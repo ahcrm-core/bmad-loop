@@ -379,13 +379,40 @@ def _set_mapping_value(lines: list[str], key: str, new_value: str) -> bool:
     A remainder neither arm can read leaves the line alone, exactly like a key
     that never matched — `advance` reports the unchanged status rather than
     claiming a write it did not make. Each line's terminator is excluded from
-    the scalar match and then reattached exactly as authored (#576)."""
+    the scalar match and then reattached exactly as authored (#576).
+
+    A value may also run past the key line. The one such shape this reads is the
+    FOLDED plain row a width-limited dump (ruamel wraps at 80) emits for a long
+    key: nothing but whitespace after the colon, then a plain scalar on one or
+    more deeper-indented lines. :func:`_folded_plain_value` proves that shape;
+    the key line and its continuation collapse into one `key: value` line that
+    takes the terminator the row's last line had. Every other multi-line value —
+    a block scalar (`|`, `>`), a quoted or plain scalar that starts on the key
+    line and wraps, a nested mapping or sequence, a comment or blank line inside
+    the value — is refused whole: rewriting only the key line would leave the
+    rest behind as part of the value (`key: done` over `    backlog` parses as
+    `done backlog`)."""
     key_pat = re.compile(rf"^(?P<indent>\s*){re.escape(key)}:(?P<gap>[ \t]+)(?P<body>\S.*)$")
+    empty_pat = re.compile(rf"^(?P<indent>\s*){re.escape(key)}:[ \t]*$")
     for i, line in enumerate(lines):
         stripped = line.rstrip("\r\n")
+        em = empty_pat.match(stripped)
+        if em:
+            folded = _folded_plain_value(lines, i, len(em.group("indent")))
+            if folded is None:
+                continue  # not a shape this can read whole — leave it as authored
+            value, end = folded
+            if value == new_value:
+                return False  # already at target — idempotent no-op
+            last = lines[end - 1]
+            nl = last[len(last.rstrip("\r\n")) :]
+            lines[i:end] = [f"{em.group('indent')}{key}: {new_value}" + nl]
+            return True
         m = key_pat.match(stripped)
         if not m:
             continue
+        if _continues_past(lines, i, len(m.group("indent"))):
+            continue  # the value runs onto later lines — a one-line edit would orphan them
         body = m.group("body")
         value_pat = _QUOTED_VALUE_RE if body[0] in "'\"" else _UNQUOTED_VALUE_RE
         vm = value_pat.match(body)
@@ -398,6 +425,66 @@ def _set_mapping_value(lines: list[str], key: str, new_value: str) -> bool:
         lines[i] = f"{m.group('indent')}{key}:{m.group('gap')}{new_value}{rest}" + nl
         return True
     return False
+
+
+# Characters that cannot open a plain scalar fragment the folded-row reader
+# accepts: YAML indicators (block scalars, quotes, flow collections, anchors,
+# tags, sequences, comments). Refusing the whole class is stricter than YAML,
+# which allows some of them in context; a refused row is left as authored.
+_PLAIN_FRAGMENT_REFUSED_LEADS = frozenset("#|>'\"-?:,[]{}&*!%@`")
+
+
+def _content_indent(line: str) -> int | None:
+    """Leading-space count of a line that carries content, or None for a blank
+    or comment-only line (neither can extend a value)."""
+    text = line.rstrip("\r\n")
+    content = text.lstrip(" ")
+    if not content.strip() or content.lstrip().startswith("#"):
+        return None
+    return len(text) - len(content)
+
+
+def _continues_past(lines: list[str], i: int, indent: int) -> bool:
+    """True when the next content line after ``lines[i]`` is indented deeper than
+    ``indent``, i.e. the value begun on line ``i`` continues onto it."""
+    for line in lines[i + 1 :]:
+        depth = _content_indent(line)
+        if depth is not None:
+            return depth > indent
+    return False
+
+
+def _folded_plain_value(lines: list[str], i: int, indent: int) -> tuple[str, int] | None:
+    """Read the plain scalar folded below the empty-valued key line ``lines[i]``.
+
+    Returns ``(value, end)`` — the fragments joined by single spaces, as YAML
+    folds them, and the index just past the last continuation line — or None
+    when the lines below are anything other than a run of plain fragments
+    indented deeper than ``indent``: no continuation at all, a fragment that
+    opens with an indicator, carries a `: ` key separator or a ` #` comment, a
+    tab in its indentation, or a comment or blank line before the value ends."""
+    fragments: list[str] = []
+    end = i + 1
+    while end < len(lines):
+        text = lines[end].rstrip("\r\n")
+        content = text.lstrip(" ")
+        if not content.strip():
+            break
+        if len(text) - len(content) <= indent:
+            break
+        fragment = content.rstrip(" \t")
+        if (
+            fragment[0] in _PLAIN_FRAGMENT_REFUSED_LEADS
+            or content[0] == "\t"
+            or fragment.endswith(":")
+            or re.search(r":[ \t]|[ \t]#", fragment)
+        ):
+            return None
+        fragments.append(fragment)
+        end += 1
+    if not fragments or _continues_past(lines, end - 1, indent):
+        return None
+    return " ".join(fragments), end
 
 
 @contextmanager

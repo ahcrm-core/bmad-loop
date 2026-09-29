@@ -382,6 +382,130 @@ def test_a_line_with_trailing_whitespace_and_no_comment_is_refused(tmp_path):
         assert "".join(lines) == line
 
 
+# ------------------------------------------------------------- folded rows
+#
+# A generator that wraps at a fixed width (ruamel's default is 80) folds a row
+# whose key is long enough onto a continuation line: `key: ` with nothing after
+# the colon, then the plain scalar indented deeper. That is valid YAML and
+# `story_status` reads it, so a writer that only knows the one-line shape
+# refuses the row, `advance` echoes the old status, and post-session
+# verification reads a finished story as unfinished. The writer reads the folded
+# shape it can prove, collapses it to one line, and still refuses every
+# multi-line shape it cannot (block scalars, nested mappings, comments or blank
+# lines inside the value, quoted continuations).
+
+_FOLDED_KEY = "7-2-date-engine-takes-a-calendar-florida-fixtures-holiday-horizo"
+
+
+def test_a_folded_plain_row_advances_and_collapses_to_one_line(tmp_path):
+    """The shape a width-80 dump emits for a long key, trailing space included.
+    The key line and its continuation become one `key: target` line; every other
+    line is untouched."""
+    board = (
+        "last_updated: 01-06-2026 10:00\n"
+        "development_status:\n"
+        "  epic-7: in-progress\n"
+        f"  {_FOLDED_KEY}: \n"
+        "    ready-for-dev\n"
+        "  7-3-next: backlog\n"
+    )
+    p = tmp_path / "sprint-status.yaml"
+    p.write_text(board, encoding="utf-8", newline="")
+    assert sprintstatus.story_status(p, _FOLDED_KEY) == "ready-for-dev"
+
+    assert sprintstatus.advance(p, _FOLDED_KEY, "done") == "done"
+
+    assert p.read_bytes() == board.replace(
+        f"  {_FOLDED_KEY}: \n    ready-for-dev\n", f"  {_FOLDED_KEY}: done\n"
+    ).encode("utf-8")
+    assert sprintstatus.story_status(p, _FOLDED_KEY) == "done"
+
+
+def test_a_folded_row_spanning_several_lines_is_read_as_one_value():
+    """A plain scalar may fold across more than one line; YAML joins the pieces
+    with single spaces, and so does the writer's comparison."""
+    lines = ["  3-2-x:\n", "      ready\n", "      for dev\n", "  3-3-y: backlog\n"]
+
+    assert sprintstatus._set_mapping_value(lines, "3-2-x", "done") is True
+
+    assert "".join(lines) == "  3-2-x: done\n  3-3-y: backlog\n"
+
+
+def test_a_folded_row_already_at_target_is_a_no_op():
+    """Idempotent like the one-line shape: a folded value equal to the target is
+    not a change, so the board keeps its authored layout."""
+    lines = [f"  {_FOLDED_KEY}: \n", "    done\n", "  7-3-next: backlog\n"]
+    before = list(lines)
+
+    assert sprintstatus._set_mapping_value(lines, _FOLDED_KEY, "done") is False
+
+    assert lines == before
+
+
+def test_a_folded_crlf_row_keeps_crlf(tmp_path):
+    """#576 for the folded shape: the collapsed line ends the way the row ended,
+    and no bare LF is introduced."""
+    board = (
+        "last_updated: 01-06-2026 10:00\r\n"
+        "development_status:\r\n"
+        "  epic-7: in-progress\r\n"
+        f"  {_FOLDED_KEY}: \r\n"
+        "    ready-for-dev\r\n"
+        "  7-3-next: backlog\r\n"
+    ).encode("utf-8")
+    p = tmp_path / "sprint-status.yaml"
+    p.write_bytes(board)
+
+    assert sprintstatus.advance(p, _FOLDED_KEY, "done") == "done"
+
+    actual = p.read_bytes()
+    assert actual == board.replace(
+        f"  {_FOLDED_KEY}: \r\n    ready-for-dev\r\n".encode(),
+        f"  {_FOLDED_KEY}: done\r\n".encode(),
+    )
+    assert b"\n" not in actual.replace(b"\r\n", b"")
+
+
+def test_a_folded_row_on_the_last_line_keeps_its_missing_terminator():
+    """The collapsed line takes the terminator of the row's LAST line, so a board
+    with no final newline does not gain one."""
+    lines = ["  3-2-x: \n", "    backlog"]
+
+    assert sprintstatus._set_mapping_value(lines, "3-2-x", "done") is True
+
+    assert "".join(lines) == "  3-2-x: done"
+
+
+@pytest.mark.parametrize(
+    "shape",
+    [
+        pytest.param(["  3-2-x: |\n", "    backlog\n"], id="literal-block"),
+        pytest.param(["  3-2-x: >-\n", "    backlog\n"], id="folded-block"),
+        pytest.param(["  3-2-x: ready\n", "    for-dev\n"], id="plain-starting-on-key-line"),
+        pytest.param(["  3-2-x: 'ready\n", "    for-dev'\n"], id="quoted-starting-on-key-line"),
+        pytest.param(["  3-2-x:\n", "    status: backlog\n"], id="nested-mapping"),
+        pytest.param(["  3-2-x:\n", "    - backlog\n"], id="nested-sequence"),
+        pytest.param(["  3-2-x:\n", "    'backlog'\n"], id="quoted-continuation"),
+        pytest.param(["  3-2-x:\n", "    # note\n", "    backlog\n"], id="comment-between"),
+        pytest.param(["  3-2-x:\n", "    back\n", "\n", "    log\n"], id="blank-line-inside"),
+        pytest.param(["  3-2-x:\n", "    backlog  # note\n"], id="trailing-comment"),
+        pytest.param(["  3-2-x:  # note\n", "    backlog\n"], id="comment-on-key-line"),
+    ],
+)
+def test_a_multi_line_value_the_writer_cannot_read_is_left_untouched(shape):
+    """Lossy, never wrong: each of these holds a value that runs past the key
+    line in a shape the line edit cannot prove it has read whole. Rewriting only
+    the key line would orphan the rest (`3-2-x: done` over `    backlog` parses
+    as `done backlog`), so the lines are left exactly as authored and `advance`
+    reports the unchanged status."""
+    lines = [*shape, "  3-3-y: backlog\n"]
+    before = list(lines)
+
+    assert sprintstatus._set_mapping_value(lines, "3-2-x", "done") is False
+
+    assert lines == before
+
+
 # --------------------------------------------------- line-ending preservation (#576)
 
 

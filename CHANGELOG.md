@@ -41,6 +41,13 @@ breaking changes may land in a minor release.
   stays unpinned until it adds `session_id_flag = "--session-id"`. A claude run paused
   before upgrading reports the host-exec config changed on resume: its launched argv
   gained `--session-id`. Dry-run previews show the flag as `--session-id <auto>`.
+- Advance a sprint-status row whose value is folded onto a continuation line (`key: ` then
+  the status indented deeper), the shape a width-80 YAML dump emits for a long story key.
+  The writer used to skip it and echo the old status, so verification read a finished
+  story as unfinished and rolled it back. The row now collapses to one `key: status`
+  line. Multi-line values the writer cannot read whole (block scalars, values that wrap
+  from the key line, nested mappings, comments inside) are now left untouched instead
+  of having only their first line rewritten.
 
 ## [0.13.0] — 2026-09-28
 
