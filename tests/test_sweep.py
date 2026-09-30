@@ -3932,7 +3932,7 @@ def test_sweep_happy_path(project):
     dev_spec = adapter.sessions[1]
     assert "Implement the deferred-work bundle" in dev_spec.prompt
     intent_path = re.findall(r"`([^`]*)`", dev_spec.prompt)[0]
-    intent = open(intent_path).read()
+    intent = Path(intent_path).read_text(encoding="utf-8")
     assert "fix both" in intent and "DW-2" in intent and "### DW-3" in intent
 
 
@@ -5045,7 +5045,7 @@ def test_triage_validation_failure_retries_with_feedback_then_escalates(project)
     assert len(prompts) == 2
     assert "--feedback" not in prompts[0] and "--feedback" in prompts[1]
     feedback_path = prompts[1].split("--feedback ", 1)[1]
-    assert "not triaged: DW-1" in open(feedback_path).read()
+    assert "not triaged: DW-1" in Path(feedback_path).read_text(encoding="utf-8")
 
 
 def test_triage_returning_a_nested_null_container_refuses_without_crashing_the_run(project):
@@ -5081,7 +5081,7 @@ def test_triage_returning_a_nested_null_container_refuses_without_crashing_the_r
     assert len(prompts) == 2
     assert "--feedback" not in prompts[0] and "--feedback" in prompts[1]
     feedback_path = prompts[1].split("--feedback ", 1)[1]
-    assert "bundles[0] not an object: NoneType" in open(feedback_path).read()
+    assert "bundles[0] not an object: NoneType" in Path(feedback_path).read_text(encoding="utf-8")
 
 
 def test_triage_returning_a_non_mapping_document_refuses_without_crashing_the_run(project):
@@ -5130,7 +5130,9 @@ def test_triage_returning_a_non_mapping_document_refuses_without_crashing_the_ru
     assert len(prompts) == 2
     assert "--feedback" not in prompts[0] and "--feedback" in prompts[1]
     feedback_path = prompts[1].split("--feedback ", 1)[1]
-    assert "triage result not a JSON object: list" in open(feedback_path).read()
+    assert "triage result not a JSON object: list" in Path(feedback_path).read_text(
+        encoding="utf-8"
+    )
     # nothing escaped `run()`: no crash record, and a refused triage classified
     # nothing, so the ledger it was reading is left exactly as it was
     assert _records(engine, "run-crash") == []
@@ -21553,7 +21555,7 @@ def test_migration_validation_failure_restores_ledger_then_escalates(project):
     prompts = [s.prompt for s in adapter.sessions]
     assert len(prompts) == 2
     assert "--feedback" not in prompts[0] and "--feedback" in prompts[1]
-    feedback = open(prompts[1].split("--feedback ", 1)[1]).read()
+    feedback = Path(prompts[1].split("--feedback ", 1)[1]).read_text(encoding="utf-8")
     assert "still parse as legacy" in feedback and "not mapped" in feedback
 
 
@@ -23027,7 +23029,9 @@ def test_migration_returning_a_non_mapping_document_refuses_without_crashing_the
     assert len(prompts) == 2
     assert "--feedback" not in prompts[0] and "--feedback" in prompts[1]
     feedback_path = prompts[1].split("--feedback ", 1)[1]
-    assert "migration result not a JSON object: list" in open(feedback_path).read()
+    assert "migration result not a JSON object: list" in Path(feedback_path).read_text(
+        encoding="utf-8"
+    )
     # nothing escaped `run()`, and the un-migrated ledger is left as it was
     assert _records(engine, "run-crash") == []
     assert project.deferred_work.read_text(encoding="utf-8") == LEGACY_LEDGER
