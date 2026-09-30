@@ -707,6 +707,43 @@ def test_wrapper_stops_the_tree_on_a_signal_that_lands_during_the_spawn(tmp_path
     assert (runner["state"], runner["child_pid"]) == ("interrupted", 424243)
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX killpg path")
+def test_wrapper_stops_the_tree_when_post_spawn_bookkeeping_raises(tmp_path, monkeypatch):
+    """A fault after the spawn that is not a signal — the ``child_pid`` record
+    write failing on a full metrics volume — must still stop the tree before it
+    propagates: pytest runs in a session of its own and would outlive the
+    wrapper.
+
+    Ablation: drop the catch-all handler after the spawn and nothing is killed."""
+
+    class Spawned:
+        pid = 424244
+        returncode = None
+
+        def wait(self, timeout=None):
+            if timeout == 5.0:  # the grace wait after the group SIGINT
+                raise subprocess.TimeoutExpired("pytest", timeout)
+            self.returncode = -9
+            return self.returncode
+
+    real_write = run_test_benchmark._write_runner
+
+    def write_runner(root, record):
+        if "child_pid" in record:
+            raise OSError(28, "No space left on device")
+        real_write(root, record)
+
+    killed = []
+    monkeypatch.setattr(run_test_benchmark.subprocess, "Popen", lambda *a, **k: Spawned())
+    monkeypatch.setattr(run_test_benchmark, "_write_runner", write_runner)
+    monkeypatch.setattr(run_test_benchmark.os, "killpg", lambda pgid, sig: killed.append(sig))
+    with pytest.raises(OSError, match="No space left"):
+        run_test_benchmark.main(["--metrics-dir", str(tmp_path / "m"), "--grace", "5", "--", "-q"])
+
+    assert killed == [signal.SIGINT, signal.SIGKILL]
+    assert _json(tmp_path / "m" / perf_report.RUNNER)["state"] == "running"
+
+
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows job-object path")
 def test_wrapper_tree_kill_reaches_a_ctrl_c_immune_child_after_the_root_exited(
     tmp_path, reap_leftovers

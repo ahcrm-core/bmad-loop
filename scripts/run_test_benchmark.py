@@ -474,6 +474,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             finish("interrupted", proc.returncode, child_reaped=proc.returncode is not None)
             _summarize(root)
             return EXIT_INTERRUPTED
+        except BaseException:
+            # Any other fault once the child exists (a runner.json write on a
+            # full metrics volume, say) must not orphan it: pytest sits in a
+            # session of its own on POSIX and the job has no kill-on-close on
+            # Windows, so nothing else would stop the tree. The fault still
+            # propagates; the record stays at ``running``, which no verifier
+            # accepts.
+            _hold_signals_for_cleanup()
+            _kill_tree(proc, args.grace, job)
+            raise
     finally:
         if job is not None:
             job.close()  # no kill-on-close: this frees the handle, nothing more
