@@ -707,6 +707,48 @@ def test_wrapper_stops_the_tree_on_a_signal_that_lands_during_the_spawn(tmp_path
     assert (runner["state"], runner["child_pid"]) == ("interrupted", 424243)
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX signal-to-self and killpg path")
+def test_wrapper_stops_the_tree_on_a_signal_that_lands_as_the_handlers_go_in(tmp_path, monkeypatch):
+    """A cancel landing just after the first raising handler is installed —
+    before the wait is reached — must still reach the tree kill, not escape to
+    the outer ``finally``, which only restores handlers.
+
+    Ablation: install the raising handlers ahead of the guarded ``try`` and
+    ``_Interrupted`` escapes ``main`` with nothing killed."""
+
+    class Spawned:
+        pid = 424247
+        returncode = None
+
+        def wait(self, timeout=None):
+            if timeout == 5.0:  # the grace wait after the group SIGINT
+                raise subprocess.TimeoutExpired("pytest", timeout)
+            self.returncode = -9
+            return self.returncode
+
+    real_signal = signal.signal
+    fired = []
+
+    def install(sig, handler):
+        previous = real_signal(sig, handler)
+        if handler is run_test_benchmark._raise_interrupted and not fired:
+            fired.append(sig)
+            os.kill(os.getpid(), sig)  # lands before the SIGTERM handler goes in
+        return previous
+
+    killed = []
+    monkeypatch.setattr(run_test_benchmark.subprocess, "Popen", lambda *a, **k: Spawned())
+    monkeypatch.setattr(run_test_benchmark.signal, "signal", install)
+    monkeypatch.setattr(run_test_benchmark.os, "killpg", lambda pgid, sig: killed.append(sig))
+    rc = run_test_benchmark.main(["--metrics-dir", str(tmp_path / "m"), "--grace", "5", "--", "-q"])
+
+    assert fired == [signal.SIGINT]
+    assert rc == run_test_benchmark.EXIT_INTERRUPTED
+    assert killed == [signal.SIGINT, signal.SIGKILL]
+    runner = _json(tmp_path / "m" / perf_report.RUNNER)
+    assert (runner["state"], runner["child_pid"]) == ("interrupted", 424247)
+
+
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX killpg path")
 def test_wrapper_stops_the_tree_when_post_spawn_bookkeeping_raises(tmp_path, monkeypatch):
     """A fault after the spawn that is not a signal — the ``child_pid`` record

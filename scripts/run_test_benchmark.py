@@ -448,10 +448,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             finish("spawn_failed", None, error=type(exc).__name__)
             _summarize(root)
             return EXIT_SPAWN_FAILED
-        for sig in previous:
-            signal.signal(sig, _raise_interrupted)
         try:
             record["child_pid"] = proc.pid
+            # Installed inside the guard: a signal landing as the first raising
+            # handler goes in must still reach the tree kill below.
+            for sig in previous:
+                signal.signal(sig, _raise_interrupted)
             if pending:
                 raise _Interrupted(pending[0])
             _write_runner(root, record)
