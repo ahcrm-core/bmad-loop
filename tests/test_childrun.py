@@ -518,11 +518,10 @@ def test_run_argv_timeout_kills_a_native_root_and_its_descendant(
     monkeypatch.setattr(childrun.subprocess, "Popen", recording_popen)
     monkeypatch.setattr(childrun, "kill_tree", recording_kill_tree)
     timeout = 3.0
+    argv = [sys.executable, str(parent), str(pid_file)]
     started = time.monotonic()
     try:
-        run = childrun.run_argv(
-            [sys.executable, str(parent), str(pid_file)], cwd=spaced_dir, timeout=timeout
-        )
+        run = childrun.run_argv(argv, cwd=spaced_dir, timeout=timeout)
         elapsed = time.monotonic() - started
     finally:
         for proc in spawned:
@@ -534,7 +533,10 @@ def test_run_argv_timeout_kills_a_native_root_and_its_descendant(
     assert grandchild is not None, "the descendant never started inside the timeout"
     assert run.timed_out is True and run.interrupted is False
     assert elapsed < timeout + _RETURN_CEILING_S
-    (root,) = spawned
+    # The patch is process-global, so it also records the helpers the host's own
+    # tree kill launches (on win32, its process-table queries); the root is the
+    # one launch of this argv.
+    (root,) = [proc for proc in spawned if proc.args == argv]
     assert [proc for proc, _ in killed] == [root]
     assert isinstance(killed[0][1], dict)
     assert root.poll() is not None, "the root survived the timeout"

@@ -15,12 +15,29 @@ breaking changes may land in a minor release.
 - Write one `pinned-session-id-mismatch` crumb when a pinned session's first non-rebind
   `SessionStart` reports an id other than the pin, so the drop of its own events as
   foreign is no longer silent; a nested CLI's `mismatch`-tagged start is skipped (DW-509).
+- Opt-in test runtime metrics: `pytest --test-metrics-dir=PATH` writes flushed per-worker
+  records, nodeid inventories and a summary that keeps wall-clock time apart from summed
+  worker-seconds, and `scripts/run_test_benchmark.py` owns the pytest process lifetime with a
+  tree-stopping deadline. Every CI test job uploads its metrics and JUnit, including after a
+  failure or deadline stop.
+- `pytest --ci-shard=I/N` runs one digest-assigned shard: whole test functions with all their
+  variants and whole xdist groups, with no list to maintain. `tests/perf_report.py
+verify-shards` proves a sharded run complete, green, disjoint and exhaustive.
 
 ### Changed
 
 - A tmux coding-CLI pane's start command now shows the `/bin/sh -c
 'BMAD_LOOP_LAUNCH_PID=$$; …'` prelude; the command itself runs under `default-shell`
   exactly as before (DW-507).
+- Windows CI runs each Python leg as two shards plus a separate serial psmux-gate job.
+  `test (windows, py3.x)` is now the leg's aggregator and fails when a shard or the gate is
+  missing, cancelled or red, when any collected test ran in no shard or in two, or when a
+  live-gate test skipped.
+- Test-suite runtime: state roots are allocated in constant time, render-only TUI and
+  sprint-status tests use a Git-free `project_tree`, TUI lifecycle waits are monotonic and
+  event-observed, three sweep recovery matrices enter at the persisted boundary, submodule
+  origins are copied from per-worker templates, and psmux teardown skips the never-observed
+  vigil for a session it saw created. No assertion was dropped.
 
 ### Fixed
 
@@ -41,6 +58,9 @@ breaking changes may land in a minor release.
   stays unpinned until it adds `session_id_flag = "--session-id"`. A claude run paused
   before upgrading reports the host-exec config changed on resume: its launched argv
   gained `--session-id`. Dry-run previews show the flag as `--session-id <auto>`.
+- `bmad-loop validate`'s coding-CLI probe returns at its timeout on a Windows `.cmd` launcher
+  and kills the launcher's descendants, instead of waiting for the launched program to exit
+  (120 s observed in CI).
 
 ## [0.13.0] — 2026-09-28
 

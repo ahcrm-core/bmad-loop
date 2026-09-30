@@ -13,6 +13,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -502,6 +503,11 @@ def test_a_killed_run_is_summarized_from_its_flushed_records(tmp_path):
         (["/usr/bin/python3.13", "-c", "print(1)"], "python"),
         ('"C:\\Program Files\\Python\\pythonw.exe" -c pass', "python"),
         ("tmux new-session -d", "tmux"),
+        # win32 audits the joined command line, not the list.
+        ('"C:\\Program Files\\Git\\cmd\\git.exe" -c "a=b c" --no-pager status', "git status"),
+        ("git -c metrics.canary=x version", "git version"),
+        ('git "/tmp/not a verb"', "git <other>"),
+        ('"C:\\unterminated\\git.exe', "git <no-verb>"),
         (["/tmp/some dir/odd name!"], "<other>"),
     ],
 )
@@ -649,3 +655,269 @@ def test_wrapper_refuses_a_used_directory_and_a_passed_deadline(tmp_path, monkey
     assert rc == run_test_benchmark.EXIT_TIMED_OUT
     runner = _json(late / perf_report.RUNNER)
     assert (runner["state"], runner["child_started"]) == ("timed_out", False)
+
+
+# ------------------------------------------------------------------- CI shards
+
+# Two files, so a function family and an xdist group each have a parent nodeid to
+# straddle: `test_b.py` repeats a function name from `test_a.py` (a different
+# family), and both files carry members of one group.
+SHARD_SUITE_A = """\
+import pytest
+
+
+@pytest.mark.parametrize("n", range(7))
+def test_params(n):
+    pass
+
+
+class TestMethods:
+    @pytest.mark.parametrize("m", ["x", "y", "z"])
+    def test_method(self, m):
+        pass
+
+    def test_plain(self):
+        pass
+
+
+@pytest.mark.xdist_group("real-mux")
+@pytest.mark.parametrize("k", range(3))
+def test_grouped_a(k):
+    pass
+
+
+@pytest.mark.skip(reason="stands in for a platform skip: selected, reported, not run")
+def test_platform_skip():
+    pass
+""" + "".join(f"\n\ndef test_fn_{i}():\n    pass\n" for i in range(24))
+
+SHARD_SUITE_B = """\
+import pytest
+
+
+@pytest.mark.parametrize("n", range(4))
+def test_params(n):
+    pass
+
+
+@pytest.mark.xdist_group("real-mux")
+def test_grouped_b():
+    pass
+""" + "".join(f"\n\ndef test_other_{i}():\n    pass\n" for i in range(24))
+
+
+def _collected(suite: Path, *args: str, **env: str) -> list[str]:
+    proc = _pytest(suite, "-q", "--collect-only", *args, **env)
+    assert proc.returncode == 0, _output(proc)
+    return [line for line in proc.stdout.splitlines() if "::" in line and " " not in line]
+
+
+@pytest.fixture(scope="module")
+def shard_suite(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    return _suite(
+        tmp_path_factory.mktemp("shards") / "suite",
+        {"test_a.py": SHARD_SUITE_A, "test_b.py": SHARD_SUITE_B},
+    )
+
+
+@pytest.mark.parametrize(
+    "spec", ["0/2", "3/2", "1/0", "0/0", "a/b", "1", "1/2/3", "-1/2", " / ", ""]
+)
+def test_ci_shard_rejects_malformed_ranges(spec):
+    with pytest.raises(pytest.UsageError, match="--ci-shard expects I/N"):
+        perf_report.parse_shard(spec)
+
+
+def test_ci_shard_accepts_its_bounds():
+    assert perf_report.parse_shard("1/1") == (1, 1)
+    assert perf_report.parse_shard(" 2/2 ") == (2, 2)
+    assert perf_report.parse_shard("7/10") == (7, 10)
+
+
+def test_a_malformed_shard_is_a_usage_error_before_any_test_runs(shard_suite):
+    proc = _pytest(shard_suite, "-q", "--ci-shard=3/2")
+    assert proc.returncode == 4, _output(proc)
+    assert "--ci-shard expects I/N" in proc.stderr
+    assert " passed" not in proc.stdout
+
+
+def test_ci_shards_partition_the_suite_by_function_family_and_group(shard_suite):
+    full = _collected(shard_suite)
+    assert len(full) == 7 + 3 + 1 + 3 + 1 + 24 + 4 + 1 + 24
+    shards = [set(_collected(shard_suite, f"--ci-shard={i}/3")) for i in (1, 2, 3)]
+    assert all(shards), "every shard of this suite is non-empty"
+    assert sum(len(s) for s in shards) == len(full)
+    assert set().union(*shards) == set(full)
+
+    def owners(predicate) -> set[int]:
+        return {i for i, s in enumerate(shards) for nodeid in s if predicate(nodeid)}
+
+    # Parameter variants never split; same-named functions in two files are two families.
+    for fam in {perf_report.family(nodeid) for nodeid in full}:
+        assert len(owners(lambda n, fam=fam: perf_report.family(n) == fam)) == 1, fam
+    # One xdist group is one unit, across files and parametrizations.
+    assert len(owners(lambda n: "test_grouped_" in n)) == 1
+    # The skip is selected like any other test (it is reported, not dropped).
+    assert len(owners(lambda n: n.endswith("test_platform_skip"))) == 1
+
+
+def test_ci_shard_selection_ignores_hash_randomization(shard_suite):
+    first = _collected(shard_suite, "--ci-shard=1/2", PYTHONHASHSEED="1")
+    again = _collected(shard_suite, "--ci-shard=1/2", PYTHONHASHSEED="2")
+    assert first == again
+    unit = "function:test_a.py::test_params"
+    assert (
+        perf_report.shard_of(unit, 2)
+        == int(__import__("hashlib").sha256(unit.encode()).hexdigest()[:16], 16) % 2
+    )
+
+
+def test_a_new_test_is_assigned_without_moving_existing_ones(tmp_path, shard_suite):
+    before = [set(_collected(shard_suite, f"--ci-shard={i}/2")) for i in (1, 2)]
+    grown = _suite(
+        tmp_path / "grown",
+        {
+            "test_a.py": SHARD_SUITE_A,
+            "test_b.py": SHARD_SUITE_B,
+            "test_new.py": "def test_added():\n    pass\n",
+        },
+    )
+    after = [set(_collected(grown, f"--ci-shard={i}/2")) for i in (1, 2)]
+    added = "test_new.py::test_added"
+    assert [added in shard for shard in after].count(True) == 1
+    assert [shard - {added} for shard in after] == before
+
+
+def test_an_empty_shard_fails_loudly(tmp_path):
+    suite = _suite(tmp_path / "suite", {"test_one.py": "def test_one():\n    pass\n"})
+    home = perf_report.shard_of("function:test_one.py::test_one", 2) + 1
+    ok = _pytest(suite, "-q", f"--ci-shard={home}/2")
+    assert ok.returncode == 0, _output(ok)
+    empty = _pytest(suite, "-q", f"--ci-shard={3 - home}/2")
+    assert empty.returncode != 0, _output(empty)
+    assert "selected none of 1 tests" in empty.stdout + empty.stderr
+
+
+def _shard_run(suite: Path, metrics: Path, spec: str, *args: str) -> Path:
+    proc = _wrapped(suite, metrics, "-q", f"--ci-shard={spec}", *args)
+    assert proc.returncode in (0, 1), _output(proc)
+    return metrics
+
+
+@pytest.fixture(scope="module")
+def shard_runs(tmp_path_factory, shard_suite) -> tuple[Path, Path]:
+    """Both halves of a real 2-shard run; the second under xdist, as in CI."""
+    base = tmp_path_factory.mktemp("shard-runs")
+    one = _shard_run(shard_suite, base / "one", "1/2")
+    two = _shard_run(shard_suite, base / "two", "2/2", "-n", "2", "--dist", "loadgroup")
+    return one, two
+
+
+def test_verify_shards_accepts_a_complete_green_partition(shard_runs):
+    assert perf_report.verify_shards(list(shard_runs), 2) == []
+    assert perf_report.main(["verify-shards", "--count", "2", *map(str, shard_runs)]) == 0
+
+
+def test_verify_shards_fails_a_missing_shard(shard_runs, tmp_path):
+    one, _ = shard_runs
+    assert perf_report.verify_shards([one], 2) == ["shard 2/2: no results"]
+    # An artifact that never arrived: the directory exists but holds nothing.
+    absent = tmp_path / "absent"
+    absent.mkdir()
+    problems = perf_report.verify_shards([one, absent], 2)
+    assert any("no manifest" in p for p in problems), problems
+    assert "shard 2/2: no results" in problems
+    assert perf_report.main(["verify-shards", "--count", "2", str(one)]) == 1
+
+
+def test_verify_shards_fails_an_omitted_test(shard_suite, shard_runs, tmp_path):
+    # A shard that selected one test less than its share: collected still lists
+    # it, so only the union-versus-collected parity check can notice.
+    # Ablation: dropping the `omitted` check in verify_shards makes this fail.
+    one, two = shard_runs
+    victim = sorted(_json_inventory(two)["selected"])[0]
+    short = _shard_run(shard_suite, tmp_path / "short", "2/2", "--deselect", victim)
+    problems = perf_report.verify_shards([one, short], 2)
+    assert problems == [f"1 collected tests ran in no shard: {victim}"]
+
+
+def test_verify_shards_fails_a_failed_or_cancelled_shard(tmp_path, shard_runs):
+    one, _ = shard_runs
+    suite = _suite(
+        tmp_path / "red",
+        {
+            "test_a.py": SHARD_SUITE_A.replace(
+                "def test_fn_0():\n    pass", "def test_fn_0():\n    assert False"
+            ),
+            "test_b.py": SHARD_SUITE_B,
+        },
+    )
+    home = perf_report.shard_of("function:test_a.py::test_fn_0", 2) + 1
+    red = _shard_run(suite, tmp_path / "red-metrics", f"{home}/2")
+    problems = perf_report.verify_shards([red], 2)
+    assert any("tests_failed" in p for p in problems), problems
+
+    # Cancelled: the runner never recorded an exit and pytest no session_finish.
+    cut = tmp_path / "cut"
+    shutil.copytree(one, cut)
+    for events in cut.glob("events-*.jsonl"):
+        kept = [
+            line
+            for line in events.read_text(encoding="utf-8").splitlines()
+            if '"kind":"session_finish"' not in line
+        ]
+        events.write_text("\n".join(kept) + "\n", encoding="utf-8")
+    runner = _json(cut / perf_report.RUNNER)
+    runner.update(state="running", exit_code=None)
+    (cut / perf_report.RUNNER).write_text(json.dumps(runner), encoding="utf-8")
+    problems = perf_report.verify_shards([cut], 2)
+    assert any("killed_externally" in p for p in problems), problems
+
+
+def test_verify_shards_fails_overlap_duplicates_and_foreign_runs(shard_runs, tmp_path):
+    one, two = shard_runs
+    assert "shard 1/2 reported twice" in " ".join(perf_report.verify_shards([one, one, two], 2))
+    assert any("is not one of 3" in p for p in perf_report.verify_shards([one, two], 3))
+
+    overlap = tmp_path / "overlap"
+    shutil.copytree(two, overlap)
+    path, inventory = _inventory_file(overlap)
+    stolen = sorted(_json_inventory(one)["selected"])[0]
+    inventory["selected"].append(stolen)
+    path.write_text(json.dumps(inventory), encoding="utf-8")
+    problems = perf_report.verify_shards([one, overlap], 2)
+    assert f"1 tests ran in more than one shard: {stolen}" in problems
+    assert any("straddle shards" in p for p in problems), problems
+
+
+def test_verify_executed_refuses_a_gate_that_skipped(tmp_path):
+    suite = _suite(
+        tmp_path / "gate",
+        {
+            "test_live.py": "import pytest\n\n\ndef test_live():\n    pass\n\n\n"
+            "@pytest.mark.skip(reason='binary absent')\ndef test_absent():\n    pass\n"
+        },
+    )
+    skipped = _wrapped(suite, tmp_path / "skipped", "-q")
+    assert skipped.returncode == 0, _output(skipped)
+    problems = perf_report.verify_executed(tmp_path / "skipped")
+    assert problems == [
+        f"{tmp_path / 'skipped'}: not every selected test passed: {{'skipped': 1}}",
+        f"{tmp_path / 'skipped'}: 1 of 2 tests passed",
+    ]
+    ran = _wrapped(suite, tmp_path / "ran", "-q", "-k", "not absent")
+    assert ran.returncode == 0, _output(ran)
+    assert perf_report.verify_executed(tmp_path / "ran") == []
+    assert perf_report.main(["verify-executed", str(tmp_path / "skipped")]) == 1
+
+
+def _inventory_file(root: Path) -> tuple[Path, dict[str, Any]]:
+    for path in sorted(root.glob(f"{perf_report.INVENTORY_PREFIX}*.json")):
+        data = _json(path)
+        if "selected" in data:
+            return path, data
+    raise AssertionError(f"no full inventory in {root}")
+
+
+def _json_inventory(root: Path) -> dict[str, Any]:
+    return _inventory_file(root)[1]

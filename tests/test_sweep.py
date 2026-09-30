@@ -22438,6 +22438,19 @@ def test_marked_triage_running_ignores_stale_accepted_rewrite(project, monkeypat
 # them; the parity row below pins that every other task field matches.
 _COMMITTING_DISPATCH_ONLY_FIELDS = frozenset({"sessions", "tokens"})
 
+# A record nested past the parser's depth. Python 3.11's json raises
+# RecursionError on it (so the reader reports it malformed); 3.12+ parses it and
+# the shape gate refuses it. Each row pins whichever gate this interpreter reaches.
+_DEEP_JSON = "[" * 2000 + "0" + "]" * 2000
+
+
+def _parses_deep_json() -> bool:
+    try:
+        json.loads(_DEEP_JSON)
+    except RecursionError:
+        return False
+    return True
+
 
 def _persist_committing_migration(project):
     """Persist the COMMITTING boundary a legacy migration reaches when its
@@ -22582,7 +22595,14 @@ def test_committing_builder_reaches_the_commit_arm_on_resume(project, monkeypatc
             json.dumps(migrate_result([])),
             "result record is inconsistent with accepted migration",
         ),
-        ("[" * 2000 + "0" + "]" * 2000, "result record is not a JSON object"),
+        (
+            _DEEP_JSON,
+            (
+                "result record is not a JSON object"
+                if _parses_deep_json()
+                else "malformed result record"
+            ),
+        ),
         ("[" + "9" * 5000 + "]", "malformed result record"),
     ],
     ids=[
@@ -22636,7 +22656,14 @@ def test_committing_resume_rejects_bad_result_before_publication(
     ("manifest_text", "detail"),
     [
         ("[]", "manifest disagrees with accepted baseline"),
-        ("[" * 2000 + "0" + "]" * 2000, "manifest record is not an object list"),
+        (
+            _DEEP_JSON,
+            (
+                "manifest record is not an object list"
+                if _parses_deep_json()
+                else "malformed manifest record"
+            ),
+        ),
         ("[" + "9" * 5000 + "]", "malformed manifest record"),
     ],
     ids=["baseline-mismatch", "recursive", "oversized-integer"],

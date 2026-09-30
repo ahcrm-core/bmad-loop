@@ -158,8 +158,22 @@ def add_options(parser: pytest.Parser) -> None:
         "command and call site (diagnostic; adds overhead).",
     )
 
+    group.addoption(
+        "--ci-shard",
+        dest="ci_shard",
+        default=None,
+        metavar="I/N",
+        help="run only shard I of N (1-based): whole test functions, with all their "
+        "parameter variants, and whole xdist groups, assigned by a stable digest. "
+        "Default: the full suite. See tests/perf_report.py.",
+    )
+
 
 def configure(config: pytest.Config) -> None:
+    shard = config.getoption("ci_shard")
+    if shard is not None:
+        index, count = parse_shard(shard)
+        config.pluginmanager.register(ShardPlugin(index, count), SHARD_PLUGIN_NAME)
     raw = config.getoption("test_metrics_dir")
     subprocesses = bool(config.getoption("test_metrics_subprocesses"))
     if raw is None:
@@ -178,6 +192,78 @@ def configure(config: pytest.Config) -> None:
         worker = str(workerinput["workerid"])
     plugin = MetricsPlugin(config, root, run_id=run_id, worker=worker, subprocesses=subprocesses)
     config.pluginmanager.register(plugin, PLUGIN_NAME)
+
+
+# --------------------------------------------------------------------- sharding
+
+SHARD_PLUGIN_NAME = "bmad-loop-ci-shard"
+_SHARD_SPEC = re.compile(r"([0-9]{1,4})/([0-9]{1,4})")
+
+
+def parse_shard(text: str) -> tuple[int, int]:
+    """``"I/N"`` -> ``(I, N)`` with ``1 <= I <= N``; anything else is a usage error."""
+    match = _SHARD_SPEC.fullmatch(str(text).strip())
+    if match is not None:
+        index, count = int(match.group(1)), int(match.group(2))
+        if 1 <= index <= count:
+            return index, count
+    raise pytest.UsageError(f"--ci-shard expects I/N with 1 <= I <= N (e.g. 1/2), got {text!r}")
+
+
+def _xdist_groups(item: pytest.Item) -> list[str]:
+    return sorted(
+        {
+            str(m.args[0] if m.args else m.kwargs.get("name", "default"))
+            for m in item.iter_markers("xdist_group")
+        }
+    )
+
+
+def shard_unit(item: pytest.Item) -> str:
+    """The indivisible unit a shard receives. An xdist-grouped test belongs to its
+    group (keyed by the sorted group names), so a real-mux group can never be
+    split across machines; any other test belongs to its function family (its
+    nodeid before parametrization), so parameter variants never split either."""
+    groups = _xdist_groups(item)
+    if groups:
+        return "group:" + ",".join(groups)
+    name = getattr(item, "originalname", None) or item.name.partition("[")[0]
+    parent = item.parent.nodeid if item.parent is not None else ""
+    return f"function:{parent}::{name}"
+
+
+def shard_of(unit: str, count: int) -> int:
+    """0-based shard of ``unit``: a SHA-256 digest, never Python's per-process
+    randomized ``hash()``, so every worker and every job agrees."""
+    digest = hashlib.sha256(unit.encode("utf-8")).digest()
+    return int.from_bytes(digest[:8], "big") % count
+
+
+class ShardPlugin:
+    """Deselects every unit outside shard ``index`` of ``count``. Registered only
+    with ``--ci-shard``; a new test is assigned automatically by its unit's digest."""
+
+    def __init__(self, index: int, count: int) -> None:
+        self.index = index
+        self.count = count
+
+    @pytest.hookimpl(trylast=True)
+    def pytest_collection_modifyitems(
+        self, session: pytest.Session, config: pytest.Config, items: list[pytest.Item]
+    ) -> None:
+        keep: list[pytest.Item] = []
+        drop: list[pytest.Item] = []
+        for item in items:
+            mine = shard_of(shard_unit(item), self.count) == self.index - 1
+            (keep if mine else drop).append(item)
+        if items and not keep:
+            raise pytest.UsageError(
+                f"--ci-shard {self.index}/{self.count} selected none of {len(items)} tests; "
+                "use fewer shards for this selection"
+            )
+        if drop:
+            config.hook.pytest_deselected(items=drop)
+            items[:] = keep
 
 
 def _claim_directory(root: Path) -> None:
@@ -252,6 +338,7 @@ def _write_json_atomic(path: Path, payload: Any, *, compact: bool = False) -> No
 _SAFE_NAME = re.compile(r"[A-Za-z0-9._+-]{1,64}")
 _PYTHON_NAME = re.compile(r"python(\d+(\.\d+)?)?w?")
 _GIT_VERB = re.compile(r"[a-z][a-z0-9-]{0,39}")
+_COMMAND_TOKEN = re.compile(r'"[^"]*"?|\'[^\']*\'?|\S+')
 _GIT_OPTIONS_WITH_VALUE = frozenset(
     {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--config-env", "--super-prefix"}
 )
@@ -292,12 +379,10 @@ def git_verb(args: Sequence[str]) -> str:
 def describe_command(executable: object, args: object) -> str:
     """``program`` or ``git <verb>`` for a ``subprocess.Popen`` audit event."""
     if isinstance(args, (str, bytes, os.PathLike)):
-        text = os.fsdecode(args).strip()
-        if text[:1] in ('"', "'"):
-            end = text.find(text[0], 1)
-            argv = [text[1:end] if end > 0 else text[1:]]
-        else:
-            argv = text.split()[:1]
+        # A command-line string: a shell command, or, on win32, every argv (the
+        # audit event fires after `list2cmdline` joined it). Quoted tokens keep
+        # their spaces; the verb still has to pass `git_verb`'s shape check.
+        argv = [token.strip("\"'") for token in _COMMAND_TOKEN.findall(os.fsdecode(args))]
     elif isinstance(args, Iterable):
         argv = [os.fsdecode(a) if isinstance(a, (str, bytes, os.PathLike)) else "" for a in args]
     else:
@@ -332,12 +417,7 @@ def call_site(frame: FrameType | None, depth: int = 3) -> str:
 def _canonical_nodeid(item: pytest.Item) -> str:
     """Strip xdist's ``@<group>`` loadgroup suffix (added on workers only)."""
     nodeid = item.nodeid
-    names = sorted(
-        {
-            str(m.args[0] if m.args else m.kwargs.get("name", "default"))
-            for m in item.iter_markers("xdist_group")
-        }
-    )
+    names = _xdist_groups(item)
     suffix = "@" + "_".join(names)
     if names and nodeid.endswith(suffix):
         return nodeid[: -len(suffix)]
@@ -496,6 +576,7 @@ class MetricsPlugin:
             "utf8_mode": bool(sys.flags.utf8_mode),
             "subprocess_attribution": self._subprocesses,
             "junitxml": bool(getattr(config.option, "xmlpath", None)),
+            "ci_shard": config.getoption("ci_shard", default=None),
         }
 
     def _at_exit(self) -> None:
@@ -1147,16 +1228,168 @@ def write_summary(root: Path) -> dict[str, Any]:
     return summary
 
 
+# ---------------------------------------------------------------- verification
+
+
+def _full_inventory(root: Path) -> dict[str, Any] | None:
+    for path in sorted(root.glob(f"{INVENTORY_PREFIX}*.json")):
+        data = _read_json(path)
+        if data and "selected" in data and "collected" in data:
+            return data
+    return None
+
+
+def family(nodeid: str) -> str:
+    """A nodeid without its parametrization: every variant of one test function."""
+    return nodeid.partition("[")[0]
+
+
+def _run_problems(root: Path, label: str) -> tuple[list[str], dict[str, Any] | None]:
+    """Why one metrics directory is not a complete, green run ([] if it is)."""
+    if _read_json(root / MANIFEST) is None:
+        return [f"{label}: no manifest -- the run is missing or never started"], None
+    summary = summarize(root)
+    tests = summary["tests"]
+    problems: list[str] = []
+    if summary["status"] != "passed":
+        problems.append(f"{label}: {summary['status']} -- {summary['status_detail']}")
+    if tests.get("consistent") is False:
+        problems.append(f"{label}: workers collected different test sets")
+    if tests.get("not_started"):
+        problems.append(f"{label}: {tests['not_started']} selected tests never started")
+    if tests["unfinished"]:
+        problems.append(f"{label}: {len(tests['unfinished'])} tests started but never finished")
+    return problems, summary
+
+
+def _sample(nodeids: Iterable[str], limit: int = 10) -> str:
+    ordered = sorted(nodeids)
+    more = f" (+{len(ordered) - limit} more)" if len(ordered) > limit else ""
+    return ", ".join(ordered[:limit]) + more
+
+
+def verify_shards(roots: Sequence[Path], count: int) -> list[str]:
+    """Problems with a sharded run's ``count`` metrics directories ([] if none).
+
+    Each shard must have finished green; the shards must be exactly ``1..count``;
+    their selected sets must be disjoint; their union must equal the collected
+    set each shard recorded before it deselected anything (so an omitted test --
+    including a platform skip, which is selected and reported -- fails here);
+    and no function family may straddle two shards."""
+    problems: list[str] = []
+    by_index: dict[int, set[str]] = {}
+    collected: set[str] | None = None
+    for root in roots:
+        label = str(root)
+        run_problems, summary = _run_problems(root, label)
+        problems.extend(run_problems)
+        if summary is None:
+            continue
+        spec = (summary.get("manifest") or {}).get("ci_shard")
+        try:
+            index, spec_count = parse_shard(str(spec))
+        except pytest.UsageError:
+            problems.append(f"{label}: not a shard run (ci_shard={spec!r})")
+            continue
+        if spec_count != count:
+            problems.append(f"{label}: shard {spec} is not one of {count}")
+            continue
+        if index in by_index:
+            problems.append(f"{label}: shard {index}/{count} reported twice")
+            continue
+        inventory = _full_inventory(root)
+        if inventory is None:
+            problems.append(f"{label}: no full nodeid inventory")
+            continue
+        selected = set(inventory["selected"])
+        shard_collected = set(inventory["collected"])
+        if not selected:
+            problems.append(f"{label}: shard {index}/{count} selected no tests")
+        if collected is None:
+            collected = shard_collected
+        elif shard_collected != collected:
+            problems.append(f"{label}: collected a different suite than the other shards")
+        by_index[index] = selected
+    missing = sorted(set(range(1, count + 1)) - set(by_index))
+    problems.extend(f"shard {i}/{count}: no results" for i in missing)
+    if missing or collected is None:
+        return problems
+    owner: dict[str, int] = {}
+    overlap: set[str] = set()
+    families: dict[str, set[int]] = {}
+    for index, selected in sorted(by_index.items()):
+        for nodeid in selected:
+            if nodeid in owner:
+                overlap.add(nodeid)
+            owner[nodeid] = index
+            families.setdefault(family(nodeid), set()).add(index)
+    if overlap:
+        problems.append(f"{len(overlap)} tests ran in more than one shard: {_sample(overlap)}")
+    omitted = collected - set(owner)
+    if omitted:
+        problems.append(f"{len(omitted)} collected tests ran in no shard: {_sample(omitted)}")
+    extra = set(owner) - collected
+    if extra:
+        problems.append(f"{len(extra)} shard tests were never collected: {_sample(extra)}")
+    split = {name for name, shards in families.items() if len(shards) > 1}
+    if split:
+        problems.append(f"{len(split)} test functions straddle shards: {_sample(split)}")
+    return problems
+
+
+def verify_executed(root: Path) -> list[str]:
+    """Problems with a run that must execute every selected test ([] if none):
+    it finished green, selected at least one test, and none of them skipped --
+    for a live gate, a skip means the gate did not actually run."""
+    problems, summary = _run_problems(root, str(root))
+    if summary is None:
+        return problems
+    tests = summary["tests"]
+    if not tests.get("selected"):
+        problems.append(f"{root}: selected no tests")
+    outcomes = tests["outcomes"]
+    not_run = {k: v for k, v in outcomes.items() if k != "passed"}
+    if not_run:
+        problems.append(f"{root}: not every selected test passed: {not_run}")
+    if tests.get("selected") is not None and outcomes.get("passed", 0) != tests["selected"]:
+        problems.append(f"{root}: {outcomes.get('passed', 0)} of {tests['selected']} tests passed")
+    return problems
+
+
+def _report(problems: list[str], ok: str) -> int:
+    if problems:
+        sys.stdout.write("".join(f"FAIL: {p}\n" for p in problems))
+        return 1
+    sys.stdout.write(ok + "\n")
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     import argparse
 
-    parser = argparse.ArgumentParser(description="Summarize a --test-metrics-dir directory.")
+    parser = argparse.ArgumentParser(description="Summarize or verify --test-metrics-dir runs.")
     sub = parser.add_subparsers(dest="command", required=True)
     summarize_cmd = sub.add_parser(
         "summarize", help="(re)write summary.json/summary.txt and print the text"
     )
     summarize_cmd.add_argument("directory", type=Path)
+    shards_cmd = sub.add_parser(
+        "verify-shards", help="check a sharded run is complete, green, disjoint and exhaustive"
+    )
+    shards_cmd.add_argument("--count", type=int, required=True)
+    shards_cmd.add_argument("directories", type=Path, nargs="+")
+    executed_cmd = sub.add_parser(
+        "verify-executed", help="check a run passed every selected test, none skipped"
+    )
+    executed_cmd.add_argument("directory", type=Path)
     args = parser.parse_args(argv)
+    if args.command == "verify-shards":
+        return _report(
+            verify_shards(args.directories, args.count),
+            f"ok: {args.count} shards are complete, green, disjoint and exhaustive",
+        )
+    if args.command == "verify-executed":
+        return _report(verify_executed(args.directory), f"ok: every test in {args.directory} ran")
     summary = write_summary(args.directory)
     sys.stdout.write(render_text(summary))
     return 0
