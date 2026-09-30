@@ -821,8 +821,58 @@ def _isolate_ambient_git_ignores(tmp_path_factory: pytest.TempPathFactory):
     mp.undo()
 
 
+class StateRootAllocator:
+    """Hands out distinct, freshly created state roots under one per-worker base.
+
+    Linear by construction: `allocate` does one `mkdir` (two on the first child of a
+    bucket) and never lists a directory. `tmp_path_factory.mktemp` does not have that
+    property — pytest's numbered-dir allocation scans the parent for the highest
+    existing suffix on every call, so one numbered state root per test made the
+    autouse fixture quadratic in the tests a worker had already run, and every
+    ordinary `tmp_path` allocation scanned those roots too because they shared its
+    parent. The counter is plain per-instance state: each xdist worker is its own
+    process with its own session fixture, so no two allocators share a base.
+
+    Children are bucketed `BUCKET_SIZE` to a directory so no directory ever holds
+    more than that many entries. `mkdir` without `exist_ok` is the distinctness
+    proof: an existing path is an error, never a silently shared root. Names stay
+    short (`state0/b3/s17`) so no root is longer than the `state-rootN` it replaced
+    — Windows path budgets are measured from here."""
+
+    BUCKET_SIZE = 256
+
+    def __init__(self, base: Path) -> None:
+        self.base = base
+        self._allocated = 0
+
+    def allocate(self) -> Path:
+        index = self._allocated
+        self._allocated += 1
+        bucket, slot = divmod(index, self.BUCKET_SIZE)
+        bucket_dir = self.base / f"b{bucket}"
+        if slot == 0:
+            bucket_dir.mkdir()
+        root = bucket_dir / f"s{slot}"
+        root.mkdir()
+        return root
+
+
+def point_state_root(mp: pytest.MonkeyPatch, allocator: StateRootAllocator) -> Path:
+    """Aim `BMAD_LOOP_STATE_DIR` at a fresh root, through ``mp`` so ``mp.undo()``
+    restores the operator's own value (or its absence). The only variable touched."""
+    root = allocator.allocate()
+    mp.setenv(envvars.STATE_DIR, str(root))
+    return root
+
+
+@pytest.fixture(scope="session")
+def _state_root_allocator(tmp_path_factory: pytest.TempPathFactory) -> StateRootAllocator:
+    """One numbered base per worker session; every per-test root is a child of it."""
+    return StateRootAllocator(tmp_path_factory.mktemp("state"))
+
+
 @pytest.fixture(autouse=True)
-def _isolate_state_root(tmp_path_factory: pytest.TempPathFactory, monkeypatch):
+def _isolate_state_root(_state_root_allocator: StateRootAllocator, monkeypatch):
     """Point the user-scoped state root at a per-test temp dir, for every test.
 
     `runs.state_root()` resolves to `~/.local/state/bmad-loop` (POSIX) or
@@ -845,7 +895,7 @@ def _isolate_state_root(tmp_path_factory: pytest.TempPathFactory, monkeypatch):
     Tests that grade the cascade itself `delenv` this variable and monkeypatch
     the ones they need, and share this fixture's monkeypatch instance, so the
     override comes off cleanly for exactly that test."""
-    monkeypatch.setenv(envvars.STATE_DIR, str(tmp_path_factory.mktemp("state-root")))
+    point_state_root(monkeypatch, _state_root_allocator)
 
 
 @pytest.fixture(autouse=True)
@@ -890,6 +940,24 @@ def _isolate_mux_registry(monkeypatch):
     monkeypatch.setattr(psmux_backend, "_DISPLACED_ROOT", None)
 
 
+def seed_project_files(root: Path) -> ProjectPaths:
+    """Write the sandbox's file tree under ``root`` (which must not exist yet).
+
+    The ONE definition of what a sandbox holds before Git: `_project_template` commits
+    exactly this, and `project_tree` hands it out with no repository at all, so the
+    two fixtures cannot drift into describing different projects."""
+    paths = ProjectPaths(
+        project=root,
+        implementation_artifacts=root / "_bmad-output" / "implementation-artifacts",
+        planning_artifacts=root / "_bmad-output" / "planning-artifacts",
+    )
+    paths.implementation_artifacts.mkdir(parents=True)
+    paths.planning_artifacts.mkdir(parents=True)
+    (root / "src.txt").write_text("original\n")
+    (root / ".gitignore").write_text(".bmad-loop/runs/\n")  # as `bmad-loop init` would
+    return paths
+
+
 @pytest.fixture(scope="session")
 def _project_template(
     tmp_path_factory: pytest.TempPathFactory, _isolate_ambient_git_ignores: None
@@ -898,13 +966,7 @@ def _project_template(
     a test — a mutation would poison every later test in the worker; tests get
     disposable copies via `project`. (Do not chmod it read-only either: copytree
     preserves modes, so the copies would inherit it and break every write.)"""
-    root = tmp_path_factory.mktemp("project-template") / "sandbox"
-    impl = root / "_bmad-output" / "implementation-artifacts"
-    plan = root / "_bmad-output" / "planning-artifacts"
-    impl.mkdir(parents=True)
-    plan.mkdir(parents=True)
-    (root / "src.txt").write_text("original\n")
-    (root / ".gitignore").write_text(".bmad-loop/runs/\n")  # as `bmad-loop init` would
+    root = seed_project_files(tmp_path_factory.mktemp("project-template") / "sandbox").project
     git(root, "init", "-q", "-b", "main")
     # `git init` seeds 14 dead `*.sample` hooks nothing here reads, and every test
     # replicated all 14 through `project`'s copytree. Drop the files only — NOT via
@@ -932,18 +994,45 @@ def _project_template(
     return root
 
 
-@pytest.fixture
-def project(tmp_path: Path, _project_template: Path) -> ProjectPaths:
-    """Git repo with BMAD-shaped artifact dirs and an initial commit — a copytree
-    clone of the per-worker template, so no git subprocesses per test (git spawn
-    plus fsync made this fixture ~3s per test on Windows CI)."""
-    root = tmp_path / "sandbox"
-    shutil.copytree(_project_template, root)
+def copy_project(template: Path, root: Path) -> ProjectPaths:
+    """A private copytree of the template repo at ``root``: its own `.git` directory,
+    index, refs and hooks, nothing linked back to the template or any other copy."""
+    shutil.copytree(template, root)
     return ProjectPaths(
         project=root,
         implementation_artifacts=root / "_bmad-output" / "implementation-artifacts",
         planning_artifacts=root / "_bmad-output" / "planning-artifacts",
     )
+
+
+@pytest.fixture
+def project(tmp_path: Path, _project_template: Path) -> ProjectPaths:
+    """Git repo with BMAD-shaped artifact dirs and an initial commit — a copytree
+    clone of the per-worker template, so no git subprocesses per test (git spawn
+    plus fsync made this fixture ~3s per test on Windows CI)."""
+    return copy_project(_project_template, tmp_path / "sandbox")
+
+
+@pytest.fixture
+def project_tree(tmp_path: Path) -> ProjectPaths:
+    """The `project` file tree at the same `tmp_path / "sandbox"` spot, with NO Git.
+
+    For tests whose assertion and exercised code path never consult a repository:
+    it skips the `.git` copy entirely. Opt in explicitly and only with a reason —
+    nothing here guesses from a test's name, and nothing creates a repository lazily
+    if the code under test turns out to want one. Code that does reach Git finds no
+    repository here and may DEGRADE rather than fail, so a green run on this fixture
+    is not by itself evidence that Git was incidental — read the exercised path.
+    Anything that commits, diffs, stashes, installs hooks or reads `HEAD` stays on
+    `project`.
+
+    Admitted so far, each on two grounds — the product path is Git-free by reading
+    (every TUI Git contact goes through `verify._run_git`, only on launch, decision
+    publish, story-checkpoint subject and re-arm; nothing reads `.git` directly) AND
+    the test measured zero subprocess spawns on `project`: `test_sprintstatus.py`
+    parsing, `test_tui_data.py` config/ledger/sprint readers, and `test_tui_app.py`
+    render, input, layout and lifecycle rows that never reach one of those actions."""
+    return seed_project_files(tmp_path / "sandbox")
 
 
 # --------------------------------------- divergent roots (`repo_root` override)
