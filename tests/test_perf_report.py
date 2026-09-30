@@ -680,7 +680,10 @@ def test_wrapper_tree_kill_reaches_a_ctrl_c_immune_child_after_the_root_exited(
     """An interrupt reaches the wrapper only once pytest has exited
     (``Popen.wait`` is not interruptible on Windows), when ``taskkill /T`` can no
     longer walk from the reaped root. A child in its own process group ignored
-    the Ctrl+C; the job must still reach it."""
+    the Ctrl+C; the job must still reach it. The root is started through
+    ``sys.executable`` — on CI the venv redirector, whose own job hands every
+    grandchild a silent breakaway — and the job lives in a driver process so this
+    worker never joins one."""
     pid_file = tmp_path / "child"
     root = (
         "import pathlib, subprocess, sys\n"
@@ -688,17 +691,37 @@ def test_wrapper_tree_kill_reaches_a_ctrl_c_immune_child_after_the_root_exited(
         " creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)\n"
         f"pathlib.Path({str(pid_file)!r}).write_text(str(child.pid), encoding='utf-8')\n"
     )
-    proc = subprocess.Popen([sys.executable, "-c", root])
-    job = run_test_benchmark._TreeJob.open(proc.pid)
+    driver = (
+        "import subprocess, sys\n"
+        f"sys.path.insert(0, {str(WRAPPER.parent)!r})\n"
+        "import run_test_benchmark as rtb\n"
+        "job = rtb._TreeJob.enter()\n"
+        f"proc = subprocess.Popen([sys.executable, '-c', {root!r}])\n"
+        "assert proc.wait(timeout=60) == 0\n"
+        "print(open(sys.argv[1], encoding='utf-8').read(), flush=True)\n"
+        "input()  # the test checks the child is alive, then releases the kill\n"
+        "rtb._kill_tree(proc, 0.0, job)\n"
+    )
+    proc = subprocess.Popen(
+        [sys.executable, "-c", driver, str(pid_file)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+    )
     try:
-        assert proc.wait(timeout=60) == 0
-        child = int(pid_file.read_text(encoding="utf-8"))
+        line = proc.stdout.readline()
+        assert line.strip().isdigit(), f"driver failed before the kill: {line!r}"
+        child = int(line)
         reap_leftovers.append(child)
         assert not _gone(child), "the child must outlive its root for this row to mean anything"
-        run_test_benchmark._kill_tree(proc, 0.0, job)
+        proc.stdin.write("\n")
+        proc.stdin.flush()
+        assert proc.wait(timeout=CHILD_TIMEOUT_S) == 0
         assert _wait_gone(child), f"pid {child} outlived the tree kill"
     finally:
-        job.close()
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait()
 
 
 def test_wrapper_refuses_a_used_directory_and_a_passed_deadline(tmp_path, monkeypatch):

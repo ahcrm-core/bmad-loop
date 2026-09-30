@@ -31,14 +31,15 @@ wrapper's console group there, as it would without the wrapper, so no Ctrl+C can
 be aimed at it alone). Records already flushed by the metrics plugin survive
 either way.
 
-Windows tree: pytest is put in a job object of its own, the stand-in for the
-POSIX process group — membership outlives the root, so a child that ignored
-Ctrl+C (``CREATE_NEW_PROCESS_GROUP``) is still reached after pytest itself exited
-and was reaped, when ``taskkill /T`` can no longer walk to it. That is the normal
-case on an interrupt: ``Popen.wait`` is not interruptible there, so the wrapper
-only sees the Ctrl+C once pytest is gone. ``taskkill /T /F`` still runs after the
-job kill for anything outside the job. If the job cannot be set up the run goes
-on without it and ``runner.json`` records ``tree_job: false``.
+Windows tree: the wrapper enters a job object before starting pytest (see
+``_TreeJob``), the stand-in for the POSIX process group — membership outlives
+the root, so a child that ignored Ctrl+C (``CREATE_NEW_PROCESS_GROUP``) is still
+reached after pytest itself exited and was reaped, when ``taskkill /T`` can no
+longer walk to it. That is the normal case on an interrupt: ``Popen.wait`` is
+not interruptible there, so the wrapper only sees the Ctrl+C once pytest is
+gone. A stop runs ``taskkill /T /F`` first, then terminates every other job
+member. If the job cannot be set up the run goes on without it and
+``runner.json`` records ``tree_job: false``.
 
 Standalone by design: stdlib only, and it does not import bmad_loop. Child output
 passes straight through to this process's stdout/stderr and is never recorded.
@@ -78,101 +79,151 @@ class _Interrupted(Exception):
 
 
 class _TreeJob:
-    """Windows only: a job object holding pytest and everything it starts.
+    """Windows only: a job object the wrapper enters before starting pytest, so
+    pytest is born in it along with everything it starts — no window between
+    the spawn and an assignment.
 
-    Limits are just ``BREAKAWAY_OK``, so a child that explicitly asks to break
-    away still can, as it could without the wrapper; there is no kill-on-close,
-    so a run that exits normally leaves its processes exactly as it would
-    unwrapped. Only a process pytest started before :meth:`open` assigned it —
-    microseconds after the spawn, long before pytest starts anything — escapes."""
+    No limits are set, so the job permits no breakaway. That is load-bearing:
+    a venv's ``python.exe`` redirector runs the real interpreter in a job of its
+    own with ``SILENT_BREAKAWAY_OK``, so every process pytest starts silently
+    leaves that job and moves up the job chain until a job that does not permit
+    breakaway — this one. (The flip side: a descendant that explicitly passes
+    ``CREATE_BREAKAWAY_FROM_JOB`` is refused. Nothing under test does.) There is
+    no kill-on-close either, so a run that exits normally leaves its processes
+    as it would unwrapped. The wrapper stays a member, so the kill terminates
+    every OTHER member, one handle at a time, never the job as a whole."""
+
+    _PROCESS_TERMINATE = 0x0001
+    # The full query right, not the limited one: Windows accepts either for
+    # IsProcessInJob, Wine only this one, and members are our own processes.
+    _PROCESS_QUERY_INFORMATION = 0x0400
+    _JOB_OBJECT_BASIC_PROCESS_ID_LIST = 3
+    _ERROR_MORE_DATA = 234
+    _SWEEPS = 5  # members started while a sweep runs are caught by the next
 
     def __init__(self, kernel32: Any, handle: int) -> None:
         self._kernel32 = kernel32
         self._handle: int | None = handle
 
     @classmethod
-    def open(cls, pid: int) -> _TreeJob:
-        """Create the job and assign ``pid`` to it; ``OSError`` on any failure."""
+    def enter(cls) -> _TreeJob:
+        """Create the job and put the calling process in it; ``OSError`` on any
+        failure (the process is then in no new job)."""
         import ctypes
         from ctypes import wintypes
-
-        class _Basic(ctypes.Structure):
-            _fields_ = [
-                ("PerProcessUserTimeLimit", ctypes.c_int64),
-                ("PerJobUserTimeLimit", ctypes.c_int64),
-                ("LimitFlags", wintypes.DWORD),
-                ("MinimumWorkingSetSize", ctypes.c_size_t),
-                ("MaximumWorkingSetSize", ctypes.c_size_t),
-                ("ActiveProcessLimit", wintypes.DWORD),
-                ("Affinity", ctypes.c_size_t),
-                ("PriorityClass", wintypes.DWORD),
-                ("SchedulingClass", wintypes.DWORD),
-            ]
-
-        class _Extended(ctypes.Structure):
-            _fields_ = [
-                ("BasicLimitInformation", _Basic),
-                ("IoInfo", ctypes.c_uint64 * 6),
-                ("ProcessMemoryLimit", ctypes.c_size_t),
-                ("JobMemoryLimit", ctypes.c_size_t),
-                ("PeakProcessMemoryUsed", ctypes.c_size_t),
-                ("PeakJobMemoryUsed", ctypes.c_size_t),
-            ]
 
         kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
         kernel32.CreateJobObjectW.argtypes = (ctypes.c_void_p, wintypes.LPCWSTR)
         kernel32.CreateJobObjectW.restype = wintypes.HANDLE
-        kernel32.SetInformationJobObject.argtypes = (
+        kernel32.GetCurrentProcess.argtypes = ()
+        kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+        kernel32.AssignProcessToJobObject.argtypes = (wintypes.HANDLE, wintypes.HANDLE)
+        kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
+        kernel32.QueryInformationJobObject.argtypes = (
             wintypes.HANDLE,
             ctypes.c_int,
             ctypes.c_void_p,
             wintypes.DWORD,
+            ctypes.POINTER(wintypes.DWORD),
         )
-        kernel32.SetInformationJobObject.restype = wintypes.BOOL
+        kernel32.QueryInformationJobObject.restype = wintypes.BOOL
         kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
         kernel32.OpenProcess.restype = wintypes.HANDLE
-        kernel32.AssignProcessToJobObject.argtypes = (wintypes.HANDLE, wintypes.HANDLE)
-        kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
-        kernel32.TerminateJobObject.argtypes = (wintypes.HANDLE, wintypes.UINT)
-        kernel32.TerminateJobObject.restype = wintypes.BOOL
+        kernel32.IsProcessInJob.argtypes = (
+            wintypes.HANDLE,
+            wintypes.HANDLE,
+            ctypes.POINTER(wintypes.BOOL),
+        )
+        kernel32.IsProcessInJob.restype = wintypes.BOOL
+        kernel32.TerminateProcess.argtypes = (wintypes.HANDLE, wintypes.UINT)
+        kernel32.TerminateProcess.restype = wintypes.BOOL
         kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
         kernel32.CloseHandle.restype = wintypes.BOOL
 
-        def fail(what: str) -> OSError:
-            err = ctypes.get_last_error()
-            return OSError(err, f"{what} failed (winerror {err})")
-
         handle = kernel32.CreateJobObjectW(None, None)
         if not handle:
-            raise fail("CreateJobObjectW")
+            raise cls._error("CreateJobObjectW")
         job = cls(kernel32, handle)
-        try:
-            info = _Extended()
-            info.BasicLimitInformation.LimitFlags = 0x800  # JOB_OBJECT_LIMIT_BREAKAWAY_OK
-            if not kernel32.SetInformationJobObject(
-                handle, 9, ctypes.byref(info), ctypes.sizeof(info)
-            ):  # 9: JobObjectExtendedLimitInformation
-                raise fail("SetInformationJobObject")
-            # PROCESS_TERMINATE | PROCESS_SET_QUOTA. The pid cannot be reused
-            # meanwhile: the caller's Popen still holds its process handle.
-            process = kernel32.OpenProcess(0x0001 | 0x0100, False, pid)
-            if not process:
-                raise fail("OpenProcess")
-            try:
-                if not kernel32.AssignProcessToJobObject(handle, process):
-                    raise fail("AssignProcessToJobObject")
-            finally:
-                kernel32.CloseHandle(process)
-        except BaseException:
+        if not kernel32.AssignProcessToJobObject(handle, kernel32.GetCurrentProcess()):
+            error = cls._error("AssignProcessToJobObject")
             job.close()
-            raise
+            raise error
         return job
 
-    def terminate(self) -> bool:
-        """Kill every process still in the job. False if the call failed."""
+    @staticmethod
+    def _error(what: str) -> OSError:
+        import ctypes
+
+        err = ctypes.get_last_error()
+        return OSError(err, f"{what} failed (winerror {err})")
+
+    def _member_pids(self) -> list[int]:
+        import ctypes
+
+        capacity = 256
+        while True:
+            # JOBOBJECT_BASIC_PROCESS_ID_LIST: two DWORD counts, then ULONG_PTR ids.
+            class _List(ctypes.Structure):
+                _fields_ = [
+                    ("NumberOfAssignedProcesses", ctypes.c_uint32),
+                    ("NumberOfProcessIdsInList", ctypes.c_uint32),
+                    ("ProcessIdList", ctypes.c_size_t * capacity),
+                ]
+
+            ids = _List()
+            if self._kernel32.QueryInformationJobObject(
+                self._handle,
+                self._JOB_OBJECT_BASIC_PROCESS_ID_LIST,
+                ctypes.byref(ids),
+                ctypes.sizeof(ids),
+                None,
+            ):
+                return [int(pid) for pid in ids.ProcessIdList[: ids.NumberOfProcessIdsInList]]
+            if ctypes.get_last_error() != self._ERROR_MORE_DATA:
+                raise self._error("QueryInformationJobObject")
+            capacity = max(capacity * 2, int(ids.NumberOfAssignedProcesses) + 64)
+
+    def _terminate_member(self, pid: int) -> str | None:
+        """Terminate ``pid`` if it is still a member; the failure, if any."""
+        import ctypes
+        from ctypes import wintypes
+
+        access = self._PROCESS_TERMINATE | self._PROCESS_QUERY_INFORMATION
+        process = self._kernel32.OpenProcess(access, False, pid)
+        if not process:
+            return None  # exited since the listing
+        try:
+            # The handle pins the pid: re-check membership so a pid reused
+            # since the listing is never killed.
+            member = wintypes.BOOL(False)
+            if not self._kernel32.IsProcessInJob(process, self._handle, ctypes.byref(member)):
+                return f"{pid}: IsProcessInJob winerror {ctypes.get_last_error()}"
+            if member and not self._kernel32.TerminateProcess(process, 1):
+                return f"{pid}: TerminateProcess winerror {ctypes.get_last_error()}"
+            return None
+        finally:
+            self._kernel32.CloseHandle(process)
+
+    def terminate_others(self) -> None:
+        """Terminate every member but the calling process. ``OSError`` if the
+        listing fails or a member could not be checked or terminated — after
+        every other member was still tried."""
         if self._handle is None:
-            return False
-        return bool(self._kernel32.TerminateJobObject(self._handle, 1))
+            return
+        me = os.getpid()
+        failures: dict[int, str] = {}
+        for _ in range(self._SWEEPS):
+            others = [pid for pid in self._member_pids() if pid != me]
+            if not others:
+                break
+            for pid in others:
+                failure = self._terminate_member(pid)
+                if failure is not None:
+                    failures[pid] = failure
+                else:
+                    failures.pop(pid, None)
+        if failures:
+            raise OSError(f"job members not terminated: {'; '.join(failures.values())}")
 
     def close(self) -> None:
         if self._handle is not None:
@@ -222,10 +273,9 @@ def _kill_tree(proc: subprocess.Popen[bytes], grace: float, job: _TreeJob | None
     """Stop pytest and everything it started. Bounded: returns within
     ``grace + _REAP_WAIT_S`` (+ taskkill's own bound on Windows)."""
     if sys.platform == "win32":
-        # The job first: it still holds the tree when the root is already
-        # reaped, which taskkill's parent-pid walk cannot see past.
-        if job is not None:
-            job.terminate()
+        # taskkill first, while a live root still anchors its parent-pid walk;
+        # then the job, which still holds whatever that walk could not reach
+        # (everything, once the root is reaped).
         try:
             subprocess.run(  # fixed argv, no shell
                 ["taskkill", "/T", "/F", "/PID", str(proc.pid)],
@@ -238,6 +288,11 @@ def _kill_tree(proc: subprocess.Popen[bytes], grace: float, job: _TreeJob | None
             pass
         if proc.poll() is None:
             proc.kill()
+        if job is not None:
+            try:
+                job.terminate_others()
+            except OSError as exc:
+                sys.stderr.write(f"run_test_benchmark: job sweep failed ({exc})\n")
     else:
         pgid = proc.pid  # start_new_session=True made pytest its group leader
         if grace > 0:
@@ -353,6 +408,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     for sig in previous:
         signal.signal(sig, _raise_interrupted)
     job: _TreeJob | None = None
+    if sys.platform == "win32":
+        try:
+            job = _TreeJob.enter()  # before the spawn: pytest is born inside it
+        except OSError as exc:
+            sys.stderr.write(
+                f"run_test_benchmark: no job object for the pytest tree ({exc}); "
+                "a stop reaches only what taskkill /T can still find\n"
+            )
+        record["tree_job"] = job is not None
     try:
         try:
             proc = subprocess.Popen(command, **popen_kwargs)  # fixed argv, no shell
@@ -364,15 +428,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             _summarize(root)
             return EXIT_SPAWN_FAILED
         record["child_pid"] = proc.pid
-        if sys.platform == "win32":
-            try:
-                job = _TreeJob.open(proc.pid)
-            except OSError as exc:
-                sys.stderr.write(
-                    f"run_test_benchmark: no job object for the pytest tree ({exc}); "
-                    "a stop reaches only what taskkill /T can still find\n"
-                )
-            record["tree_job"] = job is not None
         _write_runner(root, record)
         try:
             returncode = proc.wait(timeout=budget)
