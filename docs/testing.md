@@ -12,8 +12,8 @@ and every negative assertion proven by ablation.**
 
 ## The suite at a glance
 
-- Flat `tests/` — roughly 70 `test_*.py` files mirroring `src/bmad_loop` modules by name,
-  ~5,100 collected tests. No package nesting, one `tests/conftest.py`, one data file
+- Flat `tests/` — roughly 85 `test_*.py` files mirroring `src/bmad_loop` modules by name,
+  ~13,000 collected tests. No package nesting, one `tests/conftest.py`, one data file
   (`tests/fixtures/stories.yaml`, the dogfooded stories-mode contract from BMAD-METHOD
   PR #2549).
 - Configuration is four settings under `[tool.pytest.ini_options]` in `pyproject.toml`:
@@ -260,9 +260,9 @@ those paths.
 **Manual-gate cadence:** `test_opencode_live.py` is the one gate CI still cannot see. Run it on a
 POSIX box with opencode installed before every release, and after any change to the adapter it
 covers; a release cut without it is trusting stale evidence. `test_psmux_live.py` left this
-category in #662 — the **test-windows** job installs psmux and runs the gate on every pull
-request and on pushes to `main`/`release/*` (the workflow's own triggers), in its own serial
-step, so its evidence is as fresh as the branch rather than as fresh as someone's memory.
+category in #662 — the **test-windows-live** job installs psmux and runs the gate on every pull
+request and on pushes to `main`/`release/*` (the workflow's own triggers), serially on its own
+machine, so its evidence is as fresh as the branch rather than as fresh as someone's memory.
 
 ## Ablation records
 
@@ -331,15 +331,45 @@ the day the defect is fixed, the test fails and forces the debt note to be remov
 
 ## CI, flakes, and deliberate absences
 
-Six jobs (`.github/workflows/ci.yml`): **test** (ubuntu, Python 3.11–3.14, tmux installed so
-L4 and `stories_e2e` run), **test-windows** (`PYTHONUTF8=1`, psmux installed so the L5
-`test_psmux_live.py` gate runs; PRs run the 3.11/3.14 boundary only — Windows failures here
-have been platform-shaped, not version-shaped — pushes to `main` and `release/*` run the full
-spread), **version-sync**, **lint** (trunk, including actionlint + zizmor over the
-workflows themselves), **typecheck** (the same pinned pyright a contributor runs), and
-**build** (packaging smoke: sdist + wheel, the console script executed from the installed
-wheel, and a wheel data-file inventory against `git ls-files` — every other job runs from the
-source tree, so packaging breaks were invisible until this job existed).
+Eight jobs (`.github/workflows/ci.yml`): **test** (ubuntu, Python 3.11–3.14, tmux installed so
+L4 and `stories_e2e` run), three Windows jobs (`PYTHONUTF8=1`; PRs run the 3.11/3.14 boundary
+only — Windows failures here have been platform-shaped, not version-shaped — pushes to `main`
+and `release/*` run the full spread), **version-sync**, **lint** (trunk, including actionlint
+and zizmor over the workflows themselves), **typecheck** (the same pinned pyright a contributor
+runs), and **build** (packaging smoke: sdist and wheel, the console script executed from the
+installed wheel, and a wheel data-file inventory against `git ls-files` — every other job runs
+from the source tree, so packaging breaks were invisible until this job existed).
+
+The Windows jobs split one leg across machines without dropping a test:
+
+- **test-windows-shard** runs the suite minus `test_psmux_live.py` as two shards per Python
+  leg, `--ci-shard=1/2` and `2/2` (`tests/perf_report.py`). A shard receives whole units: a
+  test function with every parameter variant, or a whole xdist group keyed by its sorted group
+  names, so a real-mux group can never split. Units are assigned by a SHA-256 digest of the
+  unit's nodeid before parametrization — never Python's randomized `hash()`, never a file list
+  — so a new test is assigned automatically and existing tests do not move. A malformed range
+  or a shard that selects nothing is a usage error; without the option pytest runs the whole
+  suite. The digest balances test counts, not seconds, so one shard usually runs longer.
+- **test-windows-live** installs psmux and runs the L5 gate once per leg, serially, on a
+  machine of its own.
+- **test-windows** keeps the check name the unsharded job had (`test (windows, py3.x)`) and
+  is the leg's verdict. It downloads that leg's records and runs
+  `perf_report.py verify-shards --count 2`: both shards present and green, their selected sets
+  disjoint, their union equal to the collected set each shard recorded before deselecting
+  (platform skips included), no function family straddling shards. Then `verify-executed`
+  requires every live-gate test to have passed; a skip there means the gate did not run. A
+  failed, cancelled, deadline-stopped or never-uploaded shard or gate fails the leg, and so
+  does one whose wrapper `runner.json` is missing or never reached `exited`. It judges
+  from records rather than `needs.*.result`, which aggregates the whole matrix. Artifacts are
+  run-scoped, so a re-run job that fails before uploading would leave the earlier attempt's
+  green records in place; `verify-jobs` therefore also requires each of the leg's three jobs
+  to have concluded `success` in its latest execution (the run's `jobs?filter=latest` listing).
+
+Sharding buys latency, not work: every shard pays its own runner setup and a full collection.
+It stays only while the extra aggregate job-seconds remain within 15% of the unsharded
+layout; beyond that, one job per leg is the cheaper answer. The repository has no required
+status checks today; the aggregator keeps the old names so adding protection later needs no
+renames.
 
 **Zero-retry flaky policy.** There is no retry mechanism anywhere: no `--reruns`, no retry
 plugin — `pytest-rerunfailures` was removed from the environment precisely because an installed
@@ -369,10 +399,61 @@ Deliberate absences — decisions, not gaps:
   suite at 10× the queue time.
 - **No opencode install in CI** — so `test_opencode_live.py` is the last manual gate (table
   above), and faking the server would test the fake. psmux is the counter-example rather than
-  the precedent: it is one zip on a GitHub release, so **test-windows** installs it and runs
+  the precedent: it is one zip on a GitHub release, so **test-windows-live** installs it and runs
   that gate on every PR and every push to `main`/`release/*` (#662). Chocolatey was tried
   first and dropped — its community feed 503'd on both matrix legs, and Chocolatey document
   it as unguaranteed and rate-limited per IP, which hosted runners share.
+
+## Runtime, metrics, and performance budgets
+
+**Default invocation is serial.** `uv run pytest -q` runs one process: correct everywhere,
+slowest everywhere. Parallelism is opt-in with `-n logical` (see
+[The suite at a glance](#the-suite-at-a-glance)). Compare like with like: a serial local run
+against a four-worker hosted run measures the worker count, not the change.
+
+**The 2-vCPU Windows comparison** (a small VM or WinBoat guest) is two commands, in this order,
+never alongside another full-suite run on the same guest:
+
+```powershell
+$env:PYTHONUTF8 = '1'
+uv run pytest -q -n 2 --ignore=tests/test_psmux_live.py
+uv run pytest -q tests/test_psmux_live.py
+```
+
+Keep the checkout and `TMP`/`TEMP` on the guest's own disk. A host-shared or network folder
+makes every per-test sandbox copy cross the share, which measures the share. The live gate
+runs separately and serially for the same reason CI runs it that way: its tests drive real
+psmux servers, a single-machine resource rather than per-worker state.
+
+**Metrics** (`tests/perf_report.py`, inert unless asked for) answer where the time went,
+including for a run that never finished:
+
+```sh
+uv run python scripts/run_test_benchmark.py --metrics-dir <fresh-dir> -- -q -n logical
+uv run python tests/perf_report.py summarize <fresh-dir>
+```
+
+The wrapper owns the pytest process lifetime, preserves pytest's exit status, and with
+`--timeout`/`--deadline-epoch` stops the whole tree (exit 124) while leaving every flushed
+record behind. Pytest alone takes `--test-metrics-dir=PATH`, spelled with `=`. The summary
+keeps two clocks apart: wall-clock elapsed, and _worker-seconds_ summed across xdist workers,
+which exceeds elapsed whenever workers overlap. It also reports fixture setup totals, per-file
+cost, the cleanup tail after the last report, and tests started but never finished.
+`--test-metrics-subprocesses` adds per-test, per-command and per-call-site launch counts
+(`git <verb>`). It is a targeted diagnostic with real overhead and stays off in CI. Nothing
+recorded carries environment values, output or argv beyond a program name and git verb. Metrics
+directories are run artifacts: CI uploads them (`test-metrics-*`, 14-day retention, uploaded
+even when the step fails or hits its deadline) and they never go into Git.
+
+**Budgets.** Each test job has a hard `timeout-minutes` cap, and its test steps stop a few
+minutes short of it through the wrapper's deadline, so a wedged run ends as a red step with its
+metrics uploaded rather than as a cancelled job with nothing to read. Change a cap and its
+deadline arithmetic together (the workflow comments name both). Beyond the caps, the
+engineering targets for the Windows legs are an ordinary-suite median of at most ten minutes
+and a completed Windows check within fifteen, judged on at least three hosted samples per
+boundary Python version. These are acceptance targets, not guarantees; three samples support a
+median and a range, never a p95. A red sample is recorded as a result, never rerun into a
+green one.
 
 ## TUI testing
 

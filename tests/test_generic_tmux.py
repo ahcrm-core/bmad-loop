@@ -2258,16 +2258,24 @@ def test_untrusted_lineage_crumbs_once_and_keeps_the_767_rules(tmp_path, first_t
     }
 
 
-def test_wait_for_completion_transcriptless_stop_is_terminal_without_flag(tmp_path):
+def test_wait_for_completion_transcriptless_stop_is_terminal_without_flag(tmp_path, monkeypatch):
     """Gating: a profile without subagent_stop_without_transcript (claude) still
     treats every Stop as the main turn-end, so a result-less one stalls the dev
-    stage (0 nudges) — the filter must not leak to other CLIs."""
+    stage (0 nudges) — the filter must not leak to other CLIs.
+
+    The result-less Stop waits out the dev read-back's full ``RESULT_GRACE_S``
+    before the stall verdict; it runs on the adapter-scoped fake clock with each
+    poll's sleep as the event that advances it, so the production grace and its
+    deadline order are kept without 15 s of real waiting. The final clock
+    reading proves the whole grace elapsed rather than being skipped."""
     adapter, _ = make_dev_adapter(tmp_path, profile_name="claude")
     adapter._stall_grace_s = 0  # isolate the gating from the idle-grace path
     assert adapter.profile.subagent_stop_without_transcript is False
+    clock = _frozen_stall_clock(monkeypatch, sleep_advances=True)
     adapter.watcher = _ScriptedWatcher([_stop_event("3-1-dev-1", "sess", None)])
     result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
     assert result.status == "stalled"
+    assert clock["t"] == 1000.0 + generic.RESULT_GRACE_S
 
 
 def test_dev_stall_grace_defaults_from_policy(tmp_path):
@@ -2291,13 +2299,19 @@ def test_dev_stall_grace_defaults_from_policy(tmp_path):
 # record the deliberate divergence.
 
 
-def _frozen_stall_clock(monkeypatch):
+def _frozen_stall_clock(monkeypatch, *, sleep_advances=False):
     clock = {"t": 1000.0}
+
+    def _sleep(seconds=0.0, *_):
+        # Opt-in: a poll's sleep is the scripted event that advances fake time, so
+        # a RESULT_GRACE_S read-back expires in order without a real wait.
+        if sleep_advances:
+            clock["t"] += seconds
 
     class _Clock:
         monotonic = staticmethod(lambda: clock["t"])
         time = staticmethod(lambda: 0.0)  # wall co-bound stays frozen
-        sleep = staticmethod(lambda *_: None)
+        sleep = staticmethod(_sleep)
         time_ns = staticmethod(lambda: 0)
 
     monkeypatch.setattr(generic, "time", _Clock)

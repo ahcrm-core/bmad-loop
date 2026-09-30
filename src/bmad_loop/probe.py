@@ -55,11 +55,11 @@ from datetime import datetime, timezone
 from importlib import resources
 from pathlib import Path
 
-from . import runs, sanitize
+from . import childrun, runs, sanitize
 from .adapters.multiplexer import MultiplexerError, get_multiplexer
 from .adapters.profile import CLIProfile
 from .install import merge_hooks, relay_registered
-from .process_host import get_process_host
+from .process_host import ProcessHostError, get_process_host
 
 # cmd_probe catches `probe.LeakDetected` around the renderers, mirroring
 # diagnostics — the noqa keeps ruff's F401 autofix from deleting the re-export.
@@ -209,34 +209,39 @@ def binary_runs(binary: str, timeout_s: float = 10) -> int | None:
     Never raises, and that is load-bearing rather than defensive style: machine.py
     records that every gate in ``cmd_validate`` runs inside a ``try`` so "the
     command has no error path of its own — its rc is purely the verdict". A probe
-    that raised would give it one. The guard is ``_run_capture``'s exactly, and
-    the return is deliberately left as bytes (no ``text=True``): nothing here reads
-    the output, so the locale decode that forced ``errors="replace"`` on that
-    function never happens and cannot raise the ``UnicodeDecodeError`` the guard
-    does not name.
+    that raised would give it one. The guard names ``_run_capture``'s families
+    plus ``ProcessHostError``, the one fault the tree kill adds (a bogus
+    ``BMAD_LOOP_PROCESS_HOST`` override surfaces there). The output is never read;
+    :func:`childrun.run_argv` decodes it with ``errors="replace"``, so no
+    ``UnicodeDecodeError`` can escape either.
 
-    None (could not launch, or timed out) and a nonzero code are separate answers
-    to the caller, not one sentinel: the first has no return code to report.
+    None (could not launch, timed out, or interrupted before spawning) and a
+    nonzero code are separate answers to the caller, not one sentinel: the first
+    has no return code to report.
 
-    ``stdin=DEVNULL`` is required, not cosmetic. With the caller's tty inherited, a
-    shim that prompts blocks on the read for the whole timeout — measured 4.00s
-    against 0.00s — inside an interactive command.
+    Bounded by :func:`childrun.run_argv`, not ``subprocess.run``: on timeout the
+    latter killed only the root and then waited on the pipes with no bound, so a
+    Windows ``.cmd`` shim — rooted at ``cmd.exe``, the real program its child —
+    returned only when that child exited by itself (a 0.5 s timeout measured at
+    120 s). ``run_argv`` kills the whole tree and bounds the drain. It is also
+    stop-aware, but no hard-stop probe is installed here: ``cmd_validate`` never
+    runs inside ``Engine.run``, and the probe only reads the stop channel.
+
+    ``stdin=DEVNULL`` (``run_argv``'s spawn) is required, not cosmetic. With the
+    caller's tty inherited, a shim that prompts blocks on the read for the whole
+    timeout — measured 4.00s against 0.00s — inside an interactive command.
 
     Not folded into :func:`run_version_help`, which discards the return code by
     design and spawns TWO children (``--version`` then ``--help``) at ``timeout_s``
     each: reusing it would cost up to 20s per profile here.
     """
     try:
-        proc = subprocess.run(
-            [binary, "--version"],
-            capture_output=True,
-            check=False,
-            stdin=subprocess.DEVNULL,
-            timeout=timeout_s,
-        )
-    except (OSError, subprocess.SubprocessError):
+        run = childrun.run_argv([binary, "--version"], cwd=None, timeout=timeout_s)
+    except (OSError, subprocess.SubprocessError, ProcessHostError):
         return None
-    return proc.returncode
+    if run.timed_out or run.interrupted:
+        return None
+    return run.returncode
 
 
 def run_version_help(binary: str, timeout_s: float = 10) -> FlagFinding:

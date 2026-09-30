@@ -4,9 +4,9 @@ from conftest import fault_metadata_probe, write_sprint
 from bmad_loop import sprintstatus
 
 
-def test_load_classifies_keys(project):
+def test_load_classifies_keys(project_tree):
     write_sprint(
-        project,
+        project_tree,
         {
             "epic-1": "in-progress",
             "1-1-user-auth": "done",
@@ -20,7 +20,7 @@ def test_load_classifies_keys(project):
             "weird-key": "huh",
         },
     )
-    ss = sprintstatus.load(project.sprint_status)
+    ss = sprintstatus.load(project_tree.sprint_status)
     assert ss.epics == {1: "in-progress", 2: "backlog"}
     assert [s.key for s in ss.stories] == [
         "1-1-user-auth",
@@ -32,11 +32,11 @@ def test_load_classifies_keys(project):
     assert ss.unknown_keys == ("weird-key",)
 
 
-def test_load_split_story_keys(project):
+def test_load_split_story_keys(project_tree):
     # BMAD splits an oversized story into 2-6a / 2-6b (issue #144); both halves
     # must parse as stories — not fall into unknown_keys — and keep file order.
     write_sprint(
-        project,
+        project_tree,
         {
             "2-5-intact": "done",
             "2-6a-build-structure": "backlog",
@@ -46,7 +46,7 @@ def test_load_split_story_keys(project):
             "2-6A-not-lower": "backlog",  # uppercase: not the convention
         },
     )
-    ss = sprintstatus.load(project.sprint_status)
+    ss = sprintstatus.load(project_tree.sprint_status)
     assert [s.key for s in ss.stories] == [
         "2-5-intact",
         "2-6a-build-structure",
@@ -62,16 +62,16 @@ def test_load_split_story_keys(project):
     assert sprintstatus.next_actionable(ss).key == "2-6a-build-structure"
 
 
-def test_load_classifies_retro_items(project):
+def test_load_classifies_retro_items(project_tree):
     write_sprint(
-        project,
+        project_tree,
         {
             "epic-1-retrospective": "done",
             "epic-1-retro-item-1-test-design-in-stories": "done",
             "epic-5-retro-item-2-singleflight-inflight-guard-helper": "backlog",
         },
     )
-    ss = sprintstatus.load(project.sprint_status)
+    ss = sprintstatus.load(project_tree.sprint_status)
     # retro action items are recognized, not dumped into unknown_keys
     assert ss.unknown_keys == ()
     assert ss.retros == {1: "done"}  # plain retrospective key is unaffected
@@ -87,26 +87,26 @@ def test_load_classifies_retro_items(project):
     ]
 
 
-def test_retro_items_do_not_become_actionable_stories(project):
+def test_retro_items_do_not_become_actionable_stories(project_tree):
     # recognition only: retro items must not leak into story selection
-    write_sprint(project, {"epic-3-retro-item-1-do-a-thing": "backlog"})
-    ss = sprintstatus.load(project.sprint_status)
+    write_sprint(project_tree, {"epic-3-retro-item-1-do-a-thing": "backlog"})
+    ss = sprintstatus.load(project_tree.sprint_status)
     assert ss.stories == ()
     assert sprintstatus.next_actionable(ss) is None
 
 
-def test_legacy_drafted_maps_to_ready(project):
-    write_sprint(project, {"1-1-x": "drafted"})
-    ss = sprintstatus.load(project.sprint_status)
+def test_legacy_drafted_maps_to_ready(project_tree):
+    write_sprint(project_tree, {"1-1-x": "drafted"})
+    ss = sprintstatus.load(project_tree.sprint_status)
     assert ss.stories[0].status == "ready-for-dev"
 
 
-def test_next_actionable_order_and_skip(project):
+def test_next_actionable_order_and_skip(project_tree):
     write_sprint(
-        project,
+        project_tree,
         {"1-1-a": "done", "1-2-b": "ready-for-dev", "1-3-c": "backlog"},
     )
-    ss = sprintstatus.load(project.sprint_status)
+    ss = sprintstatus.load(project_tree.sprint_status)
     assert sprintstatus.next_actionable(ss).key == "1-2-b"
     assert sprintstatus.next_actionable(ss, skip={"1-2-b"}).key == "1-3-c"
     assert sprintstatus.next_actionable(ss, skip={"1-2-b", "1-3-c"}) is None
@@ -145,11 +145,11 @@ def test_parked_story_is_never_picked_as_next_actionable(project):
     assert sprintstatus.next_actionable(ss, skip={"1-2-b"}) is None
 
 
-def test_parked_story_cannot_be_targeted_by_a_selector(project):
+def test_parked_story_cannot_be_targeted_by_a_selector(project_tree):
     """`--story` naming a parked story is a user error with a specific message,
     not a silent re-drive: select_actionable filters on the same set."""
-    write_sprint(project, {"1-1-a": "awaiting-operator"})
-    ss = sprintstatus.load(project.sprint_status)
+    write_sprint(project_tree, {"1-1-a": "awaiting-operator"})
+    ss = sprintstatus.load(project_tree.sprint_status)
     with pytest.raises(
         sprintstatus.SprintStatusError,
         match=r"story 1-1 matched 1-1-a but its status is 'awaiting-operator'",
@@ -157,24 +157,24 @@ def test_parked_story_cannot_be_targeted_by_a_selector(project):
         sprintstatus.select_actionable(ss, None, "1-1")
 
 
-def test_next_actionable_epic_filter(project):
+def test_next_actionable_epic_filter(project_tree):
     # document order (epic 5 before epic 9), not numeric; the epic filter returns
     # epic 9's first actionable story even though 5-1 is earlier in the file.
     write_sprint(
-        project,
+        project_tree,
         {"5-1-e5": "backlog", "9-0-x": "ready-for-dev", "9-1-y": "backlog"},
     )
-    ss = sprintstatus.load(project.sprint_status)
+    ss = sprintstatus.load(project_tree.sprint_status)
     assert sprintstatus.next_actionable(ss).key == "5-1-e5"  # unfiltered = file order
     assert sprintstatus.next_actionable(ss, epic=9).key == "9-0-x"
     assert sprintstatus.next_actionable(ss, skip={"9-0-x"}, epic=9).key == "9-1-y"
     assert sprintstatus.next_actionable(ss, skip={"9-0-x", "9-1-y"}, epic=9) is None
 
 
-def test_story_status_reread(project):
-    write_sprint(project, {"1-1-a": "in-progress"})
-    assert sprintstatus.story_status(project.sprint_status, "1-1-a") == "in-progress"
-    assert sprintstatus.story_status(project.sprint_status, "9-9-z") is None
+def test_story_status_reread(project_tree):
+    write_sprint(project_tree, {"1-1-a": "in-progress"})
+    assert sprintstatus.story_status(project_tree.sprint_status, "1-1-a") == "in-progress"
+    assert sprintstatus.story_status(project_tree.sprint_status, "9-9-z") is None
 
 
 def test_parse_selector_forms():
@@ -223,12 +223,12 @@ def test_parse_selector_epic_conflict():
         sprintstatus.parse_selector(2, "3-1-user-auth")
 
 
-def test_select_actionable_short_ref_and_epic_story(project):
+def test_select_actionable_short_ref_and_epic_story(project_tree):
     write_sprint(
-        project,
+        project_tree,
         {"3-1-user-auth": "ready-for-dev", "3-2-foo": "backlog", "4-1-bar": "backlog"},
     )
-    ss = sprintstatus.load(project.sprint_status)
+    ss = sprintstatus.load(project_tree.sprint_status)
     for epic, story in [(None, "3-1"), (None, "3.1"), (3, "1"), (None, "user-auth")]:
         got = sprintstatus.select_actionable(ss, epic, story)
         assert [s.key for s in got] == ["3-1-user-auth"]
@@ -239,16 +239,16 @@ def test_select_actionable_short_ref_and_epic_story(project):
     ]
 
 
-def test_select_actionable_split_suffix(project):
+def test_select_actionable_split_suffix(project_tree):
     write_sprint(
-        project,
+        project_tree,
         {
             "2-6a-build-structure": "backlog",
             "2-6b-extend-structure": "backlog",
             "2-7-later": "backlog",
         },
     )
-    ss = sprintstatus.load(project.sprint_status)
+    ss = sprintstatus.load(project_tree.sprint_status)
     # a suffixed ref selects exactly its half — never the sibling
     for epic, story in [(None, "2-6a"), (None, "2.6a"), (2, "6a")]:
         got = sprintstatus.select_actionable(ss, epic, story)
@@ -266,12 +266,12 @@ def test_select_actionable_split_suffix(project):
         sprintstatus.select_actionable(ss, None, "2-6c")
 
 
-def test_select_actionable_split_suffix_not_actionable(project):
+def test_select_actionable_split_suffix_not_actionable(project_tree):
     write_sprint(
-        project,
+        project_tree,
         {"2-6a-build-structure": "done", "2-6b-extend-structure": "backlog"},
     )
-    ss = sprintstatus.load(project.sprint_status)
+    ss = sprintstatus.load(project_tree.sprint_status)
     with pytest.raises(
         sprintstatus.SprintStatusError,
         match=r"story 2-6a matched 2-6a-build-structure but its status is 'done'",
@@ -282,9 +282,9 @@ def test_select_actionable_split_suffix_not_actionable(project):
     assert [s.key for s in got] == ["2-6b-extend-structure"]
 
 
-def test_select_actionable_targeted_not_actionable(project):
-    write_sprint(project, {"3-1-user-auth": "ready-for-dev", "3-2-foo": "done"})
-    ss = sprintstatus.load(project.sprint_status)
+def test_select_actionable_targeted_not_actionable(project_tree):
+    write_sprint(project_tree, {"3-1-user-auth": "ready-for-dev", "3-2-foo": "done"})
+    ss = sprintstatus.load(project_tree.sprint_status)
     with pytest.raises(
         sprintstatus.SprintStatusError,
         match=r"story 3-2 matched 3-2-foo but its status is 'done'",
@@ -292,35 +292,35 @@ def test_select_actionable_targeted_not_actionable(project):
         sprintstatus.select_actionable(ss, None, "3-2")
 
 
-def test_select_actionable_ambiguous_slug(project):
-    write_sprint(project, {"3-1-user-auth": "backlog", "4-2-admin-auth": "backlog"})
-    ss = sprintstatus.load(project.sprint_status)
+def test_select_actionable_ambiguous_slug(project_tree):
+    write_sprint(project_tree, {"3-1-user-auth": "backlog", "4-2-admin-auth": "backlog"})
+    ss = sprintstatus.load(project_tree.sprint_status)
     with pytest.raises(sprintstatus.SprintStatusError, match="ambiguous"):
         sprintstatus.select_actionable(ss, None, "auth")
 
 
-def test_select_actionable_no_match(project):
-    write_sprint(project, {"3-1-user-auth": "backlog"})
-    ss = sprintstatus.load(project.sprint_status)
+def test_select_actionable_no_match(project_tree):
+    write_sprint(project_tree, {"3-1-user-auth": "backlog"})
+    ss = sprintstatus.load(project_tree.sprint_status)
     with pytest.raises(sprintstatus.SprintStatusError, match="no story matches"):
         sprintstatus.select_actionable(ss, None, "9-9")
 
 
-def test_missing_file_raises(project):
+def test_missing_file_raises(project_tree):
     with pytest.raises(sprintstatus.SprintStatusError, match="not found"):
-        sprintstatus.load(project.sprint_status)
+        sprintstatus.load(project_tree.sprint_status)
 
 
-def test_malformed_yaml_raises(project):
-    project.sprint_status.write_text("development_status: [unclosed")
+def test_malformed_yaml_raises(project_tree):
+    project_tree.sprint_status.write_text("development_status: [unclosed")
     with pytest.raises(sprintstatus.SprintStatusError, match="not valid YAML"):
-        sprintstatus.load(project.sprint_status)
+        sprintstatus.load(project_tree.sprint_status)
 
 
-def test_missing_map_raises(project):
-    project.sprint_status.write_text("project: x\n")
+def test_missing_map_raises(project_tree):
+    project_tree.sprint_status.write_text("project: x\n")
     with pytest.raises(sprintstatus.SprintStatusError, match="development_status"):
-        sprintstatus.load(project.sprint_status)
+        sprintstatus.load(project_tree.sprint_status)
 
 
 # ---------------------------------------------------------------- action_items (DW-388)
@@ -362,13 +362,13 @@ action_items:
 """
 
 
-def test_load_action_items_reads_id_keyed_items_in_file_order(project):
+def test_load_action_items_reads_id_keyed_items_in_file_order(project_tree):
     """The happy path, plus every skip rule and normalization in one board.
 
     Ablation: drop the `if item_id is None: continue` skip and the legacy row (and
     the blank/non-string ids) appear, reddening the id list."""
-    project.sprint_status.write_text(_BOARD_WITH_ITEMS, encoding="utf-8")
-    items = sprintstatus.load_action_items(project.sprint_status)
+    project_tree.sprint_status.write_text(_BOARD_WITH_ITEMS, encoding="utf-8")
+    items = sprintstatus.load_action_items(project_tree.sprint_status)
     assert items is not None
     assert [i.id for i in items] == [
         "epic-1-retro-item-1-add-x",
@@ -409,13 +409,13 @@ def test_load_action_items_reads_id_keyed_items_in_file_order(project):
     assert boolean.epic is None
 
 
-def test_load_action_items_absent_board_is_none(project):
+def test_load_action_items_absent_board_is_none(project_tree):
     """Absence is not a fault: no board means nothing to ingest.
 
     Ablation: drop the `FileNotFoundError` arm and this raises
     `SprintStatusError` instead of answering None."""
-    project.sprint_status.unlink(missing_ok=True)
-    assert sprintstatus.load_action_items(project.sprint_status) is None
+    project_tree.sprint_status.unlink(missing_ok=True)
+    assert sprintstatus.load_action_items(project_tree.sprint_status) is None
 
 
 @pytest.mark.parametrize(
@@ -430,9 +430,9 @@ def test_load_action_items_absent_board_is_none(project):
     ],
     ids=["no-key", "no-dev-status", "null-value", "empty-list"],
 )
-def test_load_action_items_without_items_is_empty(project, board):
-    project.sprint_status.write_text(board, encoding="utf-8")
-    assert sprintstatus.load_action_items(project.sprint_status) == ()
+def test_load_action_items_without_items_is_empty(project_tree, board):
+    project_tree.sprint_status.write_text(board, encoding="utf-8")
+    assert sprintstatus.load_action_items(project_tree.sprint_status) == ()
 
 
 @pytest.mark.parametrize(
@@ -440,13 +440,13 @@ def test_load_action_items_without_items_is_empty(project, board):
     ["action_items: {id: x}\n", "action_items: just text\n", "action_items: 3\n"],
     ids=["mapping", "scalar", "number"],
 )
-def test_load_action_items_non_list_raises_malformed(project, board):
+def test_load_action_items_non_list_raises_malformed(project_tree, board):
     """Ablation: drop the `isinstance(listed, list)` check and the mapping row
     iterates its keys (skipping them all) and returns `()` silently, the scalar
     row iterates characters — none raise."""
-    project.sprint_status.write_text(board, encoding="utf-8")
+    project_tree.sprint_status.write_text(board, encoding="utf-8")
     with pytest.raises(sprintstatus.ActionItemsMalformed, match="not a list"):
-        sprintstatus.load_action_items(project.sprint_status)
+        sprintstatus.load_action_items(project_tree.sprint_status)
 
 
 def test_action_items_malformed_is_a_sprint_status_error():
@@ -464,29 +464,29 @@ def test_action_items_malformed_is_a_sprint_status_error():
     ],
     ids=["bad-yaml", "top-level-list", "empty-file", "undecodable"],
 )
-def test_load_action_items_unreadable_board_raises(project, raw, match):
+def test_load_action_items_unreadable_board_raises(project_tree, raw, match):
     """Every board-level fault is a typed `SprintStatusError` — including an
     undecodable file, which `read_text` raises as `UnicodeDecodeError` (a
     `ValueError`, not an `OSError`).
 
     Ablation: drop `UnicodeDecodeError` from the read's except tuple and the
     undecodable row escapes untyped."""
-    project.sprint_status.write_bytes(raw)
+    project_tree.sprint_status.write_bytes(raw)
     with pytest.raises(sprintstatus.SprintStatusError, match=match) as exc_info:
-        sprintstatus.load_action_items(project.sprint_status)
+        sprintstatus.load_action_items(project_tree.sprint_status)
     assert not isinstance(exc_info.value, sprintstatus.ActionItemsMalformed)
 
 
-def test_load_is_unaffected_by_action_items(project):
+def test_load_is_unaffected_by_action_items(project_tree):
     """`load()` stays byte-for-byte behaviourally identical: the retro list is
     neither a key it classifies nor a shape it validates — a malformed one
     included, which only `load_action_items` refuses."""
-    write_sprint(project, {"epic-1": "in-progress", "1-1-user-auth": "done"})
-    baseline = sprintstatus.load(project.sprint_status)
-    text = project.sprint_status.read_text(encoding="utf-8")
+    write_sprint(project_tree, {"epic-1": "in-progress", "1-1-user-auth": "done"})
+    baseline = sprintstatus.load(project_tree.sprint_status)
+    text = project_tree.sprint_status.read_text(encoding="utf-8")
     for tail in (_BOARD_WITH_ITEMS.split("\naction_items:", 1)[1], " not-a-list\n"):
-        project.sprint_status.write_text(text + "action_items:" + tail, encoding="utf-8")
-        ss = sprintstatus.load(project.sprint_status)
+        project_tree.sprint_status.write_text(text + "action_items:" + tail, encoding="utf-8")
+        ss = sprintstatus.load(project_tree.sprint_status)
         assert (ss.epics, ss.stories, ss.retros, ss.retro_items, ss.unknown_keys) == (
             baseline.epics,
             baseline.stories,
@@ -496,25 +496,25 @@ def test_load_is_unaffected_by_action_items(project):
         )
 
 
-def test_load_action_items_non_regular_board_raises(project):
+def test_load_action_items_non_regular_board_raises(project_tree):
     """A board path that exists but is not a file is a fault, not absence.
 
     Ablation: restore `return None` for the non-`S_ISREG` arm and this answers
     None — indistinguishable from "no board"."""
-    project.sprint_status.unlink(missing_ok=True)
-    project.sprint_status.mkdir()
+    project_tree.sprint_status.unlink(missing_ok=True)
+    project_tree.sprint_status.mkdir()
     with pytest.raises(sprintstatus.SprintStatusError, match="not a regular file"):
-        sprintstatus.load_action_items(project.sprint_status)
+        sprintstatus.load_action_items(project_tree.sprint_status)
 
 
-def test_load_action_items_metadata_fault_raises_typed(project, monkeypatch):
+def test_load_action_items_metadata_fault_raises_typed(project_tree, monkeypatch):
     """A `stat` refusal is a `SprintStatusError` (not the malformed-list
     subclass), never a bare OSError and never "no board".
 
     Ablation: drop the `except OSError` arm around `stat()` and the
     PermissionError escapes untyped."""
-    project.sprint_status.write_text("action_items: []\n", encoding="utf-8")
-    fault_metadata_probe(monkeypatch, project.sprint_status, "stat")
+    project_tree.sprint_status.write_text("action_items: []\n", encoding="utf-8")
+    fault_metadata_probe(monkeypatch, project_tree.sprint_status, "stat")
     with pytest.raises(sprintstatus.SprintStatusError, match="could not be read") as exc_info:
-        sprintstatus.load_action_items(project.sprint_status)
+        sprintstatus.load_action_items(project_tree.sprint_status)
     assert not isinstance(exc_info.value, sprintstatus.ActionItemsMalformed)
