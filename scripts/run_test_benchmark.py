@@ -99,6 +99,7 @@ class _TreeJob:
     _PROCESS_QUERY_INFORMATION = 0x0400
     _JOB_OBJECT_BASIC_PROCESS_ID_LIST = 3
     _ERROR_MORE_DATA = 234
+    _STILL_ACTIVE = 259
     _SWEEPS = 5  # members started while a sweep runs are caught by the next
 
     def __init__(self, kernel32: Any, handle: int) -> None:
@@ -137,6 +138,8 @@ class _TreeJob:
         kernel32.IsProcessInJob.restype = wintypes.BOOL
         kernel32.TerminateProcess.argtypes = (wintypes.HANDLE, wintypes.UINT)
         kernel32.TerminateProcess.restype = wintypes.BOOL
+        kernel32.GetExitCodeProcess.argtypes = (wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD))
+        kernel32.GetExitCodeProcess.restype = wintypes.BOOL
         kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
         kernel32.CloseHandle.restype = wintypes.BOOL
 
@@ -198,9 +201,19 @@ class _TreeJob:
             member = wintypes.BOOL(False)
             if not self._kernel32.IsProcessInJob(process, self._handle, ctypes.byref(member)):
                 return f"{pid}: IsProcessInJob winerror {ctypes.get_last_error()}"
-            if member and not self._kernel32.TerminateProcess(process, 1):
-                return f"{pid}: TerminateProcess winerror {ctypes.get_last_error()}"
-            return None
+            if not member or self._kernel32.TerminateProcess(process, 1):
+                return None
+            err = ctypes.get_last_error()
+            # A member taskkill just ended is still listed until it finishes
+            # exiting, and TerminateProcess refuses it (access denied): exited
+            # is not a failure.
+            code = wintypes.DWORD(self._STILL_ACTIVE)
+            if (
+                self._kernel32.GetExitCodeProcess(process, ctypes.byref(code))
+                and code.value != self._STILL_ACTIVE
+            ):
+                return None
+            return f"{pid}: TerminateProcess winerror {err}"
         finally:
             self._kernel32.CloseHandle(process)
 
