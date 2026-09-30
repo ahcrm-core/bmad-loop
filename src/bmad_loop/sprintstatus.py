@@ -38,6 +38,7 @@ ledger. Nothing here writes the list.
 
 from __future__ import annotations
 
+import bisect
 import re
 import stat
 import tempfile
@@ -45,6 +46,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 import yaml
 
@@ -355,11 +357,108 @@ _QUOTED_VALUE_RE = re.compile(r"^(?P<val>['\"](?:.*\S)?)$")
 _UNQUOTED_VALUE_RE = re.compile(r"^(?P<val>\S(?:.*?\S)?)(?P<rest>[ \t]+#.*)?$")
 
 
-def _set_mapping_value(lines: list[str], key: str, new_value: str) -> bool:
-    """In-place replace the value of the first `key:` line, preserving
+_Scope = Literal["root", "development_status"]
+
+
+@dataclass(frozen=True)
+class _RowSpan:
+    """Where one mapping entry's key and scalar value sit in the source.
+
+    Line numbers index the caller's ``lines``; columns count characters from the
+    start of their line. ``value_*`` is the value node's own extent, so a value
+    that runs past its first line says so here whatever its indentation."""
+
+    key_line: int
+    key_col: int
+    value_first_line: int
+    value_last_line: int
+    value_end_col: int
+    style: str | None  # PyYAML's ScalarNode.style: None for plain
+    value: str
+
+
+def _locate_row(lines: list[str], key: str, scope: _Scope) -> _RowSpan | None:
+    """Find the entry :func:`load` would read for ``key`` in ``scope``, by source mark.
+
+    Composes the board with ``yaml.SafeLoader`` — the parser :func:`load` uses —
+    and never serializes it: the nodes only say WHERE the row is, and
+    :func:`_set_mapping_value` still owns every emitted byte. ``root`` is the
+    document's top-level mapping; ``development_status`` is the mapping under
+    that key. Text that merely looks like the row (inside a block scalar, under
+    another mapping) is never a node of the right mapping, so it cannot be
+    selected. A duplicate key resolves last-wins in both mappings, as the
+    constructor's dict assignment does, so the row found here is the row
+    :func:`story_status` read.
+
+    Returns None when there is no such scalar-valued entry: the key is absent,
+    only reachable through a ``<<`` merge, or its value is a collection or an
+    alias to a node authored elsewhere. Raises :class:`SprintStatusError` when
+    the lines do not parse — the caller parsed this board before editing it, so
+    that can only be an edit gone wrong, and it must not be published."""
+    text = "".join(lines)
+    try:
+        root = yaml.compose(text, Loader=yaml.SafeLoader)
+    except yaml.YAMLError as e:
+        raise SprintStatusError(f"sprint status is not valid YAML: {e}") from e
+    mapping = root
+    if scope == "development_status":
+        section = _last_entry(root, "development_status")
+        mapping = section[1] if section else None
+    entry = _last_entry(mapping, key)
+    if entry is None:
+        return None
+    key_node, value_node = entry
+    if not isinstance(value_node, yaml.ScalarNode):
+        return None
+    if value_node.start_mark.index < key_node.end_mark.index:
+        return None  # an alias: its marks belong to the anchor, not to this row
+
+    starts: list[int] = []
+    offset = 0
+    for line in lines:
+        starts.append(offset)
+        offset += len(line)
+
+    def where(index: int) -> tuple[int, int]:
+        line = bisect.bisect_right(starts, index) - 1
+        return line, index - starts[line]
+
+    key_line, key_col = where(key_node.start_mark.index)
+    first_line, _ = where(value_node.start_mark.index)
+    last_line, end_col = where(value_node.end_mark.index)
+    return _RowSpan(
+        key_line=key_line,
+        key_col=key_col,
+        value_first_line=first_line,
+        value_last_line=last_line,
+        value_end_col=end_col,
+        style=value_node.style,
+        value=value_node.value,
+    )
+
+
+def _last_entry(mapping: object, key: str) -> tuple[yaml.Node, yaml.Node] | None:
+    """The ``(key, value)`` node pair of the LAST ``key`` entry in a mapping node."""
+    if not isinstance(mapping, yaml.MappingNode):
+        return None
+    for key_node, value_node in reversed(mapping.value):
+        if isinstance(key_node, yaml.ScalarNode) and key_node.value == key:
+            return key_node, value_node
+    return None
+
+
+def _set_mapping_value(lines: list[str], key: str, new_value: str, *, scope: _Scope) -> bool:
+    """In-place replace the value of the ``key`` entry in ``scope``, preserving
     indentation and any trailing ` # comment`. Returns True on a real change. A
     minimal line edit (not a YAML round-trip) so the file's comments and
     structure — STATUS DEFINITIONS, WORKFLOW NOTES — survive verbatim.
+
+    Which line is edited is decided by the parser, not by a text search:
+    :func:`_locate_row` names the key line and the value's exact source span in
+    ``scope`` (story and epic rows under ``development_status``, ``last_updated``
+    at the root). A textual scan would take the first line that merely looks like
+    the row — inside an earlier block scalar, under another mapping, or a
+    duplicate the parser overrides — and rewrite it while the real row stays put.
 
     The split between value and comment is two-stage: the key prefix is matched
     first and the whole remainder captured, then that remainder decides for
@@ -370,34 +469,99 @@ def _set_mapping_value(lines: list[str], key: str, new_value: str) -> bool:
     that OPENS WITH A QUOTE is taken whole and no comment is recognized in it at
     all: a fused pattern would guess the boundary from the last ` #` on the line
     and turn `status: "a # b"` into `status: done # b"`, promoting scalar text
-    into a comment the board never had (#366). Nothing here can tell where a
-    quoted scalar ends — the closing quote may be escaped, or on another line —
-    so a comment sitting after one is dropped rather than guessed at. Lossy,
-    never wrong, and only a hand-edit reaches it: the writer replaces such a
-    value with a bare token on the next advance.
+    into a comment the board never had (#366). The span proves the closing quote
+    is on the key line, but not where on it, so a comment sitting after one is
+    dropped rather than guessed at. Lossy, never wrong, and only a hand-edit
+    reaches it: the writer replaces such a value with a bare token on the next
+    advance.
 
-    A remainder neither arm can read leaves the line alone, exactly like a key
-    that never matched — `advance` reports the unchanged status rather than
-    claiming a write it did not make. Each line's terminator is excluded from
-    the scalar match and then reattached exactly as authored (#576)."""
-    key_pat = re.compile(rf"^(?P<indent>\s*){re.escape(key)}:(?P<gap>[ \t]+)(?P<body>\S.*)$")
-    for i, line in enumerate(lines):
-        stripped = line.rstrip("\r\n")
-        m = key_pat.match(stripped)
-        if not m:
-            continue
-        body = m.group("body")
-        value_pat = _QUOTED_VALUE_RE if body[0] in "'\"" else _UNQUOTED_VALUE_RE
-        vm = value_pat.match(body)
-        if not vm:
-            continue  # unreadable remainder — leave the line as authored
-        if vm.group("val") == new_value:
+    A row the line edit cannot rewrite exactly — a key authored in quotes or
+    flow style, a remainder neither arm can read — is left alone, exactly like
+    an absent key: `advance` reports the unchanged status rather than claiming a
+    write it did not make. Each line's terminator is excluded from the scalar
+    match and then reattached exactly as authored (#576).
+
+    A value may also run past the key line. The one such shape this reads is the
+    FOLDED plain row a width-limited dump (ruamel wraps at 80) emits for a long
+    key: nothing but whitespace after the colon, then a plain scalar starting on
+    the very next line. :func:`_folded_span_is_plain` checks its lines; the key
+    line and exactly the value's span collapse into one `key: value` line that
+    takes the terminator the span's last line had. A value that STARTS on the key
+    line is edited only when its span ends there too. Every other multi-line
+    value — a block scalar (`|`, `>`), a quoted or plain scalar that wraps from
+    the key line (whatever the indentation of its later lines), a nested mapping
+    or sequence, a comment or blank line inside or before the value — is refused
+    whole: rewriting only the key line would leave the rest behind as part of
+    the value (`key: done` over `    backlog` parses as `done backlog`) or turn
+    it into invalid YAML."""
+    row = _locate_row(lines, key, scope)
+    if row is None:
+        return False
+    line = lines[row.key_line]
+    stripped = line.rstrip("\r\n")
+    if row.value_first_line > row.key_line:
+        em = re.match(rf"^(?P<indent>\s*){re.escape(key)}:[ \t]*$", stripped)
+        if (
+            em is None
+            or len(em.group("indent")) != row.key_col
+            or not _folded_span_is_plain(lines, row)
+        ):
+            return False  # not a shape this can read whole — leave it as authored
+        if row.value == new_value:
             return False  # already at target — idempotent no-op
-        rest = vm.groupdict().get("rest") or ""
-        nl = line[len(stripped) :]
-        lines[i] = f"{m.group('indent')}{key}:{m.group('gap')}{new_value}{rest}" + nl
+        last = lines[row.value_last_line]
+        nl = last[len(last.rstrip("\r\n")) :]
+        lines[row.key_line : row.value_last_line + 1] = [
+            f"{em.group('indent')}{key}: {new_value}" + nl
+        ]
         return True
-    return False
+    if row.value_last_line != row.key_line:
+        return False  # the value runs onto later lines — a one-line edit would orphan them
+    m = re.match(rf"^(?P<indent>\s*){re.escape(key)}:(?P<gap>[ \t]+)(?P<body>\S.*)$", stripped)
+    if m is None or len(m.group("indent")) != row.key_col:
+        return False
+    body = m.group("body")
+    value_pat = _QUOTED_VALUE_RE if body[0] in "'\"" else _UNQUOTED_VALUE_RE
+    vm = value_pat.match(body)
+    if not vm:
+        return False  # unreadable remainder — leave the line as authored
+    if vm.group("val") == new_value:
+        return False  # already at target — idempotent no-op
+    rest = vm.groupdict().get("rest") or ""
+    nl = line[len(stripped) :]
+    lines[row.key_line] = f"{m.group('indent')}{key}:{m.group('gap')}{new_value}{rest}" + nl
+    return True
+
+
+# Characters that cannot open a line of the folded row this writer accepts:
+# YAML indicators (block scalars, quotes, flow collections, anchors, tags,
+# sequences, comments). A plain scalar's continuation line may legally open
+# with most of them (`ready` over `- for dev` is the one value `ready - for
+# dev`); refusing the whole class is stricter than YAML, and a refused row is
+# left as authored.
+_PLAIN_FRAGMENT_REFUSED_LEADS = frozenset("#|>'\"-?:,[]{}&*!%@`")
+
+
+def _folded_span_is_plain(lines: list[str], row: _RowSpan) -> bool:
+    """Is ``row``'s value the folded shape: a plain scalar starting on the line
+    right after the key, every line of its span a content line opening with no
+    indicator, and nothing but whitespace after it on its last line?
+
+    The parser has already proved the span; this only narrows which spans the
+    writer will collapse. A comment or blank line between key and value, a blank
+    line inside it (YAML keeps it as a newline), or a comment after it would be
+    lost by the collapse, so each refuses the row. So is a span ending in a
+    Unicode line break (NEL, LS, PS): ``str.splitlines`` and YAML both end the
+    line there, but it is not one of the ``\r``/``\n`` terminators the collapse
+    carries over, so only spaces and tabs may follow the value."""
+    if row.style is not None or row.value_first_line != row.key_line + 1:
+        return False
+    for text in lines[row.value_first_line : row.value_last_line + 1]:
+        content = text.rstrip("\r\n").lstrip(" ")
+        if not content.strip() or content[0] in _PLAIN_FRAGMENT_REFUSED_LEADS:
+            return False
+    tail = lines[row.value_last_line].rstrip("\r\n")[row.value_end_col :]
+    return not tail.strip(" \t")
 
 
 @contextmanager
@@ -598,10 +762,12 @@ def _advance_locked(
     text = path.read_bytes().decode("utf-8")
     lines = text.splitlines(keepends=True)
     # story_status() resolves keys via a full YAML parse, but _set_mapping_value
-    # rewrites via a line regex that can't touch every shape it finds (quoted or
+    # rewrites via a line edit that can't touch every shape it finds (quoted or
     # block-scalar keys). If the story line itself wasn't rewritten, report the
-    # unchanged status rather than falsely claiming we advanced to target.
-    story_changed = _set_mapping_value(lines, story_key, target)
+    # unchanged status rather than falsely claiming we advanced to target. Each
+    # call below re-locates its row in the lines as edited so far, so an earlier
+    # collapse never leaves a later edit aiming at a stale line number.
+    story_changed = _set_mapping_value(lines, story_key, target, scope="development_status")
     if not story_changed:
         return current
     changed = story_changed
@@ -612,10 +778,13 @@ def _advance_locked(
             epic_key = f"epic-{int(m.group(1))}"
             ss = load(path)
             if ss.epics.get(int(m.group(1))) == "backlog":
-                changed = _set_mapping_value(lines, epic_key, "in-progress") or changed
+                changed = (
+                    _set_mapping_value(lines, epic_key, "in-progress", scope="development_status")
+                    or changed
+                )
 
     if now is not None:
-        changed = _set_mapping_value(lines, "last_updated", now) or changed
+        changed = _set_mapping_value(lines, "last_updated", now, scope="root") or changed
 
     if changed:
         atomic_write_bytes(path, "".join(lines).encode("utf-8"), require_writable_target=True)

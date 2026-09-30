@@ -58,6 +58,13 @@ breaking changes may land in a minor release.
 - Return `bmad-loop validate`'s coding-CLI probe at its timeout on a Windows `.cmd` launcher
   and kill the launcher's descendants, instead of waiting for the launched program to exit
   (120 s observed in CI).
+- Advance a sprint-status row whose status is folded onto an indented continuation line,
+  as a width-80 YAML dump writes a long story key, instead of leaving the old status and
+  rolling the finished story back; the row collapses to one `key: status` line (#842).
+  Contributed by [@mswanson](https://github.com/mswanson).
+- Edit only the sprint-status row the YAML parser reads, never look-alike text in a block
+  scalar or another mapping, and leave a multi-line value the writer cannot read whole
+  untouched instead of rewriting only its first line.
 
 ## [0.13.0] — 2026-09-28
 

@@ -30,6 +30,11 @@ development_status:
 """
 
 
+# The parent line the private-helper tests put above their rows, so the rows
+# are the `development_status` entries a story/epic write is scoped to.
+_DEV = "development_status:\n"
+
+
 def _write(tmp_path: Path) -> Path:
     p = tmp_path / "sprint-status.yaml"
     p.write_text(SPRINT, encoding="utf-8")
@@ -322,13 +327,15 @@ def test_a_quoted_value_is_replaced_whole_with_no_comment_carried(tmp_path):
     """The writer's own half of the case above: the write SUCCEEDS (a quoted
     hand-edit is still a value the orchestrator owns and replaces), and what it
     leaves behind is the bare target and nothing else."""
-    lines = ['  3-2-x: "a # b"  # real comment\n']
+    lines = [_DEV, '  3-2-x: "a # b"  # real comment\n']
 
-    assert sprintstatus._set_mapping_value(lines, "3-2-x", "done") is True
+    assert (
+        sprintstatus._set_mapping_value(lines, "3-2-x", "done", scope="development_status") is True
+    )
 
     # the trailing comment goes too: nothing here can tell a closing quote from
     # a quote inside the scalar, so a comment after one is dropped, not guessed.
-    assert "".join(lines) == "  3-2-x: done\n"
+    assert "".join(lines) == _DEV + "  3-2-x: done\n"
 
 
 def test_a_value_with_internal_spaces_is_matched_whole(tmp_path):
@@ -338,7 +345,10 @@ def test_a_value_with_internal_spaces_is_matched_whole(tmp_path):
     happening (`test_advance_refreshes_last_updated` is the advance-level half)."""
     lines = ["last_updated: 01-06-2026 10:00\n"]
 
-    assert sprintstatus._set_mapping_value(lines, "last_updated", "22-06-2026 14:30") is True
+    assert (
+        sprintstatus._set_mapping_value(lines, "last_updated", "22-06-2026 14:30", scope="root")
+        is True
+    )
 
     assert "".join(lines) == "last_updated: 22-06-2026 14:30\n"
 
@@ -348,22 +358,29 @@ def test_an_inline_comment_carries_with_its_authored_separator(tmp_path):
     unquoted value cedes the FIRST whitespace-preceded `#`, and the whitespace
     that separates it comes through as authored (two spaces here), so a
     hand-aligned comment column is not reflowed by a status flip."""
-    lines = ["  3-2-digest-delivery: backlog  # the next story\n"]
+    lines = [_DEV, "  3-2-digest-delivery: backlog  # the next story\n"]
 
-    assert sprintstatus._set_mapping_value(lines, "3-2-digest-delivery", "in-progress") is True
+    assert (
+        sprintstatus._set_mapping_value(
+            lines, "3-2-digest-delivery", "in-progress", scope="development_status"
+        )
+        is True
+    )
 
-    assert "".join(lines) == "  3-2-digest-delivery: in-progress  # the next story\n"
+    assert "".join(lines) == _DEV + "  3-2-digest-delivery: in-progress  # the next story\n"
 
 
 def test_a_hash_glued_to_the_value_stays_part_of_the_value(tmp_path):
     """YAML needs whitespace before a `#` for it to open a comment, so
     `backlog#x` is the single scalar `backlog#x`. The value is replaced whole and
     `#x` is not carried forward as a comment the board never had."""
-    lines = ["  3-2-x: backlog#x\n"]
+    lines = [_DEV, "  3-2-x: backlog#x\n"]
 
-    assert sprintstatus._set_mapping_value(lines, "3-2-x", "done") is True
+    assert (
+        sprintstatus._set_mapping_value(lines, "3-2-x", "done", scope="development_status") is True
+    )
 
-    assert "".join(lines) == "  3-2-x: done\n"
+    assert "".join(lines) == _DEV + "  3-2-x: done\n"
 
 
 def test_a_line_with_trailing_whitespace_and_no_comment_is_refused(tmp_path):
@@ -377,9 +394,373 @@ def test_a_line_with_trailing_whitespace_and_no_comment_is_refused(tmp_path):
     quoted_trailing = "  3-2-x: 'backlog' \n"
 
     for line in (trailing, quoted_trailing):
-        lines = [line]
-        assert sprintstatus._set_mapping_value(lines, "3-2-x", "done") is False
-        assert "".join(lines) == line
+        lines = [_DEV, line]
+        assert (
+            sprintstatus._set_mapping_value(lines, "3-2-x", "done", scope="development_status")
+            is False
+        )
+        assert "".join(lines) == _DEV + line
+
+
+# ------------------------------------------------------------- folded rows
+#
+# A generator that wraps at a fixed width (ruamel's default is 80) folds a row
+# whose key is long enough onto a continuation line: `key: ` with nothing after
+# the colon, then the plain scalar indented deeper. That is valid YAML and
+# `story_status` reads it, so a writer that only knows the one-line shape
+# refuses the row, `advance` echoes the old status, and post-session
+# verification reads a finished story as unfinished. The writer reads the folded
+# shape it can prove, collapses it to one line, and still refuses every
+# multi-line shape it cannot (block scalars, nested mappings, comments or blank
+# lines inside the value, quoted continuations).
+
+_FOLDED_KEY = "7-2-date-engine-takes-a-calendar-florida-fixtures-holiday-horizo"
+
+
+def test_a_folded_plain_row_advances_and_collapses_to_one_line(tmp_path):
+    """The shape a width-80 dump emits for a long key, trailing space included.
+    The key line and its continuation become one `key: target` line; every other
+    line is untouched."""
+    board = (
+        "last_updated: 01-06-2026 10:00\n"
+        "development_status:\n"
+        "  epic-7: in-progress\n"
+        f"  {_FOLDED_KEY}: \n"
+        "    ready-for-dev\n"
+        "  7-3-next: backlog\n"
+    )
+    p = tmp_path / "sprint-status.yaml"
+    p.write_text(board, encoding="utf-8", newline="")
+    assert sprintstatus.story_status(p, _FOLDED_KEY) == "ready-for-dev"
+
+    assert sprintstatus.advance(p, _FOLDED_KEY, "done") == "done"
+
+    assert p.read_bytes() == board.replace(
+        f"  {_FOLDED_KEY}: \n    ready-for-dev\n", f"  {_FOLDED_KEY}: done\n"
+    ).encode("utf-8")
+    assert sprintstatus.story_status(p, _FOLDED_KEY) == "done"
+
+
+def test_a_folded_row_spanning_several_lines_is_read_as_one_value():
+    """A plain scalar may fold across more than one line; YAML joins the pieces
+    with single spaces, and so does the writer's comparison."""
+    lines = [_DEV, "  3-2-x:\n", "      ready\n", "      for dev\n", "  3-3-y: backlog\n"]
+
+    assert (
+        sprintstatus._set_mapping_value(lines, "3-2-x", "done", scope="development_status") is True
+    )
+
+    assert "".join(lines) == _DEV + "  3-2-x: done\n  3-3-y: backlog\n"
+
+
+def test_a_folded_row_already_at_target_is_a_no_op():
+    """Idempotent like the one-line shape: a folded value equal to the target is
+    not a change, so the board keeps its authored layout."""
+    lines = [_DEV, f"  {_FOLDED_KEY}: \n", "    done\n", "  7-3-next: backlog\n"]
+    before = list(lines)
+
+    assert (
+        sprintstatus._set_mapping_value(lines, _FOLDED_KEY, "done", scope="development_status")
+        is False
+    )
+
+    assert lines == before
+
+
+def test_a_folded_crlf_row_keeps_crlf(tmp_path):
+    """#576 for the folded shape: the collapsed line ends the way the row ended,
+    and no bare LF is introduced."""
+    board = (
+        "last_updated: 01-06-2026 10:00\r\n"
+        "development_status:\r\n"
+        "  epic-7: in-progress\r\n"
+        f"  {_FOLDED_KEY}: \r\n"
+        "    ready-for-dev\r\n"
+        "  7-3-next: backlog\r\n"
+    ).encode("utf-8")
+    p = tmp_path / "sprint-status.yaml"
+    p.write_bytes(board)
+
+    assert sprintstatus.advance(p, _FOLDED_KEY, "done") == "done"
+
+    actual = p.read_bytes()
+    assert actual == board.replace(
+        f"  {_FOLDED_KEY}: \r\n    ready-for-dev\r\n".encode(),
+        f"  {_FOLDED_KEY}: done\r\n".encode(),
+    )
+    assert b"\n" not in actual.replace(b"\r\n", b"")
+
+
+def test_a_folded_row_on_the_last_line_keeps_its_missing_terminator():
+    """The collapsed line takes the terminator of the row's LAST line, so a board
+    with no final newline does not gain one."""
+    lines = [_DEV, "  3-2-x: \n", "    backlog"]
+
+    assert (
+        sprintstatus._set_mapping_value(lines, "3-2-x", "done", scope="development_status") is True
+    )
+
+    assert "".join(lines) == _DEV + "  3-2-x: done"
+
+
+@pytest.mark.parametrize(
+    "shape",
+    [
+        pytest.param(["  3-2-x: |\n", "    backlog\n"], id="literal-block"),
+        pytest.param(["  3-2-x: >-\n", "    backlog\n"], id="folded-block"),
+        pytest.param(["  3-2-x: ready\n", "    for-dev\n"], id="plain-starting-on-key-line"),
+        pytest.param(["  3-2-x: 'ready\n", "    for-dev'\n"], id="quoted-starting-on-key-line"),
+        pytest.param(["  3-2-x:\n", "    status: backlog\n"], id="nested-mapping"),
+        pytest.param(["  3-2-x:\n", "    - backlog\n"], id="nested-sequence"),
+        pytest.param(["  3-2-x:\n", "    'backlog'\n"], id="quoted-continuation"),
+        pytest.param(["  3-2-x:\n", "    # note\n", "    backlog\n"], id="comment-between"),
+        pytest.param(["  3-2-x:\n", "    back\n", "\n", "    log\n"], id="blank-line-inside"),
+        pytest.param(["  3-2-x:\n", "    backlog  # note\n"], id="trailing-comment"),
+        pytest.param(["  3-2-x:  # note\n", "    backlog\n"], id="comment-on-key-line"),
+        pytest.param(["  3-2-x:\n", "    ready\n", "    - for dev\n"], id="indicator-led-fragment"),
+        pytest.param(
+            ["  3-2-x: 'backlog\n", "    # part of the value'\n"], id="comment-shaped-quoted"
+        ),
+        pytest.param(["  3-2-x: |\n", "    # part of the value\n"], id="comment-shaped-block"),
+    ],
+)
+def test_a_multi_line_value_the_writer_cannot_read_is_left_untouched(shape):
+    """Lossy, never wrong: each of these holds a value that runs past the key
+    line in a shape the line edit cannot prove it has read whole. Rewriting only
+    the key line would orphan the rest (`3-2-x: done` over `    backlog` parses
+    as `done backlog`), so the lines are left exactly as authored and `advance`
+    reports the unchanged status.
+
+    The two comment-shaped rows are what an indentation scan could not see: it
+    skipped `    # part of the value` as a comment, found the next row at key
+    indentation, and rewrote the key line, turning scalar text into a comment
+    the board never had. Ablation: judge "continues past the key line" by the
+    next content line's indentation instead of the value node's end mark, and
+    both redden. In `_folded_span_is_plain`: drop the tail check and
+    `trailing-comment` reddens; drop the next-line check and `comment-between`
+    reddens; drop the indicator-lead check and `indicator-led-fragment` reddens
+    (`ready - for dev` is valid plain YAML). The plain-style gate is shadowed by
+    the lead check — every quoted or block scalar opens with an indicator — so
+    `quoted-continuation` reddens only with both dropped."""
+    lines = [_DEV, *shape, "  3-3-y: backlog\n"]
+    before = list(lines)
+
+    assert (
+        sprintstatus._set_mapping_value(lines, "3-2-x", "done", scope="development_status") is False
+    )
+
+    assert lines == before
+
+
+@pytest.mark.parametrize("brk", ["\x85", "\u2028", "\u2029"], ids=["NEL", "LS", "PS"])
+def test_a_folded_row_ending_in_a_unicode_line_break_is_refused(brk):
+    """YAML and `str.splitlines` both end a line at NEL, LS and PS, but the
+    collapse carries over only a `\\r`/`\\n` terminator. Collapsing this row
+    would glue the next entry onto the key line (`key: done  3-3-y: backlog`),
+    publishing invalid YAML and losing a row, so it is refused byte-for-byte.
+
+    Ablation: let `_folded_span_is_plain`'s tail check strip all whitespace
+    (`str.strip()` counts these breaks as whitespace) and this reddens."""
+    board = f"development_status:\n  3-2-x:\n    ready-for-dev{brk}  3-3-y: backlog\n".encode()
+    assert sprintstatus.status_in_bytes(board, "3-2-x") == "ready-for-dev"
+
+    assert sprintstatus.advanced_bytes(board, "3-2-x", "done") == board
+
+
+@pytest.mark.parametrize(
+    "shape",
+    [
+        pytest.param(["  3-2-x:\n", "    \tbacklog\n"], id="tab-indented-fragment"),
+        pytest.param(["  3-2-x:\n", "    ready\n", "    for:\n"], id="trailing-colon-fragment"),
+    ],
+)
+def test_a_continuation_the_parser_rejects_raises_instead_of_being_edited(shape):
+    """The PR's first cut refused a tab-indented or colon-ended fragment with its
+    own text gates. With the row located by the parser those gates are
+    unreachable — PyYAML rejects both boards outright — so they are gone, and
+    what is pinned instead is that an unparseable board is never edited: the
+    locator raises and the lines stay as authored (`advance` never gets this
+    far, because `story_status` raises first)."""
+    lines = [_DEV, *shape, "  3-3-y: backlog\n"]
+    before = list(lines)
+
+    with pytest.raises(sprintstatus.SprintStatusError):
+        sprintstatus._set_mapping_value(lines, "3-2-x", "done", scope="development_status")
+
+    assert lines == before
+
+
+# ---------------------------------------------------- the row the parser reads
+#
+# The writer edits only the entry the parser reads: story and epic rows inside
+# the real `development_status` mapping, `last_updated` at the root, and the
+# LAST of duplicate keys. A textual scan took the first line that merely looked
+# like the row, so `advance` could rewrite text in a block scalar or another
+# mapping, report the target, and leave the real row alone.
+
+
+def test_story_text_inside_an_earlier_block_scalar_is_never_the_row(tmp_path):
+    """#843 review, finding 1. The block scalar holds `3-2-x:` over an indented
+    `ready-for-dev` — exactly the folded shape — plus look-alike epic and
+    `last_updated` lines. None of it is a mapping entry, so every write lands on
+    the real rows and the notes are untouched.
+
+    Ablation: restore the PR head's textual first-match scan in
+    `_set_mapping_value` and this reddens — the notes are rewritten, `advance`
+    returns `in-progress`, and `story_status` still reads `backlog`."""
+    board = (
+        "notes: |\n"
+        "  last_updated: never\n"
+        "  epic-3: backlog\n"
+        "  3-2-x:\n"
+        "    ready-for-dev\n"
+        "last_updated: 01-06-2026 10:00\n"
+        "development_status:\n"
+        "  epic-3: backlog\n"
+        "  3-2-x: backlog\n"
+    )
+    p = tmp_path / "sprint-status.yaml"
+    p.write_text(board, encoding="utf-8", newline="")
+
+    out = sprintstatus.advance(p, "3-2-x", "in-progress", now="02-06-2026 09:00")
+
+    assert out == sprintstatus.story_status(p, "3-2-x") == "in-progress"
+    assert p.read_text(encoding="utf-8") == (
+        "notes: |\n"
+        "  last_updated: never\n"
+        "  epic-3: backlog\n"
+        "  3-2-x:\n"
+        "    ready-for-dev\n"
+        "last_updated: 02-06-2026 09:00\n"
+        "development_status:\n"
+        "  epic-3: in-progress\n"
+        "  3-2-x: in-progress\n"
+    )
+
+
+def test_a_same_named_key_under_other_metadata_is_not_the_row(tmp_path):
+    """Scope selection: `metadata` carries its own `3-2-x` and `last_updated`
+    entries ahead of the real ones. The story write goes to `development_status`
+    and the timestamp to the root, and `metadata` is untouched.
+
+    Ablation: search the root mapping for story rows (drop the
+    `development_status` scope) and the story write is refused; restore the
+    textual first-match scan and `metadata` is rewritten instead. Both redden."""
+    board = (
+        "metadata:\n"
+        "  last_updated: 01-01-2026 00:00\n"
+        "  3-2-x: backlog\n"
+        "last_updated: 01-06-2026 10:00\n"
+        "development_status:\n"
+        "  3-2-x: backlog\n"
+    )
+    p = tmp_path / "sprint-status.yaml"
+    p.write_text(board, encoding="utf-8", newline="")
+
+    out = sprintstatus.advance(p, "3-2-x", "done", now="02-06-2026 09:00")
+
+    assert out == sprintstatus.story_status(p, "3-2-x") == "done"
+    assert p.read_text(encoding="utf-8") == (
+        "metadata:\n"
+        "  last_updated: 01-01-2026 00:00\n"
+        "  3-2-x: backlog\n"
+        "last_updated: 02-06-2026 09:00\n"
+        "development_status:\n"
+        "  3-2-x: done\n"
+    )
+
+
+def test_duplicate_keys_resolve_last_wins_like_the_parser(tmp_path):
+    """PyYAML keeps the LAST of duplicate keys — for `development_status` itself
+    and for a row inside it — and `story_status` reads that one. The writer
+    edits the same row, and the epic lift lands in the same mapping.
+
+    Ablation: take the FIRST matching entry in `_last_entry` and this reddens —
+    the shadowed rows are rewritten and `story_status` still reads
+    `ready-for-dev`."""
+    board = (
+        "development_status:\n"
+        "  epic-3: backlog\n"
+        "  3-2-x: done\n"
+        "development_status:\n"
+        "  epic-3: backlog\n"
+        "  3-2-x: backlog\n"
+        "  3-2-x: ready-for-dev\n"
+    )
+    p = tmp_path / "sprint-status.yaml"
+    p.write_text(board, encoding="utf-8", newline="")
+    assert sprintstatus.story_status(p, "3-2-x") == "ready-for-dev"
+
+    out = sprintstatus.advance(p, "3-2-x", "in-progress")
+
+    assert out == sprintstatus.story_status(p, "3-2-x") == "in-progress"
+    assert p.read_text(encoding="utf-8") == (
+        "development_status:\n"
+        "  epic-3: backlog\n"
+        "  3-2-x: done\n"
+        "development_status:\n"
+        "  epic-3: in-progress\n"
+        "  3-2-x: backlog\n"
+        "  3-2-x: in-progress\n"
+    )
+
+
+def test_a_quoted_value_closing_at_key_indentation_is_refused_whole(tmp_path):
+    """#843 review, finding 2. A double-quoted scalar may continue at the key's
+    own indentation; here an escaped line break makes it the recognized status
+    `ready-for-dev`. Its span ends on the next line, so the writer refuses it
+    whole: the board stays byte-identical and still parses, and `advance`
+    reports the unchanged status. Rewriting just the key line would publish
+    `  dev"` as a stray line — invalid YAML — while claiming `done`.
+
+    Ablation: judge "continues past the key line" by the next content line's
+    indentation (deeper than the key) instead of the value node's end mark and
+    this reddens: the key line alone is rewritten, leaving `  dev"` behind as a
+    stray line the board no longer parses past."""
+    board = (
+        b"last_updated: 01-06-2026 10:00\n"
+        b"development_status:\n"
+        b'  3-2-x: "ready-for-\\\n'
+        b'  dev"\n'
+        b"  3-3-y: backlog\n"
+    )
+    p = tmp_path / "sprint-status.yaml"
+    p.write_bytes(board)
+    assert sprintstatus.story_status(p, "3-2-x") == "ready-for-dev"
+
+    assert sprintstatus.advance(p, "3-2-x", "done", now="02-06-2026 09:00") == "ready-for-dev"
+
+    assert p.read_bytes() == board
+    assert yaml.safe_load(p.read_bytes())["development_status"]["3-2-x"] == "ready-for-dev"
+    assert sprintstatus.advanced_bytes(board, "3-2-x", "done") == board
+
+
+def test_a_folded_story_collapse_leaves_later_epic_and_timestamp_edits_on_their_rows(tmp_path):
+    """One locked call can make three edits, and the first may collapse two lines
+    into one. Each later edit re-locates its row in the lines as edited, so the
+    epic and `last_updated` below the story land on their own rows rather than
+    on a line number the collapse has shifted."""
+    board = (
+        "development_status:\n"
+        "  3-2-x:\n"
+        "    ready-for-dev\n"
+        "  epic-3: backlog\n"
+        "  3-3-y: backlog\n"
+        "last_updated: 01-06-2026 10:00\n"
+    )
+    p = tmp_path / "sprint-status.yaml"
+    p.write_text(board, encoding="utf-8", newline="")
+
+    out = sprintstatus.advance(p, "3-2-x", "in-progress", now="02-06-2026 09:00")
+
+    assert out == sprintstatus.story_status(p, "3-2-x") == "in-progress"
+    assert p.read_text(encoding="utf-8") == (
+        "development_status:\n"
+        "  3-2-x: in-progress\n"
+        "  epic-3: in-progress\n"
+        "  3-3-y: backlog\n"
+        "last_updated: 02-06-2026 09:00\n"
+    )
 
 
 # --------------------------------------------------- line-ending preservation (#576)
