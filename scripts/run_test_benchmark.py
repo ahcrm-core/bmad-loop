@@ -35,9 +35,12 @@ Windows tree: the wrapper enters a job object before starting pytest (see
 ``_TreeJob``), the stand-in for the POSIX process group — membership outlives
 the root, so a child that ignored Ctrl+C (``CREATE_NEW_PROCESS_GROUP``) is still
 reached after pytest itself exited and was reaped, when ``taskkill /T`` can no
-longer walk to it. That is the normal case on an interrupt: ``Popen.wait`` is
-not interruptible there, so the wrapper only sees the Ctrl+C once pytest is
-gone. A stop runs ``taskkill /T /F`` first, then terminates every other job
+longer walk to it. That is the normal case on an interrupt: a Ctrl+C reaches
+pytest too, and usually ends it before the wrapper's own handler runs.
+``Popen.wait`` is not interruptible there, so the wrapper waits in short slices
+(``_WAIT_POLL_S``); a pytest stuck on the Ctrl+C is then still stopped, instead
+of being waited on until the deadline, or forever without one. A stop runs
+``taskkill /T /F`` first, then terminates every other job
 member. If the job cannot be set up the run goes on without it and
 ``runner.json`` records ``tree_job: false``.
 
@@ -72,6 +75,10 @@ EXIT_USAGE = 2
 # How long to wait for the direct child to be reaped after a tree kill.
 _REAP_WAIT_S = 15.0
 _TASKKILL_TIMEOUT_S = 30.0
+# Windows: the longest a signal waits for the handler that raises it. The wait
+# there blocks in WaitForSingleObject, which Python cannot interrupt; POSIX
+# signals interrupt the wait itself, so it is one call.
+_WAIT_POLL_S: float | None = 0.5 if sys.platform == "win32" else None
 
 
 class _Interrupted(Exception):
@@ -329,6 +336,22 @@ def _kill_tree(proc: subprocess.Popen[bytes], grace: float, job: _TreeJob | None
         pass
 
 
+def _wait_for_exit(proc: subprocess.Popen[bytes], deadline_mono: float | None) -> int:
+    """``proc``'s exit status; ``subprocess.TimeoutExpired`` once ``deadline_mono``
+    passes. Waits in ``_WAIT_POLL_S`` slices when set, so a pending signal's
+    handler runs between them."""
+    while True:
+        remaining = None if deadline_mono is None else max(0.0, deadline_mono - time.monotonic())
+        step = remaining
+        if _WAIT_POLL_S is not None and (step is None or step > _WAIT_POLL_S):
+            step = _WAIT_POLL_S
+        try:
+            return proc.wait(timeout=step)
+        except subprocess.TimeoutExpired:
+            if step == remaining:
+                raise
+
+
 def _raise_interrupted(signum: int, frame: object) -> None:
     raise _Interrupted(signum)
 
@@ -457,10 +480,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             if pending:
                 raise _Interrupted(pending[0])
             _write_runner(root, record)
-            remaining = (
-                None if deadline_mono is None else max(0.0, deadline_mono - time.monotonic())
-            )
-            returncode = proc.wait(timeout=remaining)
+            returncode = _wait_for_exit(proc, deadline_mono)
             # pytest is done. Hold signals until the terminal record is written:
             # the ``finally`` below still has the raising handler installed while
             # it closes the job, and restores the caller's before this record

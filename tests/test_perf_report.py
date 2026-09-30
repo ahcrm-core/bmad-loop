@@ -856,6 +856,7 @@ def test_wrapper_wait_counts_setup_time_against_the_deadline(tmp_path, monkeypat
     fake_time = type("FakeTime", (), {"time": staticmethod(time.time)})()
     fake_time.monotonic = lambda: clock[0]
     monkeypatch.setattr(run_test_benchmark, "time", fake_time)
+    monkeypatch.setattr(run_test_benchmark, "_WAIT_POLL_S", None)  # one wait, as on POSIX
     monkeypatch.setattr(run_test_benchmark.subprocess, "Popen", lambda *a, **k: Spawned())
     monkeypatch.setattr(run_test_benchmark, "_write_runner", slow_write)
     rc = run_test_benchmark.main(
@@ -864,6 +865,84 @@ def test_wrapper_wait_counts_setup_time_against_the_deadline(tmp_path, monkeypat
 
     assert rc == 0
     assert waits == [60.0]
+
+
+def test_wrapper_sliced_wait_stops_at_the_deadline_not_past_it(tmp_path, monkeypatch):
+    """Windows waits in slices; the last slice is cut to what is left of the
+    budget, and only the wait that reaches the deadline stops the tree.
+
+    Ablation: re-raise every slice's ``TimeoutExpired`` and the run times out
+    after the first 25 seconds."""
+    clock = [1000.0]
+    waits = []
+
+    class Stuck:
+        pid = 424248
+        returncode = None
+
+        def wait(self, timeout=None):
+            if self.returncode is not None or timeout == run_test_benchmark._REAP_WAIT_S:
+                self.returncode = -9  # the tree kill's reap
+                return self.returncode
+            waits.append(timeout)
+            clock[0] += timeout
+            raise subprocess.TimeoutExpired("pytest", timeout)
+
+    fake_time = type("FakeTime", (), {"time": staticmethod(time.time)})()
+    fake_time.monotonic = lambda: clock[0]
+    monkeypatch.setattr(run_test_benchmark, "time", fake_time)
+    monkeypatch.setattr(run_test_benchmark, "_WAIT_POLL_S", 25.0)
+    monkeypatch.setattr(run_test_benchmark.subprocess, "Popen", lambda *a, **k: Stuck())
+    monkeypatch.setattr(
+        run_test_benchmark,
+        "_kill_tree",
+        lambda proc, grace, job=None: proc.wait(run_test_benchmark._REAP_WAIT_S),
+    )
+    rc = run_test_benchmark.main(
+        ["--metrics-dir", str(tmp_path / "m"), "--timeout", "60", "--", "-q"]
+    )
+
+    assert rc == run_test_benchmark.EXIT_TIMED_OUT
+    assert waits == [25.0, 25.0, 10.0]
+    assert _json(tmp_path / "m" / perf_report.RUNNER)["state"] == "timed_out"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX signal-to-self and killpg path")
+def test_wrapper_reaches_the_tree_kill_while_pytest_hangs_on_the_cancel(tmp_path, monkeypatch):
+    """Windows cannot interrupt ``Popen.wait``: a Ctrl+C runs the wrapper's
+    handler only when a wait returns. With no deadline, a pytest stuck on the
+    cancel must still be stopped between slices, never waited on unbounded.
+
+    Ablation: wait once with ``timeout=None`` and the unbounded wait is refused
+    here (the real one would block for good)."""
+
+    class HungOnCancel:
+        pid = 424249
+        returncode = None
+
+        def __init__(self):
+            self.slices = 0
+
+        def wait(self, timeout=None):
+            assert timeout is not None, "unbounded wait: a Windows Ctrl+C is never handled"
+            if self.returncode is not None or timeout == run_test_benchmark._REAP_WAIT_S:
+                self.returncode = -9
+                return self.returncode
+            self.slices += 1
+            if self.slices == 3:  # the cancel: its handler runs as this slice ends
+                os.kill(os.getpid(), signal.SIGINT)
+            raise subprocess.TimeoutExpired("pytest", timeout)
+
+    killed = []
+    monkeypatch.setattr(run_test_benchmark, "_WAIT_POLL_S", 0.5)
+    monkeypatch.setattr(run_test_benchmark.subprocess, "Popen", lambda *a, **k: HungOnCancel())
+    monkeypatch.setattr(run_test_benchmark.os, "killpg", lambda pgid, sig: killed.append(sig))
+    rc = run_test_benchmark.main(["--metrics-dir", str(tmp_path / "m"), "--grace", "0", "--", "-q"])
+
+    assert rc == run_test_benchmark.EXIT_INTERRUPTED
+    assert killed == [signal.SIGKILL]
+    runner = _json(tmp_path / "m" / perf_report.RUNNER)
+    assert (runner["state"], runner["child_reaped"]) == ("interrupted", True)
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows job-object path")
