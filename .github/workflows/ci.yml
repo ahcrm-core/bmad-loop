@@ -25,11 +25,13 @@ jobs:
     steps:
       - name: Set the test deadline
         # First, so the clock starts as close to the job's own as a step can. The
-        # test run is stopped (by scripts/run_test_benchmark.py) two minutes short
+        # test run is stopped (by scripts/run_test_benchmark.py) four minutes short
         # of the job's `timeout-minutes: 15` above — change the two together — so
         # a wedged run still ends as a red step with its metrics uploaded rather
-        # than as a cancelled job with nothing to read.
-        run: echo "TEST_DEADLINE_EPOCH=$(( $(date +%s) + 15 * 60 - 120 ))" >> "$GITHUB_ENV"
+        # than as a cancelled job with nothing to read. The reserve covers the
+        # wrapper's stop bound (grace 20s + reap 15s), the summary, and the
+        # upload step's full `timeout-minutes: 3`.
+        run: echo "TEST_DEADLINE_EPOCH=$(( $(date +%s) + 15 * 60 - 240 ))" >> "$GITHUB_ENV"
 
       - uses: actions/checkout@v7
         with:
@@ -149,12 +151,13 @@ jobs:
         # test step is stopped (by scripts/run_test_benchmark.py) short of the
         # job's `timeout-minutes: 30` above — change them together — so a wedged
         # run ends as a red step whose metrics still upload, not as a cancelled
-        # job with nothing to read. The reserve covers the stop grace, the
-        # summary and the upload.
+        # job with nothing to read. The five-minute reserve covers the wrapper's
+        # Windows stop bound (taskkill 30s + job sweep + reap 15s), the summary,
+        # and the upload step's full `timeout-minutes: 3`.
         shell: pwsh
         run: |
           $start = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
-          Add-Content -Path $env:GITHUB_ENV -Value "TEST_DEADLINE_EPOCH=$($start + 30 * 60 - 180)"
+          Add-Content -Path $env:GITHUB_ENV -Value "TEST_DEADLINE_EPOCH=$($start + 30 * 60 - 300)"
 
       - uses: actions/checkout@v7
         with:
@@ -221,12 +224,12 @@ jobs:
         python-version: ${{ github.event_name == 'pull_request' && fromJSON('["3.11", "3.14"]') || fromJSON('["3.11", "3.12", "3.13", "3.14"]') }}
     steps:
       - name: Set the test deadline
-        # As in the shard job: the gate stops short of the job cap so its
-        # metrics still upload.
+        # As in the shard job, with the same five-minute reserve: the gate
+        # stops short of the job cap so its metrics still upload.
         shell: pwsh
         run: |
           $start = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
-          Add-Content -Path $env:GITHUB_ENV -Value "LIVE_GATE_DEADLINE_EPOCH=$($start + 30 * 60 - 75)"
+          Add-Content -Path $env:GITHUB_ENV -Value "LIVE_GATE_DEADLINE_EPOCH=$($start + 30 * 60 - 300)"
 
       - uses: actions/checkout@v7
         with:
