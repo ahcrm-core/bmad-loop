@@ -58,16 +58,13 @@ breaking changes may land in a minor release.
 - Return `bmad-loop validate`'s coding-CLI probe at its timeout on a Windows `.cmd` launcher
   and kill the launcher's descendants, instead of waiting for the launched program to exit
   (120 s observed in CI).
-- Advance a sprint-status row whose value is folded onto a continuation line (`key: ` then
-  the status indented deeper), the shape a width-80 YAML dump emits for a long story key.
-  The writer used to skip it and echo the old status, so verification read a finished
-  story as unfinished and rolled it back. The row now collapses to one `key: status`
-  line. Multi-line values the writer cannot read whole (block scalars, values that wrap
-  from the key line, nested mappings, comments inside) are now left untouched instead
-  of having only their first line rewritten. The writer now edits only the row the YAML
-  parser reads (story and epic rows under `development_status`, `last_updated` at the
-  root, the last of duplicate keys), never look-alike text in a block scalar or another
-  mapping.
+- Advance a sprint-status row whose status is folded onto an indented continuation line,
+  as a width-80 YAML dump writes a long story key, instead of leaving the old status and
+  rolling the finished story back; the row collapses to one `key: status` line (#842).
+  Contributed by [@mswanson](https://github.com/mswanson).
+- Edit only the sprint-status row the YAML parser reads, never look-alike text in a block
+  scalar or another mapping, and leave a multi-line value the writer cannot read whole
+  untouched instead of rewriting only its first line.
 
 ## [0.13.0] — 2026-09-28
 
