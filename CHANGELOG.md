@@ -64,7 +64,10 @@ breaking changes may land in a minor release.
   story as unfinished and rolled it back. The row now collapses to one `key: status`
   line. Multi-line values the writer cannot read whole (block scalars, values that wrap
   from the key line, nested mappings, comments inside) are now left untouched instead
-  of having only their first line rewritten.
+  of having only their first line rewritten. The writer now edits only the row the YAML
+  parser reads (story and epic rows under `development_status`, `last_updated` at the
+  root, the last of duplicate keys), never look-alike text in a block scalar or another
+  mapping.
 
 ## [0.13.0] — 2026-09-28
 
