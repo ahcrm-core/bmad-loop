@@ -744,6 +744,43 @@ def test_wrapper_stops_the_tree_when_post_spawn_bookkeeping_raises(tmp_path, mon
     assert _json(tmp_path / "m" / perf_report.RUNNER)["state"] == "running"
 
 
+def test_wrapper_wait_counts_setup_time_against_the_deadline(tmp_path, monkeypatch):
+    """The deadline is one fixed instant from the wrapper's start: time spent
+    before the wait (here a slow ``child_pid`` record write) comes out of the
+    budget, so the stop cannot land past ``--deadline-epoch``.
+
+    Ablation: pass the initial budget to ``proc.wait`` and it gets 100, not 60."""
+    clock = [1000.0]
+    waits = []
+
+    class Spawned:
+        pid = 424245
+        returncode = 0
+
+        def wait(self, timeout=None):
+            waits.append(timeout)
+            return self.returncode
+
+    real_write = run_test_benchmark._write_runner
+
+    def slow_write(root, record):
+        if "child_pid" in record and record["state"] == "running":
+            clock[0] += 40.0
+        real_write(root, record)
+
+    fake_time = type("FakeTime", (), {"time": staticmethod(time.time)})()
+    fake_time.monotonic = lambda: clock[0]
+    monkeypatch.setattr(run_test_benchmark, "time", fake_time)
+    monkeypatch.setattr(run_test_benchmark.subprocess, "Popen", lambda *a, **k: Spawned())
+    monkeypatch.setattr(run_test_benchmark, "_write_runner", slow_write)
+    rc = run_test_benchmark.main(
+        ["--metrics-dir", str(tmp_path / "m"), "--timeout", "100", "--", "-q"]
+    )
+
+    assert rc == 0
+    assert waits == [60.0]
+
+
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows job-object path")
 def test_wrapper_tree_kill_reaches_a_ctrl_c_immune_child_after_the_root_exited(
     tmp_path, reap_leftovers

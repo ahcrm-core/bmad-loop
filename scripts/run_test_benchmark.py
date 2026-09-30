@@ -376,6 +376,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         budget: float | None = args.deadline_epoch - start_wall
     else:
         budget = args.timeout
+    # Both flags name one fixed instant; the wait below is measured against it,
+    # so job setup, the spawn and the runner write come out of the budget
+    # instead of pushing the stop past it into the upload reserve.
+    deadline_mono = None if budget is None else start_mono + budget
     record: dict[str, Any] = {
         "v": SCHEMA_VERSION,
         "state": "running",
@@ -451,7 +455,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             if pending:
                 raise _Interrupted(pending[0])
             _write_runner(root, record)
-            returncode = proc.wait(timeout=budget)
+            remaining = (
+                None if deadline_mono is None else max(0.0, deadline_mono - time.monotonic())
+            )
+            returncode = proc.wait(timeout=remaining)
         except subprocess.TimeoutExpired:
             _hold_signals_for_cleanup()
             sys.stderr.write(
