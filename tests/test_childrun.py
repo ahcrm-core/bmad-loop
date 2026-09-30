@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from conftest import pid_gone, read_pid, wait_pid_gone, write_script_launcher
 
 from bmad_loop import childrun, runs
 from bmad_loop.process_host import get_process_host
@@ -46,52 +47,10 @@ def stop_probe(probe: Callable[[], bool]) -> Iterator[None]:
         childrun.reset_stop_probe(token)
 
 
-def _read_pid(pid_file: Path) -> int | None:
-    try:
-        text = pid_file.read_text(encoding="utf-8").strip()
-    except FileNotFoundError:
-        return None
-    return int(text) if text.isdigit() else None
-
-
 def _pid_written(pid_file: Path) -> Callable[[], bool]:
     """A probe that flips True once the grandchild has recorded its pid — the
     point at which the tree is known to be fully formed."""
-    return lambda: _read_pid(pid_file) is not None
-
-
-def _gone(pid: int) -> bool:
-    """Dead or a zombie awaiting its (new) parent's reap — either way no longer
-    running anything."""
-    if sys.platform.startswith("linux"):
-        try:
-            stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
-        except (FileNotFoundError, ProcessLookupError):
-            return True
-        return stat.rsplit(")", 1)[1].split()[0] in ("Z", "X")
-    return not get_process_host().is_alive(pid)
-
-
-def _wait_gone(pid: int, timeout: float = 5.0) -> bool:
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if _gone(pid):
-            return True
-        time.sleep(0.05)
-    return _gone(pid)
-
-
-@pytest.fixture
-def reap_leftovers() -> Iterator[list[int]]:
-    """Pids a failing row may have leaked; force-killed at teardown so a red row
-    never leaves a 60 s sleeper behind."""
-    pids: list[int] = []
-    yield pids
-    host = get_process_host()
-    for pid in pids:
-        if not _gone(pid):
-            with contextlib.suppress(Exception):
-                host.force_kill(pid)
+    return lambda: read_pid(pid_file) is not None
 
 
 def _sh_tree(pid_file: Path) -> str:
@@ -173,13 +132,13 @@ def test_hard_stop_kills_the_whole_sh_tree(tmp_path, reap_leftovers):
     with stop_probe(_pid_written(pid_file)):
         run = childrun.run_child(_sh_tree(pid_file), cwd=tmp_path, timeout=120)
     elapsed = time.monotonic() - started
-    grandchild = _read_pid(pid_file)
+    grandchild = read_pid(pid_file)
     assert grandchild is not None
     reap_leftovers.append(grandchild)
 
     assert run.interrupted is True and run.timed_out is False
     assert elapsed < _RETURN_CEILING_S
-    assert _wait_gone(grandchild), f"grandchild {grandchild} survived the hard stop"
+    assert wait_pid_gone(grandchild), f"grandchild {grandchild} survived the hard stop"
 
 
 @POSIX_ONLY
@@ -188,12 +147,12 @@ def test_timeout_kills_the_whole_sh_tree(tmp_path, reap_leftovers):
     pid_file = tmp_path / "grandchild.pid"
     with stop_probe(lambda: False):
         run = childrun.run_child(_sh_tree(pid_file), cwd=tmp_path, timeout=1.0)
-    grandchild = _read_pid(pid_file)
+    grandchild = read_pid(pid_file)
     assert grandchild is not None
     reap_leftovers.append(grandchild)
 
     assert run.timed_out is True and run.interrupted is False
-    assert _wait_gone(grandchild), f"grandchild {grandchild} survived the timeout"
+    assert wait_pid_gone(grandchild), f"grandchild {grandchild} survived the timeout"
 
 
 @POSIX_ONLY
@@ -219,7 +178,7 @@ def test_exception_unwinding_kills_the_tree_and_reraises(tmp_path, monkeypatch, 
     monkeypatch.setattr(childrun.subprocess, "Popen", recording_popen)
 
     def exploding_probe() -> bool:
-        if _read_pid(pid_file) is not None:
+        if read_pid(pid_file) is not None:
             raise exc_type("unwinding")
         return False
 
@@ -227,11 +186,11 @@ def test_exception_unwinding_kills_the_tree_and_reraises(tmp_path, monkeypatch, 
         childrun.run_child(_sh_tree(pid_file), cwd=tmp_path, timeout=120)
 
     (root,) = spawned
-    grandchild = _read_pid(pid_file)
+    grandchild = read_pid(pid_file)
     assert grandchild is not None
     try:
         assert root.poll() is not None, "the root survived the unwinding exception"
-        assert _wait_gone(grandchild), f"grandchild {grandchild} survived the unwind"
+        assert wait_pid_gone(grandchild), f"grandchild {grandchild} survived the unwind"
     finally:
         with contextlib.suppress(Exception):
             get_process_host().force_kill(grandchild)
@@ -254,7 +213,7 @@ def test_timeout_reaches_the_job_of_an_exited_root(tmp_path, monkeypatch, reap_l
             f"sleep 60 & echo $! > '{pid_file}'; sleep 0.6", cwd=tmp_path, timeout=1.5
         )
     elapsed = time.monotonic() - started
-    job = _read_pid(pid_file)
+    job = read_pid(pid_file)
     assert job is not None
     reap_leftovers.append(job)
 
@@ -262,7 +221,7 @@ def test_timeout_reaches_the_job_of_an_exited_root(tmp_path, monkeypatch, reap_l
     # anti-vacuity: rc 0 means the root exited on its own before the timeout; a
     # root still up there (-SIGTERM) lets the pre-signal harvest reach the job
     assert run.returncode == 0, "the root was still running at the timeout"
-    assert _wait_gone(job), f"job {job} survived the timeout of its exited root"
+    assert wait_pid_gone(job), f"job {job} survived the timeout of its exited root"
     assert elapsed < 1.5 + 4 * childrun.KILL_WAIT_S + childrun.DRAIN_S + 2.0
 
 
@@ -288,11 +247,11 @@ def test_unwinding_kill_reaches_the_job_of_an_exited_root(tmp_path, monkeypatch,
         childrun.run_child(
             f"sleep 60 & echo $! > '{pid_file}'; sleep 0.6", cwd=tmp_path, timeout=120
         )
-    job = _read_pid(pid_file)
+    job = read_pid(pid_file)
     assert job is not None
     reap_leftovers.append(job)
 
-    assert _wait_gone(job), f"job {job} survived the unwinding kill of its exited root"
+    assert wait_pid_gone(job), f"job {job} survived the unwinding kill of its exited root"
 
 
 @POSIX_ONLY
@@ -313,13 +272,13 @@ def test_hard_stop_reaches_a_process_forked_in_the_roots_grace(tmp_path, reap_le
     with stop_probe(ready.exists):
         run = childrun.run_child(command, cwd=tmp_path, timeout=120)
     elapsed = time.monotonic() - started
-    job = _read_pid(pid_file)
+    job = read_pid(pid_file)
     assert job is not None, "the TERM trap never ran"
     reap_leftovers.append(job)
 
     assert run.interrupted is True
     assert elapsed < _RETURN_CEILING_S
-    assert _wait_gone(job), f"job {job} forked in the grace survived the hard stop"
+    assert wait_pid_gone(job), f"job {job} forked in the grace survived the hard stop"
 
 
 # ---- real win32 tree --------------------------------------------------------------
@@ -345,13 +304,13 @@ def test_hard_stop_kills_a_cmd_rooted_tree(tmp_path, reap_leftovers):
             f'"{sys.executable}" "{parent}" "{pid_file}"', cwd=tmp_path, timeout=120
         )
     elapsed = time.monotonic() - started
-    grandchild = _read_pid(pid_file)
+    grandchild = read_pid(pid_file)
     assert grandchild is not None
     reap_leftovers.append(grandchild)
 
     assert run.interrupted is True
     assert elapsed < _RETURN_CEILING_S
-    assert _wait_gone(grandchild), f"grandchild {grandchild} survived the hard stop"
+    assert wait_pid_gone(grandchild), f"grandchild {grandchild} survived the hard stop"
 
 
 @WIN32_ONLY
@@ -392,16 +351,16 @@ def test_drain_gives_up_on_a_holder_nothing_can_reach(tmp_path, monkeypatch):
             )
         elapsed = time.monotonic() - started
         deadline = time.monotonic() + 5.0
-        while _read_pid(pid_file) is None and time.monotonic() < deadline:
+        while read_pid(pid_file) is None and time.monotonic() < deadline:
             time.sleep(0.05)
-        early_pid = _read_pid(pid_file)
+        early_pid = read_pid(pid_file)
         # read before the finally kills it
-        holder_alive_after = early_pid is not None and not _gone(early_pid)
+        holder_alive_after = early_pid is not None and not pid_gone(early_pid)
     finally:
         deadline = time.monotonic() + 5.0
-        while _read_pid(pid_file) is None and time.monotonic() < deadline:
+        while read_pid(pid_file) is None and time.monotonic() < deadline:
             time.sleep(0.05)
-        holder_pid = _read_pid(pid_file)
+        holder_pid = read_pid(pid_file)
         if holder_pid is not None:
             with contextlib.suppress(Exception):
                 get_process_host().force_kill(holder_pid)
@@ -411,6 +370,227 @@ def test_drain_gives_up_on_a_holder_nothing_can_reach(tmp_path, monkeypatch):
     # `taskkill /F /T` reach the holder, and the drain-timeout arm is never taken
     assert holder_alive_after, "the kill reached the holder; the unreachable-holder arm never ran"
     assert run.timed_out is True
+    assert elapsed < 1.0 + 4 * childrun.KILL_WAIT_S + childrun.DRAIN_S + 2.0
+
+
+# ---- run_argv: the executable-argv sibling ------------------------------------------
+
+
+def _argv_echo(directory: Path) -> Path:
+    """A script that prints its own argv (after the script path) as JSON, its
+    stdin as read, and exits 3 — one child showing boundaries, stdin and rc."""
+    script = directory / "echo argv.py"
+    script.write_text(
+        "import json, sys\n"
+        "print(json.dumps(sys.argv[1:]))\n"
+        "print(repr(sys.stdin.read()), file=sys.stderr)\n"
+        "sys.exit(3)\n",
+        encoding="utf-8",
+    )
+    return script
+
+
+@pytest.fixture
+def spaced_dir(tmp_path: Path) -> Path:
+    directory = tmp_path / "dir with spaces"
+    directory.mkdir()
+    return directory
+
+
+def test_run_argv_keeps_argv_boundaries_through_a_spaced_path(spaced_dir):
+    """Each element reaches the child as exactly one argument — spaces, a quote,
+    an empty string — and the path itself contains spaces. rc and both streams
+    come back as from `run_child`; stdin reads EOF at once (DEVNULL).
+
+    Ablation: join the argv into one string in `run_argv` and the boundaries
+    split (or the spaced path fails to launch)."""
+    script = _argv_echo(spaced_dir)
+    args = ["a b", 'say "hi"', "", "--version"]
+    with stop_probe(lambda: False):
+        run = childrun.run_argv([sys.executable, str(script), *args], cwd=spaced_dir, timeout=30)
+    assert run.returncode == 3 and not run.timed_out and not run.interrupted
+    assert json.loads(run.stdout) == args
+    assert run.stderr == "''\n"
+
+
+def test_run_argv_keeps_argv_boundaries_through_a_launcher(spaced_dir):
+    """The host's script launcher (a real `.cmd` on win32 — cmd.exe-rooted even
+    with shell=False — an exec'ing sh script on POSIX), in a spaced directory,
+    passes argument boundaries through to the program behind it."""
+    launcher = write_script_launcher(
+        spaced_dir, "echo shim", _argv_echo(spaced_dir).read_text(encoding="utf-8")
+    )
+    args = ["a b", "--version"]
+    run = childrun.run_argv([str(launcher), *args], cwd=None, timeout=30)
+    assert run.returncode == 3 and not run.timed_out
+    assert json.loads(run.stdout) == args
+
+
+def test_run_argv_spawns_the_list_without_a_shell_and_with_devnull_stdin(tmp_path, monkeypatch):
+    """The spawn contract no real child can show on every host: the argv goes to
+    `Popen` as a list (never a joined string), `shell=False`, stdin DEVNULL — a
+    prompting shim otherwise blocks on the caller's tty for the whole timeout —
+    and the same text decoding as `run_child`.
+
+    Ablation: drop `stdin=subprocess.DEVNULL` from `run_argv` and the stdin
+    assertion reddens with a KeyError."""
+    seen: dict[str, Any] = {}
+    real_popen = subprocess.Popen
+
+    def recording_popen(args, **kwargs):
+        seen["args"], seen["kwargs"] = args, kwargs
+        return real_popen(args, **kwargs)
+
+    monkeypatch.setattr(childrun.subprocess, "Popen", recording_popen)
+    argv = (sys.executable, "-c", "pass")
+    run = childrun.run_argv(argv, cwd=tmp_path, timeout=30)
+
+    assert run.returncode == 0
+    assert seen["args"] == list(argv) and isinstance(seen["args"], list)
+    kwargs = seen["kwargs"]
+    assert kwargs["shell"] is False
+    assert kwargs["stdin"] is subprocess.DEVNULL
+    assert kwargs["stdout"] is subprocess.PIPE and kwargs["stderr"] is subprocess.PIPE
+    assert kwargs["text"] is True and kwargs["errors"] == "replace"
+    assert kwargs["cwd"] == tmp_path
+
+
+def test_run_argv_propagates_spawn_faults(tmp_path):
+    """A path that is not there faults in `Popen` and propagates, as from
+    `run_child`: translating it is each caller's business."""
+    with pytest.raises(OSError):
+        childrun.run_argv([str(tmp_path / "nope" / "missing")], cwd=None, timeout=30)
+
+
+def test_run_argv_pending_hard_stop_spawns_nothing(monkeypatch):
+    """Same pre-spawn probe read as `run_child`."""
+
+    def no_spawn(*_args, **_kwargs):
+        raise AssertionError("a pending hard stop must spawn nothing")
+
+    monkeypatch.setattr(childrun.subprocess, "Popen", no_spawn)
+    with stop_probe(lambda: True):
+        run = childrun.run_argv(["anything"], cwd=None, timeout=30)
+    assert run == childrun.ChildRun(None, "", "", timed_out=False, interrupted=True)
+
+
+def _write_tree_parent(directory: Path) -> Path:
+    """A native root (python) whose child sleeps 120 s holding the inherited
+    pipes, after recording its pid; the root then sleeps 120 s too."""
+    parent = directory / "tree parent.py"
+    parent.write_text(
+        "import subprocess, sys, time\n"
+        "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)'])\n"
+        "with open(sys.argv[1], 'w') as fh:\n"
+        "    fh.write(str(child.pid))\n"
+        "time.sleep(120)\n",
+        encoding="utf-8",
+    )
+    return parent
+
+
+def test_run_argv_timeout_kills_a_native_root_and_its_descendant(
+    spaced_dir, monkeypatch, reap_leftovers
+):
+    """The timeout leg on a native executable root with a descendant holding the
+    pipes: the runner returns within the kill/drain allowance, the root is
+    reaped, the descendant is dead, and the kill was aimed at the very `Popen`
+    this call spawned with the tree the loop accumulated (kill identity).
+
+    Ablation: replace the `kill_tree` call in `_supervise` with `proc.kill()` and
+    the kill-identity assertion reddens (the root-only kill leaves the descendant
+    running)."""
+    pid_file = spaced_dir / "grandchild.pid"
+    parent = _write_tree_parent(spaced_dir)
+    spawned: list[subprocess.Popen[str]] = []
+    killed: list[tuple[subprocess.Popen[str], object]] = []
+    real_popen, real_kill_tree = subprocess.Popen, childrun.kill_tree
+
+    def recording_popen(*args, **kwargs):
+        proc = real_popen(*args, **kwargs)
+        spawned.append(proc)
+        return proc
+
+    def recording_kill_tree(proc, **kwargs):
+        killed.append((proc, kwargs.get("known")))
+        return real_kill_tree(proc, **kwargs)
+
+    monkeypatch.setattr(childrun.subprocess, "Popen", recording_popen)
+    monkeypatch.setattr(childrun, "kill_tree", recording_kill_tree)
+    timeout = 3.0
+    started = time.monotonic()
+    try:
+        run = childrun.run_argv(
+            [sys.executable, str(parent), str(pid_file)], cwd=spaced_dir, timeout=timeout
+        )
+        elapsed = time.monotonic() - started
+    finally:
+        for proc in spawned:
+            reap_leftovers.append(proc.pid)
+        grandchild = read_pid(pid_file)
+        if grandchild is not None:
+            reap_leftovers.append(grandchild)
+
+    assert grandchild is not None, "the descendant never started inside the timeout"
+    assert run.timed_out is True and run.interrupted is False
+    assert elapsed < timeout + _RETURN_CEILING_S
+    (root,) = spawned
+    assert [proc for proc, _ in killed] == [root]
+    assert isinstance(killed[0][1], dict)
+    assert root.poll() is not None, "the root survived the timeout"
+    assert wait_pid_gone(grandchild), f"descendant {grandchild} survived the timeout"
+
+
+def test_run_argv_drain_gives_up_on_a_holder_nothing_can_reach(spaced_dir, monkeypatch):
+    """Bounded held-pipe drain: the root exits at once leaving an orphan holder
+    with the pipes, and the harvest never sees it (patched to `{}`), so no kill
+    reaches it. The runner must still return within the timeout plus the kill and
+    drain bounds — never wait out the holder's 30 s — on every host.
+
+    Ablation: drop the timeout from `_drain`'s `communicate` and the return waits
+    for the holder."""
+    pid_file = spaced_dir / "holder.pid"
+    holder = spaced_dir / "holder.py"
+    holder.write_text(
+        "import os, sys, time\n"
+        "with open(sys.argv[1], 'w') as fh:\n"
+        "    fh.write(str(os.getpid()))\n"
+        "time.sleep(30)\n",
+        encoding="utf-8",
+    )
+    parent = spaced_dir / "parent.py"
+    parent.write_text(
+        "import subprocess, sys\n"
+        "subprocess.Popen([sys.executable, sys.argv[1], sys.argv[2]],\n"
+        "                 stdout=sys.stdout, stderr=sys.stderr)\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(get_process_host(), "descendants", lambda pid: {})
+    started = time.monotonic()
+    holder_alive_after = False
+    try:
+        run = childrun.run_argv(
+            [sys.executable, str(parent), str(holder), str(pid_file)], cwd=None, timeout=1.0
+        )
+        elapsed = time.monotonic() - started
+        deadline = time.monotonic() + 5.0
+        while read_pid(pid_file) is None and time.monotonic() < deadline:
+            time.sleep(0.05)
+        early_pid = read_pid(pid_file)
+        holder_alive_after = early_pid is not None and not pid_gone(early_pid)
+    finally:
+        deadline = time.monotonic() + 5.0
+        while read_pid(pid_file) is None and time.monotonic() < deadline:
+            time.sleep(0.05)
+        holder_pid = read_pid(pid_file)
+        if holder_pid is not None:
+            with contextlib.suppress(Exception):
+                get_process_host().force_kill(holder_pid)
+
+    assert holder_pid is not None, "the holder never started"
+    assert holder_alive_after, "the kill reached the holder; the unreachable-holder arm never ran"
+    assert run.timed_out is True
+    assert run.returncode == 0, "the root was still running at the timeout"
     assert elapsed < 1.0 + 4 * childrun.KILL_WAIT_S + childrun.DRAIN_S + 2.0
 
 
@@ -947,8 +1127,8 @@ def test_drain_timeout_output_goes_through_timeout_stream(tmp_path):
             timeout=120,
         )
     finally:
-        holder = _read_pid(holder_pid)
-        if holder is not None and not _gone(holder):
+        holder = read_pid(holder_pid)
+        if holder is not None and not pid_gone(holder):
             with contextlib.suppress(Exception):
                 get_process_host().force_kill(holder)
 

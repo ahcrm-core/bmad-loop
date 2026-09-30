@@ -12,6 +12,7 @@ import signal
 import stat
 import subprocess
 import sys
+import time
 import warnings
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -437,6 +438,55 @@ def write_script_launcher(directory: Path, name: str, body: str) -> Path:
         )
         launcher.chmod(0o755)
     return launcher
+
+
+def read_pid(pid_file: Path) -> int | None:
+    """The pid a test child recorded in ``pid_file``, or None before it has."""
+    try:
+        text = pid_file.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return None
+    return int(text) if text.isdigit() else None
+
+
+def pid_gone(pid: int) -> bool:
+    """Dead or a zombie awaiting its (new) parent's reap — either way no longer
+    running anything."""
+    if sys.platform.startswith("linux"):
+        try:
+            stat_line = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+        except (FileNotFoundError, ProcessLookupError):
+            return True
+        return stat_line.rsplit(")", 1)[1].split()[0] in ("Z", "X")
+    from bmad_loop.process_host import get_process_host
+
+    return not get_process_host().is_alive(pid)
+
+
+def wait_pid_gone(pid: int, timeout: float = 5.0) -> bool:
+    """Poll :func:`pid_gone` until it holds or ``timeout`` passes."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if pid_gone(pid):
+            return True
+        time.sleep(0.05)
+    return pid_gone(pid)
+
+
+@pytest.fixture
+def reap_leftovers() -> Iterator[list[int]]:
+    """Pids a failing row may have leaked; force-killed at teardown so a red row
+    never leaves a long sleeper behind. Append a pid as soon as it is known,
+    before the first assertion that could fail."""
+    from bmad_loop.process_host import get_process_host
+
+    pids: list[int] = []
+    yield pids
+    host = get_process_host()
+    for pid in pids:
+        if not pid_gone(pid):
+            with contextlib.suppress(Exception):
+                host.force_kill(pid)
 
 
 class _WindowsLauncher:
