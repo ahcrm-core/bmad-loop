@@ -1386,6 +1386,40 @@ def verify_executed(root: Path) -> list[str]:
     return problems
 
 
+def verify_jobs(listing: Path, expected: Sequence[str]) -> list[str]:
+    """Problems with the latest execution of each ``expected`` job ([] if none).
+
+    ``listing`` is ``gh api --paginate --slurp`` output of the run's
+    ``actions/runs/{id}/jobs?filter=latest`` pages. Metrics artifacts are
+    run-scoped, so a re-run attempt that fails before its upload leaves an
+    earlier attempt's green records in place; the job's own latest conclusion
+    is what makes that failure count. Each expected job must appear and have
+    concluded ``success``; of duplicate names the highest ``run_attempt`` wins."""
+    try:
+        pages = json.loads(listing.read_text(encoding="utf-8"))
+        jobs = [job for page in pages for job in page["jobs"]]
+    except (OSError, ValueError, TypeError, KeyError) as exc:
+        return [f"{listing}: unreadable job listing ({exc!r})"]
+    latest: dict[str, dict[str, Any]] = {}
+    for job in jobs:
+        name = job.get("name")
+        held = latest.get(name)
+        if held is None or (job.get("run_attempt") or 0) > (held.get("run_attempt") or 0):
+            latest[name] = job
+    problems: list[str] = []
+    for name in expected:
+        job = latest.get(name)
+        if job is None:
+            problems.append(f"job {name!r}: not in the run's latest executions")
+        elif job.get("conclusion") != "success":
+            problems.append(
+                f"job {name!r}: attempt {job.get('run_attempt')} is "
+                f"{job.get('status')}/{job.get('conclusion')}, not a success -- "
+                "its downloaded records may be an earlier attempt's"
+            )
+    return problems
+
+
 def _report(problems: list[str], ok: str) -> int:
     if problems:
         sys.stdout.write("".join(f"FAIL: {p}\n" for p in problems))
@@ -1412,7 +1446,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         "verify-executed", help="check a run passed every selected test, none skipped"
     )
     executed_cmd.add_argument("directory", type=Path)
+    jobs_cmd = sub.add_parser(
+        "verify-jobs", help="check each named job concluded success in its latest execution"
+    )
+    jobs_cmd.add_argument("listing", type=Path)
+    jobs_cmd.add_argument("--expect", action="append", required=True, metavar="NAME")
     args = parser.parse_args(argv)
+    if args.command == "verify-jobs":
+        return _report(
+            verify_jobs(args.listing, args.expect),
+            f"ok: {len(args.expect)} jobs succeeded in their latest execution",
+        )
     if args.command == "verify-shards":
         return _report(
             verify_shards(args.directories, args.count),

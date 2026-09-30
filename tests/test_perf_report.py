@@ -1104,6 +1104,47 @@ def test_verify_executed_refuses_a_gate_that_skipped(tmp_path):
     assert perf_report.main(["verify-executed", str(tmp_path / "skipped")]) == 1
 
 
+def test_verify_jobs_makes_the_latest_job_execution_authoritative(tmp_path):
+    shard, gate = "test (windows, py3.11, shard 1/2)", "psmux gate (windows, py3.11)"
+
+    def listing(*jobs: tuple[str, int, str | None]) -> Path:
+        path = tmp_path / f"jobs-{uuid.uuid4().hex}.json"
+        page = [
+            {"name": n, "run_attempt": a, "status": "completed", "conclusion": c}
+            for n, a, c in jobs
+        ]
+        # `--slurp` output: one array of pages; split across two pages.
+        path.write_text(json.dumps([{"jobs": page[:1]}, {"jobs": page[1:]}]), encoding="utf-8")
+        return path
+
+    green = listing((shard, 1, "success"), (gate, 1, "success"))
+    assert perf_report.verify_jobs(green, [shard, gate]) == []
+    assert perf_report.main(["verify-jobs", str(green), "--expect", shard, "--expect", gate]) == 0
+    # A re-run whose shard failed before uploading: attempt 1's green artifact
+    # would still be downloadable, so the attempt-2 failure has to decide.
+    rerun = listing((shard, 1, "success"), (shard, 2, "failure"), (gate, 2, "success"))
+    assert perf_report.verify_jobs(rerun, [shard, gate]) == [
+        f"job {shard!r}: attempt 2 is completed/failure, not a success -- "
+        "its downloaded records may be an earlier attempt's"
+    ]
+    # Carried over by "re-run failed jobs": an earlier attempt's success stands.
+    carried = listing((gate, 2, "success"), (shard, 1, "success"))
+    assert perf_report.verify_jobs(carried, [shard, gate]) == []
+    for conclusion in ("cancelled", "timed_out", "skipped", None):
+        assert perf_report.verify_jobs(
+            listing((shard, 1, conclusion), (gate, 1, "success")), [shard, gate]
+        )
+    assert perf_report.verify_jobs(
+        listing((gate, 1, "success"), (gate, 1, "success")), [shard, gate]
+    ) == [f"job {shard!r}: not in the run's latest executions"]
+    torn = tmp_path / "torn.json"
+    torn.write_text('[{"jobs": [', encoding="utf-8")
+    assert perf_report.verify_jobs(torn, [shard])[0].startswith(f"{torn}: unreadable job listing")
+    assert perf_report.verify_jobs(tmp_path / "absent.json", [shard])[0].startswith(
+        f"{tmp_path / 'absent.json'}: unreadable job listing"
+    )
+
+
 def _inventory_file(root: Path) -> tuple[Path, dict[str, Any]]:
     for path in sorted(root.glob(f"{perf_report.INVENTORY_PREFIX}*.json")):
         data = _json(path)

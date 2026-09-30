@@ -360,7 +360,10 @@ The Windows jobs split one leg across machines without dropping a test:
   requires every live-gate test to have passed; a skip there means the gate did not run. A
   failed, cancelled, deadline-stopped or never-uploaded shard or gate fails the leg, and so
   does one whose wrapper `runner.json` is missing or never reached `exited`. It judges
-  from records rather than `needs.*.result`, which aggregates the whole matrix.
+  from records rather than `needs.*.result`, which aggregates the whole matrix. Artifacts are
+  run-scoped, so a re-run job that fails before uploading would leave the earlier attempt's
+  green records in place; `verify-jobs` therefore also requires each of the leg's three jobs
+  to have concluded `success` in its latest execution (the run's `jobs?filter=latest` listing).
 
 Sharding buys latency, not work: every shard pays its own runner setup and a full collection.
 It stays only while the extra aggregate job-seconds remain within 15% of the unsharded

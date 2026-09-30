@@ -30,7 +30,8 @@ breaking changes may land in a minor release.
   exactly as before (DW-507).
 - Run each Windows CI leg as two shards plus a serial psmux-gate job; fail the
   `test (windows, py3.x)` aggregator on a missing or red shard or gate, a test run in no
-  shard or two, or a skipped live-gate test.
+  shard or two, a skipped live-gate test, or a shard or gate job whose latest attempt
+  failed (so a re-run cannot pass on an earlier attempt's records).
 - Cut test-suite runtime without dropping assertions: allocate state roots in constant time,
   give render-only tests a Git-free `project_tree`, observe TUI lifecycle events instead of
   polling, and copy submodule origins from per-worker templates.

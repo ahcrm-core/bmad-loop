@@ -200,7 +200,9 @@ jobs:
         # matter most; a job cancelled outright may still lose the upload, and
         # the aggregator then fails on the missing shard. `overwrite`: a re-run
         # attempt replaces its predecessor's records rather than failing on the
-        # name, so the aggregator always reads the attempt that ran last.
+        # name. An attempt that never reaches this step leaves the older records
+        # in place, which is why the aggregator also checks each job's latest
+        # conclusion.
         if: always()
         timeout-minutes: 3
         uses: actions/upload-artifact@v7
@@ -326,12 +328,19 @@ jobs:
     # aggregates the whole matrix, so one leg's red would redden every leg): a
     # shard or gate that failed, was cancelled, timed out or never uploaded fails
     # here, and so does any collected test that ran in no shard or in both.
+    # Artifacts are run-scoped, so a re-run job that fails before its upload
+    # leaves the earlier attempt's green records downloadable; each of this
+    # leg's jobs must therefore also have succeeded in its latest execution.
     # `always()`: a skipped aggregator would read as a pass.
     name: test (windows, py${{ matrix.python-version }})
     needs: [test-windows-shard, test-windows-live]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    permissions:
+      contents: read
+      # The run's job listing, for the latest-execution check below.
+      actions: read
     strategy:
       fail-fast: false
       matrix:
@@ -369,6 +378,20 @@ jobs:
         env:
           LEG: test-metrics-windows-py${{ matrix.python-version }}
         run: uv run python tests/perf_report.py verify-executed "$RUNNER_TEMP/windows-metrics/$LEG-live"
+
+      - name: Verify this leg's jobs succeeded in their latest execution
+        # `filter=latest` keeps a job carried over by "re-run failed jobs" at the
+        # attempt it last ran in, so its records and its conclusion still agree.
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PY: ${{ matrix.python-version }}
+        run: |
+          gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/jobs?filter=latest&per_page=100" > "$RUNNER_TEMP/jobs.json"
+          uv run python tests/perf_report.py verify-jobs "$RUNNER_TEMP/jobs.json" \
+            --expect "test (windows, py$PY, shard 1/2)" \
+            --expect "test (windows, py$PY, shard 2/2)" \
+            --expect "psmux gate (windows, py$PY)"
 
   version-sync:
     name: version-sync
