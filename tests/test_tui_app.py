@@ -446,8 +446,8 @@ async def test_notification_record_outlives_textual_expiry(project_tree, monkeyp
     expired row fails; drop the spy's record and the emitted row fails."""
     from textual import notifications as textual_notifications
 
-    # `raised_at`'s default factory bound the real `time` at import, so the frozen
-    # clock starts from it and only `time_left`'s reading moves.
+    # `raised_at`'s default factory bound the real `time` at import, so only
+    # `time_left`'s reading follows the frozen clock.
     now = [time.time()]
     monkeypatch.setattr(textual_notifications, "time", lambda: now[0])
     app = BmadLoopApp(project_tree.project)
@@ -459,7 +459,10 @@ async def test_notification_record_outlives_textual_expiry(project_tree, monkeyp
             lambda: any(n.message == "short-lived" for n in app._notifications),
             what="Textual holds the notification",
         )
-        now[0] += BmadLoopApp.NOTIFICATION_TIMEOUT + 1
+        # Past the toast's own expiry: `raised_at` is real time at `notify`, which
+        # a slow app start can put well after any reading taken before it.
+        (held,) = (n for n in app._notifications if n.message == "short-lived")
+        now[0] = held.raised_at + held.timeout + 1
         assert not any(n.message == "short-lived" for n in app._notifications)  # reaped
         assert ("short-lived", "warning") in notifications_with_severity(app)
         with pytest.raises(AssertionError, match="not met within 0.3s: a toast never emitted"):
