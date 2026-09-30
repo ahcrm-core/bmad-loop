@@ -604,6 +604,8 @@ def test_wrapper_deadline_stops_the_tree_and_keeps_partial_records(tmp_path, rea
     runner = _json(metrics / perf_report.RUNNER)
     assert runner["state"] == "timed_out"
     assert runner["child_reaped"] is True
+    if sys.platform == "win32":
+        assert runner["tree_job"] is True, "the tree ran outside its job object"
     summary = _json(metrics / perf_report.SUMMARY_JSON)
     assert summary["status"] == "timed_out"
     assert summary["tests"]["unfinished"] == [
@@ -669,6 +671,34 @@ def test_wrapper_finishes_cleanup_through_a_second_cancel_signal(tmp_path, monke
     assert killed == [signal.SIGINT, signal.SIGKILL]
     runner = _json(tmp_path / "m" / perf_report.RUNNER)
     assert (runner["state"], runner["child_reaped"]) == ("interrupted", True)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows job-object path")
+def test_wrapper_tree_kill_reaches_a_ctrl_c_immune_child_after_the_root_exited(
+    tmp_path, reap_leftovers
+):
+    """An interrupt reaches the wrapper only once pytest has exited
+    (``Popen.wait`` is not interruptible on Windows), when ``taskkill /T`` can no
+    longer walk from the reaped root. A child in its own process group ignored
+    the Ctrl+C; the job must still reach it."""
+    pid_file = tmp_path / "child"
+    root = (
+        "import pathlib, subprocess, sys\n"
+        "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)'],"
+        " creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)\n"
+        f"pathlib.Path({str(pid_file)!r}).write_text(str(child.pid), encoding='utf-8')\n"
+    )
+    proc = subprocess.Popen([sys.executable, "-c", root])
+    job = run_test_benchmark._TreeJob.open(proc.pid)
+    try:
+        assert proc.wait(timeout=60) == 0
+        child = int(pid_file.read_text(encoding="utf-8"))
+        reap_leftovers.append(child)
+        assert not _gone(child), "the child must outlive its root for this row to mean anything"
+        run_test_benchmark._kill_tree(proc, 0.0, job)
+        assert _wait_gone(child), f"pid {child} outlived the tree kill"
+    finally:
+        job.close()
 
 
 def test_wrapper_refuses_a_used_directory_and_a_passed_deadline(tmp_path, monkeypatch):

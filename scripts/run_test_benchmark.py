@@ -26,10 +26,19 @@ is an absolute Unix time, which lets CI reserve the end of a job's
 ``timeout-minutes`` for uploading the metrics (see .github/workflows/ci.yml). On
 expiry the tree is stopped: POSIX sends SIGINT to pytest's process group (pytest
 then still writes its JUnit file and session records), waits ``--grace`` seconds
-and SIGKILLs the group; Windows runs ``taskkill /T /F`` on the tree at once (pytest
-shares the wrapper's console group there, as it would without the wrapper, so no
-Ctrl+C can be aimed at it alone). Records already flushed by the metrics plugin
-survive either way.
+and SIGKILLs the group; Windows terminates the tree at once (pytest shares the
+wrapper's console group there, as it would without the wrapper, so no Ctrl+C can
+be aimed at it alone). Records already flushed by the metrics plugin survive
+either way.
+
+Windows tree: pytest is put in a job object of its own, the stand-in for the
+POSIX process group — membership outlives the root, so a child that ignored
+Ctrl+C (``CREATE_NEW_PROCESS_GROUP``) is still reached after pytest itself exited
+and was reaped, when ``taskkill /T`` can no longer walk to it. That is the normal
+case on an interrupt: ``Popen.wait`` is not interruptible there, so the wrapper
+only sees the Ctrl+C once pytest is gone. ``taskkill /T /F`` still runs after the
+job kill for anything outside the job. If the job cannot be set up the run goes
+on without it and ``runner.json`` records ``tree_job: false``.
 
 Standalone by design: stdlib only, and it does not import bmad_loop. Child output
 passes straight through to this process's stdout/stderr and is never recorded.
@@ -66,6 +75,109 @@ _TASKKILL_TIMEOUT_S = 30.0
 
 class _Interrupted(Exception):
     """SIGINT/SIGTERM reached the wrapper while pytest was running."""
+
+
+class _TreeJob:
+    """Windows only: a job object holding pytest and everything it starts.
+
+    Limits are just ``BREAKAWAY_OK``, so a child that explicitly asks to break
+    away still can, as it could without the wrapper; there is no kill-on-close,
+    so a run that exits normally leaves its processes exactly as it would
+    unwrapped. Only a process pytest started before :meth:`open` assigned it —
+    microseconds after the spawn, long before pytest starts anything — escapes."""
+
+    def __init__(self, kernel32: Any, handle: int) -> None:
+        self._kernel32 = kernel32
+        self._handle: int | None = handle
+
+    @classmethod
+    def open(cls, pid: int) -> _TreeJob:
+        """Create the job and assign ``pid`` to it; ``OSError`` on any failure."""
+        import ctypes
+        from ctypes import wintypes
+
+        class _Basic(ctypes.Structure):
+            _fields_ = [
+                ("PerProcessUserTimeLimit", ctypes.c_int64),
+                ("PerJobUserTimeLimit", ctypes.c_int64),
+                ("LimitFlags", wintypes.DWORD),
+                ("MinimumWorkingSetSize", ctypes.c_size_t),
+                ("MaximumWorkingSetSize", ctypes.c_size_t),
+                ("ActiveProcessLimit", wintypes.DWORD),
+                ("Affinity", ctypes.c_size_t),
+                ("PriorityClass", wintypes.DWORD),
+                ("SchedulingClass", wintypes.DWORD),
+            ]
+
+        class _Extended(ctypes.Structure):
+            _fields_ = [
+                ("BasicLimitInformation", _Basic),
+                ("IoInfo", ctypes.c_uint64 * 6),
+                ("ProcessMemoryLimit", ctypes.c_size_t),
+                ("JobMemoryLimit", ctypes.c_size_t),
+                ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                ("PeakJobMemoryUsed", ctypes.c_size_t),
+            ]
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateJobObjectW.argtypes = (ctypes.c_void_p, wintypes.LPCWSTR)
+        kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+        kernel32.SetInformationJobObject.argtypes = (
+            wintypes.HANDLE,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            wintypes.DWORD,
+        )
+        kernel32.SetInformationJobObject.restype = wintypes.BOOL
+        kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.AssignProcessToJobObject.argtypes = (wintypes.HANDLE, wintypes.HANDLE)
+        kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
+        kernel32.TerminateJobObject.argtypes = (wintypes.HANDLE, wintypes.UINT)
+        kernel32.TerminateJobObject.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+        kernel32.CloseHandle.restype = wintypes.BOOL
+
+        def fail(what: str) -> OSError:
+            err = ctypes.get_last_error()
+            return OSError(err, f"{what} failed (winerror {err})")
+
+        handle = kernel32.CreateJobObjectW(None, None)
+        if not handle:
+            raise fail("CreateJobObjectW")
+        job = cls(kernel32, handle)
+        try:
+            info = _Extended()
+            info.BasicLimitInformation.LimitFlags = 0x800  # JOB_OBJECT_LIMIT_BREAKAWAY_OK
+            if not kernel32.SetInformationJobObject(
+                handle, 9, ctypes.byref(info), ctypes.sizeof(info)
+            ):  # 9: JobObjectExtendedLimitInformation
+                raise fail("SetInformationJobObject")
+            # PROCESS_TERMINATE | PROCESS_SET_QUOTA. The pid cannot be reused
+            # meanwhile: the caller's Popen still holds its process handle.
+            process = kernel32.OpenProcess(0x0001 | 0x0100, False, pid)
+            if not process:
+                raise fail("OpenProcess")
+            try:
+                if not kernel32.AssignProcessToJobObject(handle, process):
+                    raise fail("AssignProcessToJobObject")
+            finally:
+                kernel32.CloseHandle(process)
+        except BaseException:
+            job.close()
+            raise
+        return job
+
+    def terminate(self) -> bool:
+        """Kill every process still in the job. False if the call failed."""
+        if self._handle is None:
+            return False
+        return bool(self._kernel32.TerminateJobObject(self._handle, 1))
+
+    def close(self) -> None:
+        if self._handle is not None:
+            self._kernel32.CloseHandle(self._handle)
+            self._handle = None
 
 
 def _write_runner(root: Path, record: dict[str, Any]) -> None:
@@ -106,10 +218,14 @@ def _parse(argv: Sequence[str]) -> argparse.Namespace:
     return args
 
 
-def _kill_tree(proc: subprocess.Popen[bytes], grace: float) -> None:
+def _kill_tree(proc: subprocess.Popen[bytes], grace: float, job: _TreeJob | None = None) -> None:
     """Stop pytest and everything it started. Bounded: returns within
     ``grace + _REAP_WAIT_S`` (+ taskkill's own bound on Windows)."""
     if sys.platform == "win32":
+        # The job first: it still holds the tree when the root is already
+        # reaped, which taskkill's parent-pid walk cannot see past.
+        if job is not None:
+            job.terminate()
         try:
             subprocess.run(  # fixed argv, no shell
                 ["taskkill", "/T", "/F", "/PID", str(proc.pid)],
@@ -236,6 +352,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     previous = {sig: signal.getsignal(sig) for sig in (signal.SIGINT, signal.SIGTERM)}
     for sig in previous:
         signal.signal(sig, _raise_interrupted)
+    job: _TreeJob | None = None
     try:
         try:
             proc = subprocess.Popen(command, **popen_kwargs)  # fixed argv, no shell
@@ -247,6 +364,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             _summarize(root)
             return EXIT_SPAWN_FAILED
         record["child_pid"] = proc.pid
+        if sys.platform == "win32":
+            try:
+                job = _TreeJob.open(proc.pid)
+            except OSError as exc:
+                sys.stderr.write(
+                    f"run_test_benchmark: no job object for the pytest tree ({exc}); "
+                    "a stop reaches only what taskkill /T can still find\n"
+                )
+            record["tree_job"] = job is not None
         _write_runner(root, record)
         try:
             returncode = proc.wait(timeout=budget)
@@ -255,7 +381,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             sys.stderr.write(
                 f"run_test_benchmark: deadline reached after {budget:.0f}s; stopping pytest\n"
             )
-            _kill_tree(proc, args.grace)
+            _kill_tree(proc, args.grace, job)
             finish("timed_out", proc.returncode, child_reaped=proc.returncode is not None)
             _summarize(root)
             return EXIT_TIMED_OUT
@@ -268,11 +394,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                     proc.wait(timeout=args.grace)
                 except subprocess.TimeoutExpired:
                     pass
-            _kill_tree(proc, args.grace)
+            _kill_tree(proc, args.grace, job)
             finish("interrupted", proc.returncode, child_reaped=proc.returncode is not None)
             _summarize(root)
             return EXIT_INTERRUPTED
     finally:
+        if job is not None:
+            job.close()  # no kill-on-close: this frees the handle, nothing more
         for sig, handler in previous.items():
             signal.signal(sig, handler)
 
