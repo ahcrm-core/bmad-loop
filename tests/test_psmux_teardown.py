@@ -19,6 +19,8 @@ from dataclasses import dataclass, field
 import psmux_teardown
 import pytest
 
+from bmad_loop.adapters.tmux_base import TmuxError
+
 PRIVATE = "private-registry"
 DEFAULT = "default-registry"
 ENV = {"PSMUX_DATA_DIR": PRIVATE}
@@ -62,6 +64,8 @@ class FakeRegistry:
     calls: list[tuple[str, str]] = field(default_factory=list)
     witness_calls: list[str] = field(default_factory=list)
     witness_killed: list[str] = field(default_factory=list)
+    # Exceptions the next psmux calls raise, one per call, before resolving.
+    failures: list[BaseException] = field(default_factory=list)
 
     def spawn(
         self,
@@ -101,6 +105,8 @@ class FakeRegistry:
         root = DEFAULT if env is None else env.get("PSMUX_DATA_DIR", DEFAULT)
         verb = argv[0]
         self.calls.append((verb, root))
+        if self.failures:
+            raise self.failures.pop(0)
         if verb == "has-session":
             hit = [s for s in self.servers if s.session == argv[2] and self._registered(s, root)]
         elif verb == "kill-session":
@@ -245,6 +251,33 @@ def test_a_default_registry_leak_is_never_a_clean_teardown(registry, known_creat
 
     assert leaked.alive, "the private kills never reached the default registry"
     assert (("has-session", DEFAULT)) in registry.calls
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        subprocess.TimeoutExpired(["psmux", "has-session"], 5),
+        OSError("psmux vanished"),
+        TmuxError("has-session failed"),
+    ],
+    ids=["timeout", "oserror", "tmuxerror"],
+)
+def test_a_failed_first_probe_still_runs_the_teardown(registry, failure):
+    """The first `has-session` raising — likeliest right after an overloaded
+    mint, exactly when a mid-start server is loose — must not abort the
+    teardown before a kill fires. It is no positive read either, so the server
+    that registers late is still waited for and killed.
+
+    Ablation: let the first `seen_anywhere` raise and every row escapes with
+    the server alive."""
+    server = registry.spawn(registers_at=5.0)
+    registry.failures.append(failure)
+
+    _teardown(registry, known_created=False)
+
+    assert not server.alive
+    assert registry.alive() == []
+    assert registry.clock.now >= psmux_teardown.PSMUX_READY_DEADLINE_S
 
 
 def test_minted_session_carries_creation_only_after_the_mint_returns(registry):

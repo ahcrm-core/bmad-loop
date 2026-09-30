@@ -118,8 +118,17 @@ def teardown_probe_session(
     Only the pathological path pays that: every fixture here tears down a session
     it minted and observed, so either the first read sees it or the carried fact
     stands in for it, and teardown costs a beat.
+
+    A first read that RAISES (a timed-out or failed `has-session`, most likely
+    right after an overloaded mint — the path a mid-start server leaks on) is no
+    observation at all: it must not abort the teardown before either kill verb
+    fires, and it is not a positive read, so it leaves ``seen`` at the carried
+    fact and the loop below takes over.
     """
-    seen = known_created or seen_anywhere(mux, session, env)
+    try:
+        seen = known_created or seen_anywhere(mux, session, env)
+    except (OSError, TmuxError, subprocess.TimeoutExpired):
+        seen = known_created
     deadline = clock() + PSMUX_READY_DEADLINE_S + TEARDOWN_SLACK_S
     quiet_since: float | None = None
     while clock() < deadline:
