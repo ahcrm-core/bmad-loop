@@ -25,6 +25,7 @@ from conftest import (
     bundle_dev_escalates,
     bundle_review_effect,
     bundle_spec_path,
+    copy_project,
     crash_at_merge_back,
     fault_locked_ledger_read,
     fault_metadata_probe,
@@ -22431,15 +22432,158 @@ def test_marked_triage_running_ignores_stale_accepted_rewrite(project, monkeypat
     assert "--migrate" in adapter.sessions[0].prompt
 
 
+# What a real crash at the migration COMMITTING boundary persists and this
+# builder does not: the dispatched migrate session's own bookkeeping (its
+# `sessions` row and `tokens`) and the crash markers. No recovery route reads
+# them; the parity row below pins that every other task field matches.
+_COMMITTING_DISPATCH_ONLY_FIELDS = frozenset({"sessions", "tokens"})
+
+
+def _persist_committing_migration(project):
+    """Persist the COMMITTING boundary a legacy migration reaches when its
+    commit is unavailable — the four run-owned records, the recovery-marked task
+    and the accepted rewrite left live and uncommitted — without dispatching the
+    migrate session or crashing an engine to write them. Returns the engine that
+    owns the run dir; `resume_sweep` resumes it like any crashed run.
+
+    Every value comes from the production readers/serializers the real run uses:
+    the cycle ledger reader for the baseline, `SweepEngine._migration_manifest`
+    for the manifest, the confined atomic writer for all four records, and HEAD
+    and untracked files read from the repository. Nothing here is identity-bound:
+    the records carry no inode, owner or run token, only content bound to each
+    other, which the resume re-derives. `test_committing_builder_matches_a_real_crash`
+    holds this to a real crash byte for byte; its resume twin proves it reaches the
+    commit arm."""
+    write_legacy_ledger(project, LEGACY_LEDGER)
+    engine, _ = make_sweep(project, [])
+    baseline, fault = engine._read_cycle_ledger(project.deferred_work)
+    assert fault is None and deferredwork.has_legacy(baseline), "builder premise: legacy ledger"
+    head = verify.rev_parse_head(project.repo_root)
+    untracked = sorted(verify.untracked_files(project.repo_root))
+    rewrite = migrated_ledger()
+    confine_root = sweep_mod._project_of_run_dir(engine.run_dir)
+    for name, text in (
+        (sweep_mod._MIGRATE_BASELINE_RECORD, baseline),
+        (
+            sweep_mod._MIGRATE_MANIFEST_RECORD,
+            json.dumps(SweepEngine._migration_manifest(baseline), indent=2),
+        ),
+        (sweep_mod._MIGRATE_REWRITE_RECORD, rewrite),
+        (
+            sweep_mod._MIGRATE_RESULT_RECORD,
+            json.dumps(migrate_result(_valid_migration_mapping()), indent=2),
+        ),
+    ):
+        sweep_mod.atomic_write_text_confined(engine.run_dir / name, text, confine_root=confine_root)
+    # the accepted session's rewrite, exactly as `migrate_effect` leaves it
+    project.deferred_work.write_text(rewrite, encoding="utf-8")
+    engine.state.sweep_cycle = 1
+    engine.state.tasks[MIGRATE_KEY] = StoryTask.from_dict(
+        {
+            "story_key": MIGRATE_KEY,
+            "epic": 0,
+            "phase": str(Phase.COMMITTING),
+            "attempt": 1,
+            "baseline_commit": head,
+            "baseline_untracked": untracked,
+            "migration_recovery_format": sweep_mod._MIGRATION_RECOVERY_FORMAT,
+        }
+    )
+    save_state(engine.run_dir, engine.state)
+    return engine
+
+
+def _crash_at_committing(project, monkeypatch):
+    """The real route to the same boundary: dispatch the migrate session and
+    crash on an unavailable commit."""
+    write_legacy_ledger(project, LEGACY_LEDGER)
+    engine, _ = make_sweep(
+        project, [migrate_effect(project, migrated_ledger(), _valid_migration_mapping())]
+    )
+    monkeypatch.setattr(engine, "_commit_ledger", lambda *_args, **_kwargs: "unavailable")
+    assert engine.run().crashed
+    return engine
+
+
+def _migration_boundary(engine, project) -> dict:
+    records = {
+        name: (engine.run_dir / name).read_bytes()
+        for name in (
+            sweep_mod._MIGRATE_BASELINE_RECORD,
+            sweep_mod._MIGRATE_MANIFEST_RECORD,
+            sweep_mod._MIGRATE_REWRITE_RECORD,
+            sweep_mod._MIGRATE_RESULT_RECORD,
+        )
+    }
+    state = load_state(engine.run_dir)
+    task = state.tasks[MIGRATE_KEY].to_dict()
+    return {
+        "records": records,
+        "task": {k: v for k, v in task.items() if k not in _COMMITTING_DISPATCH_ONLY_FIELDS},
+        "sweep_cycle": state.sweep_cycle,
+        "ledger": project.deferred_work.read_bytes(),
+        "status": git(project.project, "status", "--porcelain", "-uall"),
+    }
+
+
+def test_committing_builder_matches_a_real_crash(tmp_path, _project_template, monkeypatch):
+    """Premise tripwire for the direct COMMITTING builder: two sandboxes from the
+    same template, one crashed by the real migrate route, one built. Their records
+    are byte-identical, their tasks agree on every field but the dispatch-only
+    bookkeeping, and the live ledger and Git status match — HEAD differs only by
+    the sandbox's own commit identity, so it is compared as "the pre-migration
+    HEAD" in each. Ablation: drop the recovery marker (or any record) from the
+    builder and this reds."""
+    real_project = copy_project(_project_template, tmp_path / "real" / "sandbox")
+    built_project = copy_project(_project_template, tmp_path / "built" / "sandbox")
+    real_engine = _crash_at_committing(real_project, monkeypatch)
+    real = _migration_boundary(real_engine, real_project)
+    built = _migration_boundary(_persist_committing_migration(built_project), built_project)
+
+    for boundary, paths in ((real, real_project), (built, built_project)):
+        assert boundary["task"].pop("baseline_commit") == verify.rev_parse_head(paths.repo_root)
+    assert built == real
+    # the excluded fields are exactly what the real crash's dispatch wrote
+    crashed = load_state(real_engine.run_dir).tasks[MIGRATE_KEY]
+    assert crashed.sessions and _COMMITTING_DISPATCH_ONLY_FIELDS <= set(crashed.to_dict())
+
+
+@needs_dir_fd_recovery
+def test_committing_builder_reaches_the_commit_arm_on_resume(project, monkeypatch):
+    """The other half of the tripwire: an UNcorrupted built boundary resumes
+    through the production COMMITTING arm to the ledger commit without redispatching
+    the migrate session, so a refusal in the rows below is the corruption's, not a
+    builder defect's."""
+    engine = _persist_committing_migration(project)
+    head = git(project.project, "rev-parse", "HEAD")
+    plan = triage_result(["DW-2"], skip=[{"id": "DW-2", "reason": "not this cycle"}])
+    resumed, adapter = resume_sweep(project, engine, [triage_effect(plan)])
+
+    summary = resumed.run()
+
+    # the same outcome `test_unavailable_migration_commit_resumes_commit_only`
+    # asserts after a real crash: commit-only replay, then the cycle's triage
+    assert not summary.paused and not summary.crashed
+    assert len(adapter.sessions) == 1
+    assert "--migrate" not in adapter.sessions[0].prompt
+    assert resumed.state.tasks[MIGRATE_KEY].phase == Phase.DONE
+    assert "chore(sweep): migrate legacy" in git(project.project, "log", "--oneline")
+    assert git(project.project, "merge-base", "--is-ancestor", head, "HEAD") == ""
+    assert "sweep-migration-recovery-invalid" not in journal_kinds(resumed)
+
+
 @pytest.mark.parametrize(
-    "result_text",
+    ("result_text", "detail"),
     [
-        None,
-        "{",
-        "[]",
-        json.dumps(migrate_result([])),
-        "[" * 2000 + "0" + "]" * 2000,
-        "[" + "9" * 5000 + "]",
+        (None, "missing result record"),
+        ("{", "malformed result record"),
+        ("[]", "result record is not a JSON object"),
+        (
+            json.dumps(migrate_result([])),
+            "result record is inconsistent with accepted migration",
+        ),
+        ("[" * 2000 + "0" + "]" * 2000, "result record is not a JSON object"),
+        ("[" + "9" * 5000 + "]", "malformed result record"),
     ],
     ids=[
         "missing",
@@ -22450,12 +22594,14 @@ def test_marked_triage_running_ignores_stale_accepted_rewrite(project, monkeypat
         "oversized-integer",
     ],
 )
-def test_committing_resume_rejects_bad_result_before_publication(project, monkeypatch, result_text):
-    write_legacy_ledger(project, LEGACY_LEDGER)
-    mapping = _valid_migration_mapping()
-    engine, _ = make_sweep(project, [migrate_effect(project, migrated_ledger(), mapping)])
-    monkeypatch.setattr(engine, "_commit_ledger", lambda *_args, **_kwargs: "unavailable")
-    assert engine.run().crashed
+def test_committing_resume_rejects_bad_result_before_publication(
+    project, monkeypatch, result_text, detail
+):
+    # Entered at the persisted COMMITTING boundary; the real crash route to it is
+    # `test_unavailable_migration_commit_resumes_commit_only` and the invalid-UTF-8
+    # family below, and `test_committing_builder_matches_a_real_crash` holds the
+    # builder to it.
+    engine = _persist_committing_migration(project)
     result_path = engine.run_dir / "migrate-result.json"
     if result_text is None:
         result_path.unlink()
@@ -22478,19 +22624,26 @@ def test_committing_resume_rejects_bad_result_before_publication(project, monkey
     assert resumed.state.tasks["sweep-migrate"].phase == Phase.ESCALATED
     assert git(project.project, "rev-parse", "HEAD") == head
     assert project.deferred_work.read_text(encoding="utf-8") == live
+    [refusal] = _records(resumed, "sweep-migration-recovery-invalid")
+    # Which gate refused, not merely that one did: a `[]` manifest also fails
+    # result validation, so without this the manifest gate's ablation passed.
+    # Without dir-fd reads every record read refuses first (DW-315).
+    if sweep_mod.DIR_FD_ANCHORED_WRITES:
+        assert refusal["detail"] == detail
 
 
 @pytest.mark.parametrize(
-    "manifest_text",
-    ["[]", "[" * 2000 + "0" + "]" * 2000, "[" + "9" * 5000 + "]"],
+    ("manifest_text", "detail"),
+    [
+        ("[]", "manifest disagrees with accepted baseline"),
+        ("[" * 2000 + "0" + "]" * 2000, "manifest record is not an object list"),
+        ("[" + "9" * 5000 + "]", "malformed manifest record"),
+    ],
     ids=["baseline-mismatch", "recursive", "oversized-integer"],
 )
-def test_committing_resume_rejects_bad_manifest(project, monkeypatch, manifest_text):
-    write_legacy_ledger(project, LEGACY_LEDGER)
-    mapping = _valid_migration_mapping()
-    engine, _ = make_sweep(project, [migrate_effect(project, migrated_ledger(), mapping)])
-    monkeypatch.setattr(engine, "_commit_ledger", lambda *_args, **_kwargs: "unavailable")
-    assert engine.run().crashed
+def test_committing_resume_rejects_bad_manifest(project, monkeypatch, manifest_text, detail):
+    # Entered at the persisted COMMITTING boundary; see the row above.
+    engine = _persist_committing_migration(project)
     (engine.run_dir / "migrate-manifest.json").write_text(manifest_text, encoding="utf-8")
     head = git(project.project, "rev-parse", "HEAD")
     live = project.deferred_work.read_text(encoding="utf-8")
@@ -22508,6 +22661,12 @@ def test_committing_resume_rejects_bad_manifest(project, monkeypatch, manifest_t
     assert resumed.state.tasks["sweep-migrate"].phase == Phase.ESCALATED
     assert git(project.project, "rev-parse", "HEAD") == head
     assert project.deferred_work.read_text(encoding="utf-8") == live
+    [refusal] = _records(resumed, "sweep-migration-recovery-invalid")
+    # Which gate refused, not merely that one did: a `[]` manifest also fails
+    # result validation, so without this the manifest gate's ablation passed.
+    # Without dir-fd reads every record read refuses first (DW-315).
+    if sweep_mod.DIR_FD_ANCHORED_WRITES:
+        assert refusal["detail"] == detail
 
 
 @pytest.mark.parametrize(
@@ -29906,20 +30065,148 @@ def test_unstaged_ignored_and_expected_absence_restore_with_tracked_refusal(proj
     assert task.integration_attempt["outcome"] == "refused-restored"
 
 
-def test_populated_submodule_checkout_is_captured_forwarded_and_restored(project, tmp_path):
-    origin = tmp_path / "sub-origin"
-    origin.mkdir()
-    git(origin, "init", "-q")
-    git(origin, "config", "user.email", "test@example.com")
-    git(origin, "config", "user.name", "Test")
-    (origin / "payload.txt").write_text("old\n")
-    git(origin, "add", "-A")
-    git(origin, "commit", "-q", "-m", "old submodule")
-    old_submodule = verify.rev_parse_head(origin)
-    (origin / "payload.txt").write_text("new\n")
-    git(origin, "add", "-A")
-    git(origin, "commit", "-q", "-m", "new submodule")
-    new_submodule = verify.rev_parse_head(origin)
+# The submodule origins below, by content: each a sequence of commits, each
+# commit the files it writes over the previous one. Named rather than one
+# multi-mode builder so every test states which history its submodule has.
+_SUBMODULE_ORIGINS: dict[str, tuple[tuple[str, dict[str, str]], ...]] = {
+    "old": (("old submodule", {"payload.txt": "old\n"}),),
+    "old-new": (
+        ("old submodule", {"payload.txt": "old\n"}),
+        ("new submodule", {"payload.txt": "new\n"}),
+    ),
+    "old-new-ignoring-logs": (
+        ("old submodule", {".gitignore": "*.log\n", "payload.txt": "old\n"}),
+        ("new submodule", {"payload.txt": "new\n"}),
+    ),
+    "new-submodule": (("new submodule", {"payload.txt": "new submodule\n"}),),
+    "new-submodule-ignoring-logs": (
+        ("new submodule", {"payload.txt": "new submodule\n", ".gitignore": "*.log\n"}),
+    ),
+    "ignoring-automator-dir": (
+        (
+            "submodule ignoring .bmad-loop/",
+            {".gitignore": ".bmad-loop/\n", "payload.txt": "submodule\n"},
+        ),
+    ),
+}
+
+
+def _build_origin_template(root: Path, commits) -> tuple[str, ...]:
+    root.mkdir()
+    git(root, "init", "-q")
+    git(root, "config", "user.email", "test@example.com")
+    git(root, "config", "user.name", "Test")
+    oids = []
+    for message, files in commits:
+        for name, text in files.items():
+            (root / name).write_text(text)
+        git(root, "add", "-A")
+        git(root, "commit", "-q", "-m", message)
+        oids.append(verify.rev_parse_head(root))
+    # Relocatable by construction, and checked rather than trusted: a plain
+    # repository whose `.git` is a directory, with no linked worktrees, no
+    # alternates and no absolute path of its own in its config — so a copy is a
+    # whole, independent repository and nothing in it points back here.
+    admin = root / ".git"
+    assert admin.is_dir() and not (admin / "worktrees").exists()
+    assert not (admin / "objects" / "info" / "alternates").exists()
+    assert str(root) not in (admin / "config").read_text()
+    return tuple(oids)
+
+
+@pytest.fixture(scope="session")
+def _submodule_origin_templates(tmp_path_factory):
+    """Per-worker origin repositories, built on first use and NEVER handed to a
+    test: `private_origin` copies one into the test's own directory. Immutable by
+    that contract, as `_project_template` is."""
+    root = tmp_path_factory.mktemp("submodule-origins")
+    built: dict[str, tuple[Path, tuple[str, ...]]] = {}
+
+    def template(name: str) -> tuple[Path, tuple[str, ...]]:
+        if name not in built:
+            path = root / name
+            built[name] = (path, _build_origin_template(path, _SUBMODULE_ORIGINS[name]))
+        return built[name]
+
+    return template
+
+
+@pytest.fixture
+def private_origin(_submodule_origin_templates, tmp_path):
+    """`private_origin(name, dirname="sub-origin")` -> `(path, commit oids oldest
+    first)`: a private copytree of the named origin under this test's tmp_path —
+    its own objects, refs, index and files. `git submodule add` still runs for
+    real against that path, so `.gitmodules` and the checkout's remote name this
+    test's copy, never the template."""
+
+    def copy(name: str, dirname: str = "sub-origin") -> tuple[Path, tuple[str, ...]]:
+        template, oids = _submodule_origin_templates(name)
+        origin = tmp_path / dirname
+        shutil.copytree(template, origin)
+        return origin, oids
+
+    return copy
+
+
+def test_private_origins_are_independent_copies(private_origin, _submodule_origin_templates):
+    """Two copies of one template, then every kind of mutation in the first:
+    a commit moving its ref, a staged index entry, a worktree file. The second
+    copy and the template keep their refs, index and content, and each copy's
+    HEAD is the recorded oid its tests rely on.
+
+    Ablation: hand out the template path itself instead of a copy and the second
+    copy (then the same repository) reads the first one's commit."""
+    first, oids = private_origin("old-new", "first")
+    second, _ = private_origin("old-new", "second")
+    template, _ = _submodule_origin_templates("old-new")
+    assert verify.rev_parse_head(first) == verify.rev_parse_head(second) == oids[-1]
+
+    (first / "payload.txt").write_text("mutated\n")
+    git(first, "commit", "-q", "-am", "mutation in the first copy")
+    (first / "staged.txt").write_text("staged\n")
+    git(first, "add", "--", "staged.txt")
+    (first / "payload.txt").write_text("dirty\n")
+
+    assert verify.rev_parse_head(first) != oids[-1]
+    for untouched in (second, template):
+        assert verify.rev_parse_head(untouched) == oids[-1]
+        assert git(untouched, "rev-list", "--count", "HEAD") == str(len(oids))
+        assert git(untouched, "ls-files") == "payload.txt"
+        assert git(untouched, "status", "--porcelain", "-uall") == ""
+        assert (untouched / "payload.txt").read_text() == "new\n"
+
+
+def test_submodule_added_from_a_private_origin_names_this_tests_copy(
+    project, private_origin, _submodule_origin_templates, tmp_path
+):
+    """The superproject's `.gitmodules`, its config and the checkout's own remote
+    all name the test's private copy, never the shared template — so a
+    `submodule update` a hook runs fetches from this test's repository alone."""
+    origin, (old_submodule,) = private_origin("old")
+    template, _ = _submodule_origin_templates("old")
+    git(
+        project.project,
+        "-c",
+        "protocol.file.allow=always",
+        "submodule",
+        "add",
+        "-q",
+        str(origin),
+        "module",
+    )
+
+    assert origin.parent == tmp_path and origin != template
+    urls = {
+        git(project.project, "config", "-f", ".gitmodules", "submodule.module.url"),
+        git(project.project, "config", "submodule.module.url"),
+        git(project.project / "module", "remote", "get-url", "origin"),
+    }
+    assert {Path(url) for url in urls} == {origin}
+    assert verify.rev_parse_head(project.project / "module") == old_submodule
+
+
+def test_populated_submodule_checkout_is_captured_forwarded_and_restored(project, private_origin):
+    origin, (old_submodule, new_submodule) = private_origin("old-new")
     git(
         project.project,
         "-c",
@@ -29968,15 +30255,8 @@ def test_populated_submodule_checkout_is_captured_forwarded_and_restored(project
     assert "unit-merged" not in journal_kinds(engine)
 
 
-def _seed_populated_target_submodule(project, tmp_path):
-    origin = tmp_path / "sub-origin"
-    origin.mkdir()
-    git(origin, "init", "-q")
-    git(origin, "config", "user.email", "test@example.com")
-    git(origin, "config", "user.name", "Test")
-    (origin / "payload.txt").write_text("old\n")
-    git(origin, "add", "-A")
-    git(origin, "commit", "-q", "-m", "old submodule")
+def _seed_populated_target_submodule(project, private_origin):
+    origin, (old_submodule,) = private_origin("old")
     git(
         project.project,
         "-c",
@@ -29989,7 +30269,7 @@ def _seed_populated_target_submodule(project, tmp_path):
     )
     git(project.project, "add", "-A")
     git(project.project, "commit", "-q", "-m", "add populated submodule")
-    return verify.rev_parse_head(origin)
+    return old_submodule
 
 
 @pytest.mark.parametrize("strategy", ["merge", "squash", "ff"])
@@ -30033,7 +30313,7 @@ def test_bundle_renaming_a_tracked_file_integrates(project, strategy):
 
 
 @pytest.mark.parametrize("strategy", ["merge", "squash", "ff"])
-def test_bundle_deleting_a_populated_target_submodule_integrates(project, tmp_path, strategy):
+def test_bundle_deleting_a_populated_target_submodule_integrates(project, private_origin, strategy):
     """A bundle that deletes the target's populated submodule could never
     integrate: git merges the deletion and leaves the populated checkout on
     disk (`warning: unable to rmdir 'module'`, then `?? module/`), and the
@@ -30049,7 +30329,7 @@ def test_bundle_deleting_a_populated_target_submodule_integrates(project, tmp_pa
     `summary.paused`; keep it but drop `retained_checkouts` from the
     absent-path probe and every leg reds the same way, the leftover now
     reported as drift on `module`."""
-    old_submodule = _seed_populated_target_submodule(project, tmp_path)
+    old_submodule = _seed_populated_target_submodule(project, private_origin)
     effect, _destination, _accepted = _git_bound_publication_bundle(project, "tracked")
 
     def deleting_effect(spec):
@@ -30250,7 +30530,7 @@ def test_target_hook_overwriting_a_pre_marked_path_outside_the_incoming_set_is_r
 
 @pytest.mark.parametrize("strategy", ["merge", "squash", "ff"])
 def test_bundle_integrates_into_a_target_with_an_assume_unchanged_submodule(
-    project, tmp_path, strategy
+    project, private_origin, strategy
 ):
     """A target whose populated submodule an operator marked
     `update-index --assume-unchanged` (`flags: 8000`, released index
@@ -30264,7 +30544,7 @@ def test_bundle_integrates_into_a_target_with_an_assume_unchanged_submodule(
 
     Ablation: drop `8000` from the captured words and every leg reds on the
     capture, before the merge."""
-    old_submodule = _seed_populated_target_submodule(project, tmp_path)
+    old_submodule = _seed_populated_target_submodule(project, private_origin)
     git(project.project, "update-index", "--assume-unchanged", "--", "module")
     assert git(project.project, "ls-files", "-v", "--", "module") == "h module"
     effect, _destination, _accepted = _git_bound_publication_bundle(project, "tracked")
@@ -30292,12 +30572,12 @@ def test_bundle_integrates_into_a_target_with_an_assume_unchanged_submodule(
     [("merge", "pre-merge-commit"), ("squash", "pre-commit"), ("ff", "post-merge")],
 )
 def test_target_hook_writing_into_a_deleted_submodule_leftover_is_refused(
-    project, tmp_path, strategy, hook_name
+    project, private_origin, strategy, hook_name
 ):
     """The leftover is accepted only as the exact captured checkout: a target
     hook writing into it after the merge deleted its gitlink is drift on an
     incoming path, refused through the receipt route and restored."""
-    old_submodule = _seed_populated_target_submodule(project, tmp_path)
+    old_submodule = _seed_populated_target_submodule(project, private_origin)
     effect, _destination, _accepted = _git_bound_publication_bundle(project, "tracked")
     target_head = verify.rev_parse_head(project.repo_root)
 
@@ -30343,7 +30623,7 @@ def test_target_hook_writing_into_a_deleted_submodule_leftover_is_refused(
     [("merge", "pre-merge-commit"), ("squash", "pre-commit"), ("ff", "post-merge")],
 )
 def test_target_hook_populating_an_incoming_new_submodule_is_refused(
-    project, tmp_path, strategy, hook_name, ignored
+    project, private_origin, strategy, hook_name, ignored
 ):
     """The integrated-submodule reading iterated the receipt's captured
     submodules only, so a gitlink the bundle ADDS got no checkout validation
@@ -30364,15 +30644,7 @@ def test_target_hook_populating_an_incoming_new_submodule_is_refused(
     plain `status -uall` reading never lists (Codex, #796 review): drop
     `--ignored` from the introduced-checkout reading and those three red the
     same way."""
-    origin = tmp_path / "new-origin"
-    origin.mkdir()
-    git(origin, "init", "-q")
-    git(origin, "config", "user.email", "test@example.com")
-    git(origin, "config", "user.name", "Test")
-    (origin / "payload.txt").write_text("new submodule\n")
-    (origin / ".gitignore").write_text("*.log\n")
-    git(origin, "add", "-A")
-    git(origin, "commit", "-q", "-m", "new submodule")
+    origin, _commits = private_origin("new-submodule-ignoring-logs", "new-origin")
     hook_file = "hook.log" if ignored else "hook.txt"
     effect, _destination, _accepted = _git_bound_publication_bundle(project, "tracked")
     target_head = verify.rev_parse_head(project.repo_root)
@@ -30426,7 +30698,7 @@ def test_target_hook_populating_an_incoming_new_submodule_is_refused(
     [("merge", "pre-merge-commit"), ("squash", "pre-commit"), ("ff", "post-merge")],
 )
 def test_target_hook_cleanly_populating_an_incoming_new_submodule_integrates(
-    project, tmp_path, strategy, hook_name
+    project, private_origin, strategy, hook_name
 ):
     """A target hook's `submodule update --init` of a gitlink the bundle adds,
     and nothing more, is accepted: the checkout is owned, clean (ignored
@@ -30437,15 +30709,7 @@ def test_target_hook_cleanly_populating_an_incoming_new_submodule_integrates(
 
     Ablation: drop `introduced_checkouts` from the tolerated set and every
     leg reds on `summary.paused`, `newmod/.git` named."""
-    origin = tmp_path / "new-origin"
-    origin.mkdir()
-    git(origin, "init", "-q")
-    git(origin, "config", "user.email", "test@example.com")
-    git(origin, "config", "user.name", "Test")
-    (origin / "payload.txt").write_text("new submodule\n")
-    git(origin, "add", "-A")
-    git(origin, "commit", "-q", "-m", "new submodule")
-    new_submodule = verify.rev_parse_head(origin)
+    origin, (new_submodule,) = private_origin("new-submodule", "new-origin")
     effect, _destination, _accepted = _git_bound_publication_bundle(project, "tracked")
 
     def adding_effect(spec):
@@ -30497,7 +30761,7 @@ def test_target_hook_cleanly_populating_an_incoming_new_submodule_integrates(
     [("merge", "pre-merge-commit"), ("squash", "pre-commit"), ("ff", "post-merge")],
 )
 def test_target_hook_writing_an_ignored_file_into_a_captured_submodule_is_refused(
-    project, tmp_path, strategy, hook_name, incoming
+    project, private_origin, strategy, hook_name, incoming
 ):
     """A captured populated submodule's checkout is read with `status -uall`,
     which lists no ignored entry; the tree's whole-tree ignored listing never
@@ -30518,20 +30782,7 @@ def test_target_hook_writing_an_ignored_file_into_a_captured_submodule_is_refuse
     Ablation: return `()` from `integrated_submodule_ignored_additions` and
     every row reds on `summary.paused` — the run finished over the hook's
     file."""
-    origin = tmp_path / "sub-origin"
-    origin.mkdir()
-    git(origin, "init", "-q")
-    git(origin, "config", "user.email", "test@example.com")
-    git(origin, "config", "user.name", "Test")
-    (origin / ".gitignore").write_text("*.log\n")
-    (origin / "payload.txt").write_text("old\n")
-    git(origin, "add", "-A")
-    git(origin, "commit", "-q", "-m", "old submodule")
-    old_submodule = verify.rev_parse_head(origin)
-    (origin / "payload.txt").write_text("new\n")
-    git(origin, "add", "-A")
-    git(origin, "commit", "-q", "-m", "new submodule")
-    new_submodule = verify.rev_parse_head(origin)
+    origin, (old_submodule, new_submodule) = private_origin("old-new-ignoring-logs")
     git(
         project.project,
         "-c",
@@ -30607,7 +30858,7 @@ def test_target_hook_writing_an_ignored_file_into_a_captured_submodule_is_refuse
     [("merge", "pre-merge-commit"), ("squash", "pre-commit"), ("ff", "post-merge")],
 )
 def test_target_hook_writing_into_a_captured_submodule_the_superproject_ignores_is_refused(
-    project, tmp_path, strategy, hook_name, ignore
+    project, private_origin, strategy, hook_name, ignore
 ):
     """A captured populated submodule the bundle leaves alone was read after
     the hooks for ownership and HEAD, and its modified and untracked content
@@ -30625,15 +30876,7 @@ def test_target_hook_writing_into_a_captured_submodule_the_superproject_ignores_
     Ablation: drop the cleanliness reading from `_validated_submodule_checkout`
     and every row reds on `summary.paused` — the run finished over the hook's
     file."""
-    origin = tmp_path / "sub-origin"
-    origin.mkdir()
-    git(origin, "init", "-q")
-    git(origin, "config", "user.email", "test@example.com")
-    git(origin, "config", "user.name", "Test")
-    (origin / "payload.txt").write_text("old\n")
-    git(origin, "add", "-A")
-    git(origin, "commit", "-q", "-m", "old submodule")
-    old_submodule = verify.rev_parse_head(origin)
+    origin, (old_submodule,) = private_origin("old")
     git(
         project.project,
         "-c",
@@ -30685,7 +30928,7 @@ def test_target_hook_writing_into_a_captured_submodule_the_superproject_ignores_
 
 
 def test_target_hook_writing_into_a_captured_submodules_automator_directory_is_refused(
-    project, tmp_path
+    project, private_origin
 ):
     """The tree's ignored listing leaves the run's own records under the
     target's `.bmad-loop/` out — the receipt's sidecars stand there. Reused
@@ -30699,15 +30942,7 @@ def test_target_hook_writing_into_a_captured_submodules_automator_directory_is_r
 
     Ablation: drop `own_records=False` from the submodule reading and this
     reds on `summary.paused` — the run finished over the hook's file."""
-    origin = tmp_path / "sub-origin"
-    origin.mkdir()
-    git(origin, "init", "-q")
-    git(origin, "config", "user.email", "test@example.com")
-    git(origin, "config", "user.name", "Test")
-    (origin / ".gitignore").write_text(".bmad-loop/\n")
-    (origin / "payload.txt").write_text("submodule\n")
-    git(origin, "add", "-A")
-    git(origin, "commit", "-q", "-m", "submodule ignoring .bmad-loop/")
+    origin, _commits = private_origin("ignoring-automator-dir")
     git(
         project.project,
         "-c",
