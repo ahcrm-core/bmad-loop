@@ -1106,16 +1106,16 @@ def test_pending_decision_missing_fields():
 # ------------------------------------------------------------ sprint overview
 
 
-def test_project_paths_degrades_and_recovers_from_root_resolve_refusal(project, monkeypatch):
+def test_project_paths_degrades_and_recovers_from_root_resolve_refusal(project_tree, monkeypatch):
     """A dead provider yields unavailable readers without poisoning recovery.
 
     INVERSE ablation: restore bare ``project.resolve()`` in ``_project_paths``
     and this test raises the stubbed WinError 64 on its first observation rather
     than returning empty panes and recovering after the provider is healthy.
     """
-    install_bmad_config(project)
-    write_sprint(project, {"1-1-a": "ready-for-dev"})
-    root = project.project
+    install_bmad_config(project_tree)
+    write_sprint(project_tree, {"1-1-a": "ready-for-dev"})
+    root = project_tree.project
 
     with monkeypatch.context() as refusal:
         refuse_to_resolve(refusal, root)
@@ -1134,15 +1134,15 @@ def test_project_paths_degrades_and_recovers_from_root_resolve_refusal(project, 
     assert data.sprint_overview(root) is not None
 
 
-def test_project_paths_uses_one_canonical_cache_key(project):
+def test_project_paths_uses_one_canonical_cache_key(project_tree):
     """Healthy aliases share one ProjectPaths snapshot under the canonical root.
 
     INVERSE ablation: key ``_paths_cache`` with the pre-canonical spelling while
     loading from the stable root and this test finds the ``..`` spelling as a
     second cache key instead of reusing the canonical entry.
     """
-    install_bmad_config(project)
-    root = project.project.resolve()
+    install_bmad_config(project_tree)
+    root = project_tree.project.resolve()
     alternate_spelling = root / ".." / root.name
 
     paths = data._project_paths(alternate_spelling)
@@ -1161,32 +1161,32 @@ def _override_implementation_artifacts(project, rel: str) -> None:
     )
 
 
-def test_project_paths_sees_a_toml_layer_edit_in_a_mixed_install(project):
+def test_project_paths_sees_a_toml_layer_edit_in_a_mixed_install(project_tree):
     """#769: the TOML layers outrank the legacy YAML the v6.12 installer still writes
     beside them, so an override-layer edit must invalidate the cached snapshot.
 
     Ablation: stat-gate on config.yaml alone and the second call serves the stale
     artifact dir from cache.
     """
-    install_bmad_config(project)
-    install_bmad_central_config(project)
-    root = project.project.resolve()
+    install_bmad_config(project_tree)
+    install_bmad_central_config(project_tree)
+    root = project_tree.project.resolve()
     before = data._project_paths(root)
     assert before is not None
     assert data._project_paths(root) is before
 
-    _override_implementation_artifacts(project, "moved-impl")
+    _override_implementation_artifacts(project_tree, "moved-impl")
 
     after = data._project_paths(root)
     assert after is not None
     assert after.implementation_artifacts == root / "moved-impl"
 
 
-def test_project_paths_caches_and_invalidates_a_toml_only_install(project):
+def test_project_paths_caches_and_invalidates_a_toml_only_install(project_tree):
     """With no config.yaml there is still a source to stat-gate on: the snapshot is
     cached (it used to be reloaded on every call) and a layer edit invalidates it."""
-    install_bmad_central_config(project)
-    root = project.project.resolve()
+    install_bmad_central_config(project_tree)
+    root = project_tree.project.resolve()
     assert not (root / bmadconfig.LEGACY_CONFIG_REL).exists()
 
     first = data._project_paths(root)
@@ -1194,7 +1194,7 @@ def test_project_paths_caches_and_invalidates_a_toml_only_install(project):
     assert data._paths_cache[root][1] is first
     assert data._project_paths(root) is first
 
-    _override_implementation_artifacts(project, "moved-impl")
+    _override_implementation_artifacts(project_tree, "moved-impl")
 
     second = data._project_paths(root)
     assert second is not None
@@ -1203,10 +1203,10 @@ def test_project_paths_caches_and_invalidates_a_toml_only_install(project):
     assert data._paths_cache[root][1] is second
 
 
-def test_sprint_overview(project):
-    install_bmad_config(project)
+def test_sprint_overview(project_tree):
+    install_bmad_config(project_tree)
     write_sprint(
-        project,
+        project_tree,
         {
             "epic-1": "in-progress",
             "1-1-a": "ready-for-dev",
@@ -1216,7 +1216,7 @@ def test_sprint_overview(project):
             "2-1-c": "backlog",
         },
     )
-    ss = data.sprint_overview(project.project)
+    ss = data.sprint_overview(project_tree.project)
     assert ss.epics == {1: "in-progress", 2: "backlog"}
     assert [(s.key, s.status) for s in ss.stories] == [
         ("1-1-a", "ready-for-dev"),
@@ -1226,21 +1226,21 @@ def test_sprint_overview(project):
     assert ss.retros == {1: "optional"}
 
     # cached result (same object) until the file changes, then re-parsed
-    assert data.sprint_overview(project.project) is ss
-    write_sprint(project, {"1-1-a": "done"})
-    assert [s.status for s in data.sprint_overview(project.project).stories] == ["done"]
+    assert data.sprint_overview(project_tree.project) is ss
+    write_sprint(project_tree, {"1-1-a": "done"})
+    assert [s.status for s in data.sprint_overview(project_tree.project).stories] == ["done"]
 
 
-def test_sprint_overview_unavailable(tmp_path, project):
+def test_sprint_overview_unavailable(tmp_path, project_tree):
     assert data.sprint_overview(tmp_path) is None  # no _bmad config at all
-    install_bmad_config(project)  # config but no sprint file
-    assert data.sprint_overview(project.project) is None
+    install_bmad_config(project_tree)  # config but no sprint file
+    assert data.sprint_overview(project_tree.project) is None
 
     # LLM-maintained file: malformed content must come back None, not raise
-    project.sprint_status.write_text("{ not: valid: yaml: [")
-    assert data.sprint_overview(project.project) is None
-    project.sprint_status.write_text("- just\n- a\n- list\n")
-    assert data.sprint_overview(project.project) is None
+    project_tree.sprint_status.write_text("{ not: valid: yaml: [")
+    assert data.sprint_overview(project_tree.project) is None
+    project_tree.sprint_status.write_text("- just\n- a\n- list\n")
+    assert data.sprint_overview(project_tree.project) is None
 
 
 # ------------------------------------------------- stories mode: pause + board
@@ -1281,9 +1281,9 @@ def test_stories_overview_none_when_unavailable(tmp_path):
 # ------------------------------------------------------------- deferred work
 
 
-def test_deferred_entries(project):
-    install_bmad_config(project)
-    project.deferred_work.write_text(
+def test_deferred_entries(project_tree):
+    install_bmad_config(project_tree)
+    project_tree.deferred_work.write_text(
         "# Deferred Work\n\n"
         "### DW-1: High severity item\n\n"
         "origin: test, 2026-06-01\nlocation: src.txt:1\n"
@@ -1301,7 +1301,7 @@ def test_deferred_entries(project):
         "origin: test, 2026-06-01\nlocation: src.txt:5\nreason: test.\n",
         encoding="utf-8",
     )
-    items = data.deferred_entries(project.project)
+    items = data.deferred_entries(project_tree.project)
     assert [(i.id, i.severity, i.done) for i in items] == [
         ("DW-1", "high", False),
         ("DW-2", "critical", False),
@@ -1313,18 +1313,18 @@ def test_deferred_entries(project):
     assert "origin: test" in items[0].body
 
     # cached result (same object) until the file changes, then re-parsed
-    assert data.deferred_entries(project.project) is items
-    project.deferred_work.write_text("# Deferred Work\n\nfreeform, no entries\n")
-    assert data.deferred_entries(project.project) == []
+    assert data.deferred_entries(project_tree.project) is items
+    project_tree.deferred_work.write_text("# Deferred Work\n\nfreeform, no entries\n")
+    assert data.deferred_entries(project_tree.project) == []
 
 
-def test_deferred_entries_unavailable(tmp_path, project):
+def test_deferred_entries_unavailable(tmp_path, project_tree):
     assert data.deferred_entries(tmp_path) is None  # no _bmad config at all
-    install_bmad_config(project)  # config but no ledger file
-    assert data.deferred_entries(project.project) is None
+    install_bmad_config(project_tree)  # config but no ledger file
+    assert data.deferred_entries(project_tree.project) is None
 
 
-def test_deferred_entries_undecodable_ledger_is_unavailable(project):
+def test_deferred_entries_undecodable_ledger_is_unavailable(project_tree):
     """The pane already had an "unavailable" degrade (`items = None`), but reached it
     only for `OSError` — and `UnicodeDecodeError` is a `ValueError` (DW-146), so
     undecodable bytes escaped the whole refresh instead of rendering the pane
@@ -1332,10 +1332,10 @@ def test_deferred_entries_undecodable_ledger_is_unavailable(project):
     it could not read.
     Ablation: revert the except tuple to `OSError` alone and this reddens with
     `UnicodeDecodeError` escaping rather than `None`."""
-    install_bmad_config(project)
-    project.deferred_work.write_bytes(b"# Deferred Work\n\n### DW-1: bad \xff byte\n")
+    install_bmad_config(project_tree)
+    project_tree.deferred_work.write_bytes(b"# Deferred Work\n\n### DW-1: bad \xff byte\n")
 
-    assert data.deferred_entries(project.project) is None
+    assert data.deferred_entries(project_tree.project) is None
 
 
 def test_severity_extraction():
@@ -1353,24 +1353,24 @@ def test_severity_extraction():
         assert deferredwork.field_severity(f"### DW-9: t\n\n{body}status: open\n") == expected, body
 
 
-def test_deferred_entries_does_not_read_severity_from_a_fenced_example(project):
-    install_bmad_config(project)
-    project.deferred_work.write_text(
+def test_deferred_entries_does_not_read_severity_from_a_fenced_example(project_tree):
+    install_bmad_config(project_tree)
+    project_tree.deferred_work.write_text(
         "# Deferred Work\n\n"
         "### DW-1: quoted severity\n\n"
         "```markdown\nseverity: critical\n```\nstatus: open\n",
         encoding="utf-8",
     )
 
-    items = data.deferred_entries(project.project)
+    items = data.deferred_entries(project_tree.project)
 
     assert items is not None
     assert items[0].severity is None
 
 
-def test_deferred_entries_legacy_ledger(project):
-    install_bmad_config(project)
-    project.deferred_work.write_text(
+def test_deferred_entries_legacy_ledger(project_tree):
+    install_bmad_config(project_tree)
+    project_tree.deferred_work.write_text(
         "# Deferred Work\n\n"
         "## Deferred from: code review of story 1.2 (2026-04-06)\n\n"
         "- ~~**Old fixed thing** — was broken, then repaired~~ → fixed in 1.3\n"
@@ -1378,7 +1378,7 @@ def test_deferred_entries_legacy_ledger(project):
         "- **Open bold-titled thing here** — details that run on and on\n",
         encoding="utf-8",
     )
-    items = data.deferred_entries(project.project)
+    items = data.deferred_entries(project_tree.project)
     assert [(i.id, i.done, i.severity, i.legacy) for i in items] == [
         ("L1", True, None, True),
         ("W9", False, "high", True),
@@ -1389,12 +1389,12 @@ def test_deferred_entries_legacy_ledger(project):
     assert items[2].title == "Open bold-titled thing here"
     assert all(i.option_key and i.option_key.startswith("legacy:") for i in items)
     # option keys never collide with DW ids and stay stable across refreshes
-    assert data.deferred_entries(project.project) is items
+    assert data.deferred_entries(project_tree.project) is items
 
 
-def test_deferred_entries_mixed_ledger_in_file_order(project):
-    install_bmad_config(project)
-    project.deferred_work.write_text(
+def test_deferred_entries_mixed_ledger_in_file_order(project_tree):
+    install_bmad_config(project_tree)
+    project_tree.deferred_work.write_text(
         "# Deferred Work\n\n"
         "## Deferred from: epic 1 review (2026-04-06)\n\n"
         "- legacy item first in the file\n\n"
@@ -1402,7 +1402,7 @@ def test_deferred_entries_mixed_ledger_in_file_order(project):
         "origin: test, 2026-06-01\nseverity: high\nreason: t.\nstatus: open\n",
         encoding="utf-8",
     )
-    items = data.deferred_entries(project.project)
+    items = data.deferred_entries(project_tree.project)
     assert [(i.id, i.legacy) for i in items] == [("L1", True), ("DW-1", False)]
     assert items[1].option_key is None  # canonical rows key on the DW id
     assert items[1].severity == "high"
@@ -1511,15 +1511,15 @@ def test_story_key_from_task_id_grammar_including_the_generation_suffix():
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX symlinks")
-def test_project_paths_invalidates_when_a_dangling_link_appears_at_an_absent_layer(project):
+def test_project_paths_invalidates_when_a_dangling_link_appears_at_an_absent_layer(project_tree):
     """`_stat_sig` follows links and folds every OSError into None, so a dangling
     link created at a layer path that was absent signs exactly like the absence and
     the cache served stale paths. `load_paths` refuses that link, so must the TUI.
 
     Ablation: sign config sources with `_stat_sig` and the stale paths come back."""
-    install_bmad_config(project)
-    install_bmad_central_config(project)
-    root = project.project.resolve()
+    install_bmad_config(project_tree)
+    install_bmad_central_config(project_tree)
+    root = project_tree.project.resolve()
     layer = root / bmadconfig.CENTRAL_LAYERS_REL[3]
     layer.unlink()  # an optional layer the operator never wrote
     assert data._project_paths(root) is not None
@@ -1835,7 +1835,7 @@ def test_pending_missed_decisions_read_fault_is_named_and_not_cached(project, mo
     assert [d.id for d in missed.items] == ["DW-1"]
 
 
-def test_pending_missed_decisions_unreadable_ledger_is_a_fault(project):
+def test_pending_missed_decisions_unreadable_ledger_is_a_fault(project_tree):
     """DW-473: `decisions.pending_missed_decisions` reads an undecodable ledger as
     "no open ids" and answers []; the TUI reader probes the ledger the way
     `cmd_decisions` does and names the fault instead.
@@ -1843,10 +1843,10 @@ def test_pending_missed_decisions_unreadable_ledger_is_a_fault(project):
     Ablation: drop the `read_for_observation` probe and `fault` is None."""
     from conftest import UNDECODABLE_LEDGER
 
-    install_bmad_config(project)
-    project.deferred_work.write_bytes(UNDECODABLE_LEDGER)
-    _write_triage_decision(make_run(project.project, "20260101-000000-aaaa"))
-    missed = data.pending_missed_decisions(project.project)
+    install_bmad_config(project_tree)
+    project_tree.deferred_work.write_bytes(UNDECODABLE_LEDGER)
+    _write_triage_decision(make_run(project_tree.project, "20260101-000000-aaaa"))
+    missed = data.pending_missed_decisions(project_tree.project)
     assert missed.items == []
     assert missed.fault is not None and "deferred-work ledger unreadable" in missed.fault
     assert "UnicodeDecodeError" in missed.fault

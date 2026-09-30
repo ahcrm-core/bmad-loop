@@ -14,6 +14,19 @@ from bmad_loop.journal import STATE_FILE, VERIFY_DIR, save_state
 from bmad_loop.model import RunState
 
 
+@pytest.fixture(autouse=True)
+def _no_ambient_sessions(monkeypatch):
+    """`clean` reads the live-session listing, and the real one answers from
+    whatever server holds the default socket — here, another xdist worker's. With
+    none running, tmux reports the socket file absent, which the backend warns
+    about by design (DW-458), and every `--json` test's empty-stderr assertion
+    fails on scheduling alone. Pin an empty, fault-free listing; tests about a
+    live session install their own."""
+    from test_runs import _LivenessMux
+
+    monkeypatch.setattr(runs, "get_multiplexer", lambda: _LivenessMux([]))
+
+
 def _state_run(project, run_id, **kw):
     run_dir = project / ".bmad-loop" / "runs" / run_id
     save_state(

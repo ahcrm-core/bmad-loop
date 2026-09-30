@@ -17,6 +17,12 @@ while the child runs and kills the whole process tree on a hard stop, on
 timeout, or on any exception unwinding through it, reporting the first as
 ``interrupted`` — a fact about the run, never a verdict about the command.
 
+:func:`run_argv` is the same supervision for an executable argv with no shell
+(``shell=False``, stdin ``DEVNULL``): the bounded ``--version`` liveness probe
+(``probe.binary_runs``) runs through it, because ``subprocess.run``'s timeout
+kills only the root and then waits unboundedly on pipes a surviving descendant
+still holds — the Windows ``.cmd`` launcher case.
+
 The probe is ambient (a ContextVar installed by the outermost ``Engine.run()``,
 beside ``runs.set_owner_run_dir``) rather than a parameter, because ``runs``
 imports ``verify`` — so neither ``verify`` nor this module can import ``runs`` —
@@ -36,6 +42,7 @@ import locale
 import subprocess
 import sys
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -190,21 +197,82 @@ def run_child(
     an entry a fresh harvest no longer lists is pruned once it is gone or reused
     (or was never stamped). A host that cannot be resolved skips harvesting —
     the kill then raises that fault loudly, as it always has."""
+    # Operator-authored shell strings (verify commands, declarative plugin hooks);
+    # the shell is the contract, so shell=True is intentional here.
+    return _supervise(
+        lambda: subprocess.Popen(  # nosec B602
+            command,
+            shell=True,  # portability: operator-authored verify/hook command — sanctioned shell-out (see plan out-of-scope)
+            cwd=cwd,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            errors="replace",
+        ),
+        timeout,
+    )
+
+
+def run_argv(
+    argv: Sequence[str],
+    *,
+    cwd: str | Path | None,
+    timeout: float | None,
+    env: dict[str, str] | None = None,
+) -> ChildRun:
+    """Run ``argv`` with no shell, under exactly :func:`run_child`'s supervision.
+
+    The executable-argv sibling of :func:`run_child`: the same pre-spawn and
+    per-poll hard-stop reads, the same timeout, tree kill (known-tree harvest,
+    win32 root ``force_kill`` first), bounded drain and ``finally`` kill on an
+    unwinding exception, and the same :class:`ChildRun`. What differs is only the
+    spawn: ``argv`` goes to ``Popen`` as a list with ``shell=False``, so its
+    element boundaries are kept exactly as given — it is never joined into a
+    shell string — and stdin is ``DEVNULL``, so a child that prompts reads EOF
+    instead of blocking on the caller's tty until the timeout.
+
+    Why a probe needs this rather than ``subprocess.run(argv, timeout=...)``: on
+    timeout ``run`` kills the ROOT and then waits for the pipes with no bound. A
+    Windows ``.cmd`` launcher is rooted at ``cmd.exe`` (CreateProcess runs batch
+    files through it even without ``shell=True``), so killing the root leaves the
+    real program alive holding the pipes, and ``run`` returned only when that
+    program exited on its own — a 0.5 s timeout observed at 120 s. Here the whole
+    tree is killed and the drain gives up after :data:`DRAIN_S`.
+
+    Batch files: the host OS may parse a ``.cmd``/``.bat`` command line by
+    ``cmd.exe`` rules with no escaping from Python (the ``subprocess`` docs'
+    warning). ``argv`` must therefore not carry untrusted text for such a target;
+    the probe callers pass a resolved binary path and a fixed flag.
+
+    Spawn faults (``OSError``, ``ValueError`` from ``Popen``) propagate untouched,
+    as in :func:`run_child`; each caller owns its translation."""
+    args = list(argv)
+    return _supervise(
+        lambda: subprocess.Popen(
+            args,
+            shell=False,
+            cwd=cwd,
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            errors="replace",
+        ),
+        timeout,
+    )
+
+
+def _supervise(spawn: Callable[[], subprocess.Popen[str]], timeout: float | None) -> ChildRun:
+    """The shared body of :func:`run_child` and :func:`run_argv`: the pre-spawn
+    probe read, the poll loop, the timeout/interrupt tree kill, the bounded drain,
+    and the unwinding ``finally`` kill — everything documented on
+    :func:`run_child` except the spawn itself, which ``spawn`` performs."""
     if hard_stop_pending():
         return ChildRun(None, "", "", interrupted=True)
     settled = False
-    # Operator-authored shell strings (verify commands, declarative plugin hooks);
-    # the shell is the contract, so shell=True is intentional here.
-    proc = subprocess.Popen(  # nosec B602
-        command,
-        shell=True,  # portability: operator-authored verify/hook command — sanctioned shell-out (see plan out-of-scope)
-        cwd=cwd,
-        env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        errors="replace",
-    )
+    proc = spawn()
     known: KnownTree = {}
     harvester: ProcessHost | None = None
     try:

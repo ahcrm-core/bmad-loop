@@ -15,12 +15,26 @@ breaking changes may land in a minor release.
 - Write one `pinned-session-id-mismatch` crumb when a pinned session's first non-rebind
   `SessionStart` reports an id other than the pin, so the drop of its own events as
   foreign is no longer silent; a nested CLI's `mismatch`-tagged start is skipped (DW-509).
+- Record opt-in per-worker test metrics with `pytest --test-metrics-dir=PATH`, keeping
+  wall-clock apart from summed worker-seconds; bound a run with a tree-stopping deadline via
+  `scripts/run_test_benchmark.py`. Upload metrics and JUnit from every CI test job, failed or
+  timed out included.
+- Shard tests by digest with `pytest --ci-shard=I/N` (whole functions and xdist groups, no
+  hand-kept list); prove a sharded run complete and disjoint with
+  `tests/perf_report.py verify-shards`.
 
 ### Changed
 
 - A tmux coding-CLI pane's start command now shows the `/bin/sh -c
 'BMAD_LOOP_LAUNCH_PID=$$; …'` prelude; the command itself runs under `default-shell`
   exactly as before (DW-507).
+- Run each Windows CI leg as two shards plus a serial psmux-gate job; fail the
+  `test (windows, py3.x)` aggregator on a missing or red shard or gate, a test run in no
+  shard or two, a skipped live-gate test, or a shard or gate job whose latest attempt
+  failed (so a re-run cannot pass on an earlier attempt's records).
+- Cut test-suite runtime without dropping assertions: allocate state roots in constant time,
+  give render-only tests a Git-free `project_tree`, observe TUI lifecycle events instead of
+  polling, and copy submodule origins from per-worker templates.
 
 ### Fixed
 
@@ -41,6 +55,9 @@ breaking changes may land in a minor release.
   stays unpinned until it adds `session_id_flag = "--session-id"`. A claude run paused
   before upgrading reports the host-exec config changed on resume: its launched argv
   gained `--session-id`. Dry-run previews show the flag as `--session-id <auto>`.
+- Return `bmad-loop validate`'s coding-CLI probe at its timeout on a Windows `.cmd` launcher
+  and kill the launcher's descendants, instead of waiting for the launched program to exit
+  (120 s observed in CI).
 - Advance a sprint-status row whose value is folded onto a continuation line (`key: ` then
   the status indented deeper), the shape a width-80 YAML dump emits for a long story key.
   The writer used to skip it and echo the old status, so verification read a finished
