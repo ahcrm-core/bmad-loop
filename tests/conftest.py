@@ -17,6 +17,7 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
+import perf_report
 import pytest
 import yaml
 
@@ -40,6 +41,17 @@ if sys.platform == "win32" and not sys.flags.utf8_mode:
         "(e.g. `set PYTHONUTF8=1 && uv run pytest`). The suite assumes UTF-8 to "
         "match the files under test; CI's windows job sets this automatically."
     )
+
+
+# Opt-in runtime metrics (`--test-metrics-dir=PATH`, tests/perf_report.py). Both
+# hooks only register the options and, when the directory option is given, the
+# recorder; without it nothing else of that module runs.
+def pytest_addoption(parser: pytest.Parser) -> None:
+    perf_report.add_options(parser)
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    perf_report.configure(config)
 
 
 def _codec_rejects_bad_byte() -> bool:

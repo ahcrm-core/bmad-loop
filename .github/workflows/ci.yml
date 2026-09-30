@@ -23,6 +23,14 @@ jobs:
       matrix:
         python-version: ['3.11', '3.12', '3.13', '3.14']
     steps:
+      - name: Set the test deadline
+        # First, so the clock starts as close to the job's own as a step can. The
+        # test run is stopped (by scripts/run_test_benchmark.py) two minutes short
+        # of the job's `timeout-minutes: 15` above — change the two together — so
+        # a wedged run still ends as a red step with its metrics uploaded rather
+        # than as a cancelled job with nothing to read.
+        run: echo "TEST_DEADLINE_EPOCH=$(( $(date +%s) + 15 * 60 - 120 ))" >> "$GITHUB_ENV"
+
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
@@ -85,7 +93,27 @@ jobs:
         run: uv sync --locked --all-extras
 
       - name: Run tests
-        run: uv run pytest -q -n logical --durations=15
+        # The wrapper runs pytest with `--test-metrics-dir` (tests/perf_report.py),
+        # records the process lifetime, preserves pytest's exit status, and stops
+        # the tree at the deadline set above (exit 124). No retries.
+        run: >-
+          uv run python scripts/run_test_benchmark.py
+          --metrics-dir "$RUNNER_TEMP/test-metrics/suite"
+          --deadline-epoch "$TEST_DEADLINE_EPOCH"
+          -- -q -n logical --durations=15
+          "--junitxml=$RUNNER_TEMP/test-metrics/suite/junit.xml"
+
+      - name: Upload test metrics
+        # `always()`: a failed or deadline-stopped run is the one whose records
+        # matter most. A job cancelled outright may still lose this upload.
+        if: always()
+        timeout-minutes: 3
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-metrics-linux-py${{ matrix.python-version }}
+          path: ${{ runner.temp }}/test-metrics/
+          if-no-files-found: warn
+          retention-days: 14
 
   test-windows:
     # Real-Windows runner for the deterministic suite plus the live psmux gate,
@@ -112,6 +140,19 @@ jobs:
         # platform-shaped, not version-shaped); push-to-main runs the full spread.
         python-version: ${{ github.event_name == 'pull_request' && fromJSON('["3.11", "3.14"]') || fromJSON('["3.11", "3.12", "3.13", "3.14"]') }}
     steps:
+      - name: Set the test deadlines
+        # First, so the clock starts as close to the job's own as a step can. Both
+        # test steps are stopped (by scripts/run_test_benchmark.py) short of the
+        # job's `timeout-minutes: 30` above — change them together — so a wedged
+        # run ends as a red step whose metrics still upload, not as a cancelled
+        # job with nothing to read. The suite's reserve covers the stop grace,
+        # the summary and its upload; the gate runs last and needs only its own.
+        shell: pwsh
+        run: |
+          $start = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+          Add-Content -Path $env:GITHUB_ENV -Value "TEST_DEADLINE_EPOCH=$($start + 30 * 60 - 180)"
+          Add-Content -Path $env:GITHUB_ENV -Value "LIVE_GATE_DEADLINE_EPOCH=$($start + 30 * 60 - 75)"
+
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
@@ -186,9 +227,31 @@ jobs:
         env:
           TMP: ${{ runner.temp }}
           TEMP: ${{ runner.temp }}
-        run: uv run pytest -q -n logical --durations=15 --ignore=tests/test_psmux_live.py
+        # Through the metrics wrapper, as in the Linux job: pytest's exit status is
+        # preserved; the deadline set above stops the tree with exit 124.
+        run: >-
+          uv run python scripts/run_test_benchmark.py
+          --metrics-dir "$env:RUNNER_TEMP/test-metrics/suite"
+          --deadline-epoch $env:TEST_DEADLINE_EPOCH
+          -- -q -n logical --durations=15 --ignore=tests/test_psmux_live.py
+          "--junitxml=$env:RUNNER_TEMP/test-metrics/suite/junit.xml"
+
+      - name: Upload suite metrics
+        # Before the live gate, so a gate that runs into the job cap cannot take
+        # the suite's records with it. `always()`: a failed or deadline-stopped
+        # run is the one whose records matter most; a job cancelled outright may
+        # still lose the upload.
+        if: always()
+        timeout-minutes: 3
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-metrics-windows-py${{ matrix.python-version }}-suite
+          path: ${{ runner.temp }}/test-metrics/suite/
+          if-no-files-found: warn
+          retention-days: 14
 
       - name: Run the live psmux gate
+        id: live-gate
         # Serial, and deliberately out of the parallel run above: these nine
         # tests drive real psmux servers, which are a single-machine resource
         # rather than per-worker state. Interleaved with the other ~2800 tests
@@ -202,7 +265,24 @@ jobs:
         env:
           TMP: ${{ runner.temp }}
           TEMP: ${{ runner.temp }}
-        run: uv run pytest -q tests/test_psmux_live.py --durations=15
+        run: >-
+          uv run python scripts/run_test_benchmark.py
+          --metrics-dir "$env:RUNNER_TEMP/test-metrics/live"
+          --deadline-epoch $env:LIVE_GATE_DEADLINE_EPOCH
+          -- -q tests/test_psmux_live.py --durations=15
+          "--junitxml=$env:RUNNER_TEMP/test-metrics/live/junit.xml"
+
+      - name: Upload live-gate metrics
+        # Skipped along with the gate when the suite failed; the suite's own
+        # upload above already ran.
+        if: always() && steps.live-gate.outcome != 'skipped'
+        timeout-minutes: 2
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-metrics-windows-py${{ matrix.python-version }}-live
+          path: ${{ runner.temp }}/test-metrics/live/
+          if-no-files-found: warn
+          retention-days: 14
 
   version-sync:
     name: version-sync
