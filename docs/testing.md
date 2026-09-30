@@ -335,11 +335,10 @@ Eight jobs (`.github/workflows/ci.yml`): **test** (ubuntu, Python 3.11–3.14, t
 L4 and `stories_e2e` run), three Windows jobs (`PYTHONUTF8=1`; PRs run the 3.11/3.14 boundary
 only — Windows failures here have been platform-shaped, not version-shaped — pushes to `main`
 and `release/*` run the full spread), **version-sync**, **lint** (trunk, including actionlint
-
-- zizmor over the workflows themselves), **typecheck** (the same pinned pyright a contributor
-  runs), and **build** (packaging smoke: sdist + wheel, the console script executed from the
-  installed wheel, and a wheel data-file inventory against `git ls-files` — every other job runs
-  from the source tree, so packaging breaks were invisible until this job existed).
+and zizmor over the workflows themselves), **typecheck** (the same pinned pyright a contributor
+runs), and **build** (packaging smoke: sdist and wheel, the console script executed from the
+installed wheel, and a wheel data-file inventory against `git ls-files` — every other job runs
+from the source tree, so packaging breaks were invisible until this job existed).
 
 The Windows jobs split one leg across machines without dropping a test:
 

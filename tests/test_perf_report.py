@@ -14,6 +14,7 @@ import contextlib
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -633,6 +634,41 @@ def test_wrapper_reports_a_spawn_failure(tmp_path, monkeypatch):
         None,
     )
     assert _json(tmp_path / "m" / perf_report.SUMMARY_JSON)["status"] == "spawn_failed"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX signal-to-self and killpg path")
+def test_wrapper_finishes_cleanup_through_a_second_cancel_signal(tmp_path, monkeypatch):
+    """A CI cancel is SIGINT then SIGTERM, the second landing inside the grace
+    wait. It must not abort the tree kill: the group still gets its SIGKILL and
+    the record still closes as interrupted."""
+
+    class CancelledPytest:
+        pid = 424242
+        returncode = None
+
+        def __init__(self):
+            self.waits = 0
+
+        def wait(self, timeout=None):
+            self.waits += 1
+            if self.waits == 1:  # the run itself: the cancel's SIGINT
+                os.kill(os.getpid(), signal.SIGINT)
+            elif self.waits == 2:  # the grace wait: the cancel's SIGTERM
+                os.kill(os.getpid(), signal.SIGTERM)
+                raise subprocess.TimeoutExpired("pytest", timeout)
+            else:
+                self.returncode = -9
+            return self.returncode
+
+    killed = []
+    monkeypatch.setattr(run_test_benchmark.subprocess, "Popen", lambda *a, **k: CancelledPytest())
+    monkeypatch.setattr(run_test_benchmark.os, "killpg", lambda pgid, sig: killed.append(sig))
+    rc = run_test_benchmark.main(["--metrics-dir", str(tmp_path / "m"), "--grace", "5", "--", "-q"])
+
+    assert rc == run_test_benchmark.EXIT_INTERRUPTED
+    assert killed == [signal.SIGINT, signal.SIGKILL]
+    runner = _json(tmp_path / "m" / perf_report.RUNNER)
+    assert (runner["state"], runner["child_reaped"]) == ("interrupted", True)
 
 
 def test_wrapper_refuses_a_used_directory_and_a_passed_deadline(tmp_path, monkeypatch):

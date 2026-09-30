@@ -149,6 +149,16 @@ def _raise_interrupted(signum: int, frame: object) -> None:
     raise _Interrupted(signum)
 
 
+def _hold_signals_for_cleanup() -> None:
+    """Stop a further SIGINT/SIGTERM from aborting the tree kill. A CI cancel
+    sends SIGINT and then SIGTERM a few seconds later — inside the grace wait —
+    and a second raise there would skip the group SIGKILL and leave the run
+    record at ``running``. Cleanup is bounded, so nothing is lost by deferring:
+    ``main``'s ``finally`` restores the caller's handlers."""
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(sig, signal.SIG_IGN)
+
+
 def _summarize(root: Path) -> None:
     sys.path.insert(0, str(TESTS_DIR))
     try:
@@ -241,6 +251,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         try:
             returncode = proc.wait(timeout=budget)
         except subprocess.TimeoutExpired:
+            _hold_signals_for_cleanup()
             sys.stderr.write(
                 f"run_test_benchmark: deadline reached after {budget:.0f}s; stopping pytest\n"
             )
@@ -249,12 +260,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             _summarize(root)
             return EXIT_TIMED_OUT
         except _Interrupted:
+            _hold_signals_for_cleanup()
             if sys.platform == "win32":
                 # A console Ctrl+C already reached pytest too (same console
                 # group): give it the grace to finish before the tree kill.
                 try:
                     proc.wait(timeout=args.grace)
-                except (subprocess.TimeoutExpired, _Interrupted):
+                except subprocess.TimeoutExpired:
                     pass
             _kill_tree(proc, args.grace)
             finish("interrupted", proc.returncode, child_reaped=proc.returncode is not None)
