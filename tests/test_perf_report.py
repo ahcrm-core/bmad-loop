@@ -962,6 +962,21 @@ def test_verify_shards_fails_a_failed_or_cancelled_shard(tmp_path, shard_runs):
     problems = perf_report.verify_shards([cut], 2)
     assert any("killed_externally" in p for p in problems), problems
 
+    # A green session_finish is not a green process: the wrapper's record of what
+    # happened after it (killed from outside; a failed or killed cleanup) wins.
+    for label, state, exit_code, expected in (
+        ("late-kill", "running", None, "killed_externally"),
+        ("late-crash", "exited", 1, "exit_mismatch"),
+        ("late-signal", "exited", -9, "exit_mismatch"),
+    ):
+        late = tmp_path / label
+        shutil.copytree(one, late)
+        runner = _json(late / perf_report.RUNNER)
+        runner.update(state=state, exit_code=exit_code)
+        (late / perf_report.RUNNER).write_text(json.dumps(runner), encoding="utf-8")
+        problems = perf_report.verify_shards([late], 2)
+        assert any(expected in p for p in problems), (label, problems)
+
 
 def test_verify_shards_fails_overlap_duplicates_and_foreign_runs(shard_runs, tmp_path):
     one, two = shard_runs

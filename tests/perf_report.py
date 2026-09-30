@@ -917,6 +917,19 @@ def _status(main: _Process | None, runner: dict[str, Any] | None) -> tuple[str, 
             "finishing; records end at the last flushed line"
         )
     exitstatus = finish.get("exitstatus")
+    # session_finish is not the end of the process: unconfigure, atexit and temp
+    # cleanup still follow it, so a wrapper record that disagrees overrules it.
+    if state == "running":
+        return "killed_externally", (
+            f"pytest finished its session (exit status {exitstatus}) but neither it nor "
+            "the wrapper exited: both were killed from outside during post-session cleanup"
+        )
+    code = (runner or {}).get("exit_code")
+    if state == "exited" and code != exitstatus:
+        return "exit_mismatch", (
+            f"pytest finished its session with exit status {exitstatus} but the process "
+            f"exited {code}: it failed or was killed during post-session cleanup"
+        )
     name = (
         EXIT_STATUS_NAMES.get(exitstatus, f"exit_{exitstatus}")
         if isinstance(exitstatus, int)
