@@ -279,14 +279,18 @@ def _kill_unregistered_servers(session: str) -> list[str]:
         _powershell(
             "; ".join(
                 f"Stop-Process -Id {pid} -Force -ErrorAction SilentlyContinue" for pid in doomed
-            )
+            ),
+            check=False,
         )
     return doomed
 
 
-def _powershell(script: str) -> str:
-    """Run one PowerShell command, returning stdout (empty on any failure — the
-    caller's own report still stands without this witness)."""
+def _powershell(script: str, *, check: bool = True) -> str:
+    """Run one PowerShell command and return its stdout; raise if it could not
+    run, or (``check``) exited nonzero. An empty listing is the teardown's proof
+    that no invisible server is left, so a failed probe must never read as one.
+    The kill passes ``check=False``: `-Command` exits 1 when a pid is already
+    gone, and the teardown re-confirms after every kill anyway."""
     try:
         proc = subprocess.run(
             ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
@@ -296,8 +300,15 @@ def _powershell(script: str) -> str:
             errors="backslashreplace",
             timeout=tmux_base.TMUX_TIMEOUT_S,
         )
-    except (OSError, subprocess.TimeoutExpired):
-        return ""
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise AssertionError(
+            f"probe setup: process-table witness failed ({type(exc).__name__}: {exc})"
+        ) from exc
+    if check and proc.returncode != 0:
+        raise AssertionError(
+            f"probe setup: process-table witness exited {proc.returncode}: "
+            f"{proc.stderr.strip()[:500]}"
+        )
     return proc.stdout
 
 
