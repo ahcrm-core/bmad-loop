@@ -358,7 +358,8 @@ The Windows jobs split one leg across machines without dropping a test:
   disjoint, their union equal to the collected set each shard recorded before deselecting
   (platform skips included), no function family straddling shards. Then `verify-executed`
   requires every live-gate test to have passed; a skip there means the gate did not run. A
-  failed, cancelled, deadline-stopped or never-uploaded shard or gate fails the leg. It judges
+  failed, cancelled, deadline-stopped or never-uploaded shard or gate fails the leg, and so
+  does one whose wrapper `runner.json` is missing or never reached `exited`. It judges
   from records rather than `needs.*.result`, which aggregates the whole matrix.
 
 Sharding buys latency, not work: every shard pays its own runner setup and a full collection.

@@ -1048,6 +1048,24 @@ def test_verify_shards_fails_a_failed_or_cancelled_shard(tmp_path, shard_runs):
         problems = perf_report.verify_shards([late], 2)
         assert any(expected in p for p in problems), (label, problems)
 
+    # No settled wrapper record: a green session_finish alone proves nothing.
+    # Ablation: drop the runner check in _run_problems and these rows pass green.
+    for label, content, expected in (
+        ("no-runner", None, "no readable runner.json"),
+        ("torn-runner", '{"state": "exi', "no readable runner.json"),
+        ("odd-runner", {"state": "exiting", "exit_code": 0}, "state 'exiting', not 'exited'"),
+    ):
+        bare = tmp_path / label
+        shutil.copytree(one, bare)
+        path = bare / perf_report.RUNNER
+        if content is None:
+            path.unlink()
+        else:
+            text = content if isinstance(content, str) else json.dumps(content)
+            path.write_text(text, encoding="utf-8")
+        problems = perf_report.verify_shards([bare], 2)
+        assert any(expected in p for p in problems), (label, problems)
+
 
 def test_verify_shards_fails_overlap_duplicates_and_foreign_runs(shard_runs, tmp_path):
     one, two = shard_runs

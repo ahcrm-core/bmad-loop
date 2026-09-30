@@ -1258,7 +1258,12 @@ def family(nodeid: str) -> str:
 
 
 def _run_problems(root: Path, label: str) -> tuple[list[str], dict[str, Any] | None]:
-    """Why one metrics directory is not a complete, green run ([] if it is)."""
+    """Why one metrics directory is not a complete, green run ([] if it is).
+
+    The verifiers grade only wrapper runs (``scripts/run_test_benchmark.py``):
+    ``session_finish`` is not the end of the process, so a green run also needs
+    the wrapper's record that the process exited. A missing, unreadable or
+    unsettled record is a problem, never folded into green."""
     if _read_json(root / MANIFEST) is None:
         return [f"{label}: no manifest -- the run is missing or never started"], None
     summary = summarize(root)
@@ -1266,6 +1271,18 @@ def _run_problems(root: Path, label: str) -> tuple[list[str], dict[str, Any] | N
     problems: list[str] = []
     if summary["status"] != "passed":
         problems.append(f"{label}: {summary['status']} -- {summary['status_detail']}")
+    runner = _read_json(root / RUNNER)
+    if runner is None or "_unreadable" in runner:
+        why = "missing" if runner is None else runner["_unreadable"]
+        problems.append(
+            f"{label}: no readable {RUNNER} ({why}) -- the wrapper's exit record "
+            "is lost, so the process end is unproven"
+        )
+    elif summary["status"] == "passed" and runner.get("state") != "exited":
+        problems.append(
+            f"{label}: {RUNNER} state {runner.get('state')!r}, not 'exited' -- "
+            "the wrapper never recorded the process exit"
+        )
     if tests.get("consistent") is False:
         problems.append(f"{label}: workers collected different test sets")
     if tests.get("not_started"):
