@@ -417,9 +417,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     # needs no group.
     popen_kwargs: dict[str, Any] = {} if sys.platform == "win32" else {"start_new_session": True}
 
+    # Until Popen returns there is no child to stop, and a raise inside it could
+    # leave one running with no handle to reach it by: a signal here is only
+    # noted, and replayed once the child is covered by the cleanup below.
+    pending: list[int] = []
     previous = {sig: signal.getsignal(sig) for sig in (signal.SIGINT, signal.SIGTERM)}
     for sig in previous:
-        signal.signal(sig, _raise_interrupted)
+        signal.signal(sig, lambda signum, frame: pending.append(signum))
     job: _TreeJob | None = None
     if sys.platform == "win32":
         try:
@@ -440,9 +444,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             finish("spawn_failed", None, error=type(exc).__name__)
             _summarize(root)
             return EXIT_SPAWN_FAILED
-        record["child_pid"] = proc.pid
-        _write_runner(root, record)
+        for sig in previous:
+            signal.signal(sig, _raise_interrupted)
         try:
+            record["child_pid"] = proc.pid
+            if pending:
+                raise _Interrupted(pending[0])
+            _write_runner(root, record)
             returncode = proc.wait(timeout=budget)
         except subprocess.TimeoutExpired:
             _hold_signals_for_cleanup()

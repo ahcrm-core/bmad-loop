@@ -673,6 +673,40 @@ def test_wrapper_finishes_cleanup_through_a_second_cancel_signal(tmp_path, monke
     assert (runner["state"], runner["child_reaped"]) == ("interrupted", True)
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX signal-to-self and killpg path")
+def test_wrapper_stops_the_tree_on_a_signal_that_lands_during_the_spawn(tmp_path, monkeypatch):
+    """A cancel landing while Popen is still returning — the child already
+    exists in its own session, so the signal never reached it — must still
+    reach the tree kill, not escape past it and leave pytest running with the
+    record at ``running``.
+
+    Ablation: install the raising handler before the spawn and this row
+    escapes ``main`` with nothing killed."""
+
+    class SpawnedMidSignal:
+        pid = 424243
+        returncode = None
+
+        def __init__(self, *_args, **_kwargs):
+            os.kill(os.getpid(), signal.SIGTERM)  # the child is born; the cancel lands
+
+        def wait(self, timeout=None):
+            if timeout == 5.0:  # the grace wait after the group SIGINT
+                raise subprocess.TimeoutExpired("pytest", timeout)
+            self.returncode = -9
+            return self.returncode
+
+    killed = []
+    monkeypatch.setattr(run_test_benchmark.subprocess, "Popen", SpawnedMidSignal)
+    monkeypatch.setattr(run_test_benchmark.os, "killpg", lambda pgid, sig: killed.append(sig))
+    rc = run_test_benchmark.main(["--metrics-dir", str(tmp_path / "m"), "--grace", "5", "--", "-q"])
+
+    assert rc == run_test_benchmark.EXIT_INTERRUPTED
+    assert killed == [signal.SIGINT, signal.SIGKILL]
+    runner = _json(tmp_path / "m" / perf_report.RUNNER)
+    assert (runner["state"], runner["child_pid"]) == ("interrupted", 424243)
+
+
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows job-object path")
 def test_wrapper_tree_kill_reaches_a_ctrl_c_immune_child_after_the_root_exited(
     tmp_path, reap_leftovers
