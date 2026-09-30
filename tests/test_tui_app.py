@@ -7,11 +7,14 @@ bindings drive modals into tui.launch calls (monkeypatched — no real tmux)."""
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import json
 import os
 import subprocess
 import sys
+import threading
+import time
 import tomllib
 from pathlib import Path
 
@@ -167,18 +170,158 @@ def make_run(
     return run_dir
 
 
+@dataclasses.dataclass(frozen=True)
+class Emission:
+    """One `App.notify` call, as the app made it: text, severity, and the
+    monotonic instant it was made."""
+
+    message: str
+    severity: str
+    at: float
+
+
+_EMITTED = "_test_emitted_notifications"
+_WORKERS = "_test_started_workers"
+# The harness's own clock, a module attribute so a test of the deadline can swap
+# it (scoped to this module) without touching the process-wide `time` module.
+_monotonic = time.monotonic
+_TRACE: list[str] = []
+
+
+def trace(event: str) -> None:
+    """Note a test-observed event for the next failed wait's diagnostic."""
+    _TRACE.append(f"{_monotonic():.3f} [{threading.current_thread().name}] {event}")
+
+
+def emitted(app) -> list[Emission]:
+    """Every notification the app emitted, in order, expired ones included."""
+    return app.__dict__.setdefault(_EMITTED, [])
+
+
+@pytest.fixture(autouse=True)
+def _observe_tui(monkeypatch):
+    """Record every `notify` and every app-level worker as it happens.
+
+    Textual's own store is not a history: `App._notifications` reaps each entry
+    once its five-second lifetime passes, on every read. A wait that reads it
+    therefore loses a toast the app did emit whenever the runner is slow enough,
+    and cannot say whether the toast was never emitted or merely expired. The
+    spy forwards to the real `notify`, so rendering is unchanged; it only keeps
+    what was said. Emission is not rendering: rows that pin what the operator
+    sees read `rendered_toasts` too.
+
+    Textual drops a worker from `app.workers` the moment it finishes, so the
+    worker record is also kept here: a failed wait can then name a lifecycle
+    worker that errored, was cancelled or never started."""
+    _TRACE.clear()
+    real_notify = BmadLoopApp.notify
+    real_run_worker = BmadLoopApp.run_worker
+
+    def notify(self, message, *, severity="information", **kwargs):
+        emitted(self).append(Emission(str(message), severity, _monotonic()))
+        trace(f"notify[{severity}] {message}")
+        return real_notify(self, message, severity=severity, **kwargs)
+
+    def run_worker(self, *args, **kwargs):
+        worker = real_run_worker(self, *args, **kwargs)
+        self.__dict__.setdefault(_WORKERS, []).append(worker)
+        trace(f"worker started {worker.group}/{worker.name}")
+        return worker
+
+    monkeypatch.setattr(BmadLoopApp, "notify", notify)
+    monkeypatch.setattr(BmadLoopApp, "run_worker", run_worker)
+    yield
+    _TRACE.clear()
+
+
 def notifications(app: BmadLoopApp) -> list[str]:
-    return [n.message for n in app._notifications]
+    return [e.message for e in emitted(app)]
 
 
 def notifications_with_severity(app: BmadLoopApp) -> list[tuple[str, str]]:
     """`notifications()` discards severity, so a refusal that softened from `error`
     to an information toast still matches on text alone. Rows that are ABOUT a
     refusal read this instead."""
-    return [(n.message, n.severity) for n in app._notifications]
+    return [(e.message, e.severity) for e in emitted(app)]
 
 
-async def until(pilot, condition, timeout: float = 10.0) -> None:
+def rendered_toasts(app: BmadLoopApp) -> list[tuple[str, str]]:
+    """The toasts on screen now, as (text, severity), severity read from the
+    widget's own `-<severity>` class. This is what the operator sees; it expires
+    with the toast, so read it only right after the emission it renders.
+
+    Only an app run under `run_test(notifications=True)` mounts a toast rack:
+    Textual's test default is `False`, which is why every other row reads the
+    emission record instead."""
+    shown = []
+    for toast in app.screen.query("Toast"):
+        severity = next(
+            (c[1:] for c in toast.classes if c in ("-information", "-warning", "-error")), ""
+        )
+        shown.append((str(toast.render()), severity))
+    return shown
+
+
+def ui_state(app) -> str:
+    """What a failed wait reports: the screen, focus, workers, what the app
+    emitted and what the test observed, so a missed click, a dead worker and a
+    missing toast read differently."""
+    try:
+        screen = type(app.screen).__name__
+    except Exception as e:  # a panicked app has no screen stack left to name
+        screen = f"<unavailable: {e!r}>"
+    started = [
+        f"{w.group}/{w.name}={w.state.name}" + (f" error={w.error!r}" if w.error else "")
+        for w in app.__dict__.get(_WORKERS, [])
+    ]
+    live = sorted(f"{w.group}/{w.name}={w.state.name}" for w in app.workers)
+    lines = [
+        f"screen={screen} focused={app.focused!r}",
+        f"app workers started: {started or 'none'}",
+        f"workers live now: {live or 'none'}",
+        f"emitted: {notifications_with_severity(app) or 'nothing'}",
+        f"app exception: {app._exception!r}",
+        "trace:",
+        *(f"  {line}" for line in _TRACE[-40:]),
+    ]
+    return "\n".join(lines)
+
+
+def _describe(condition, what: str | None) -> str:
+    if what is not None:
+        return what
+    code = getattr(condition, "__code__", None)
+    if code is None:
+        return repr(condition)
+    return f"{condition.__qualname__} ({Path(code.co_filename).name}:{code.co_firstlineno})"
+
+
+_STEP = 0.05
+# What one step may take past the deadline before it is called a stall rather
+# than an ordinary last step: `pause` drains the queue before it sleeps.
+_STEP_GRACE = 1.0
+
+
+async def _step(pilot, deadline: float, what: str) -> None:
+    """One `pilot.pause`, bounded by the caller's deadline.
+
+    `pause` first waits for every widget to drain its queued messages, with
+    Textual's own 30-second bound, and only then sleeps the requested step, so
+    a busy UI makes one step take far longer than the step. Bounding it by the
+    deadline (plus one step's grace) keeps a stalled UI a failure of this wait,
+    reported as such, instead of Textual's 30-second one."""
+    try:
+        await asyncio.wait_for(
+            pilot.pause(_STEP), timeout=max(deadline - _monotonic(), 0.0) + _STEP_GRACE
+        )
+    except TimeoutError:
+        raise AssertionError(
+            f"UI did not drain its messages before the deadline, waiting for: {what}\n"
+            + ui_state(pilot.app)
+        ) from None
+
+
+async def until(pilot, condition, timeout: float = 10.0, *, what: str | None = None) -> None:
     """Wait for a predicate across thread-worker polls and their callbacks.
 
     The dashboard polls on a 1.0s interval and each tick hops through a thread
@@ -186,13 +329,19 @@ async def until(pilot, condition, timeout: float = 10.0) -> None:
     ticks; the timeout is generous and returns the instant the predicate holds.
     A pending log jump survives skipped/starved ticks (each tick's _apply
     re-attempts it until it lands), so waiting on its effect is deterministic —
-    no rerun markers needed on the journal-jump tests."""
-    waited = 0.0
+    no rerun markers needed on the journal-jump tests.
+
+    The timeout is real elapsed time on a monotonic clock. Counting requested
+    sleeps instead let a slow runner wait several times longer than it said,
+    and a timeout said only "condition not met"; this one names the condition
+    and the UI state (`ui_state`)."""
+    deadline = _monotonic() + timeout
     while not condition():
-        if waited >= timeout:
-            raise AssertionError("condition not met before timeout")
-        await pilot.pause(0.05)
-        waited += 0.05
+        if _monotonic() >= deadline:
+            raise AssertionError(
+                f"not met within {timeout}s: {_describe(condition, what)}\n" + ui_state(pilot.app)
+            )
+        await _step(pilot, deadline, _describe(condition, what))
 
 
 async def settle(pilot, timeout: float = 10.0) -> None:
@@ -202,7 +351,8 @@ async def settle(pilot, timeout: float = 10.0) -> None:
     reapply, a deferred scroll, a resize of a widget the scroll just exposed —
     each is a message, and each `pause` drains a round. Requiring the regions to
     repeat lets a slow runner take as many frames as it needs, and a screen that
-    never settles raises rather than proceeding.
+    never settles raises rather than proceeding. The timeout is real elapsed
+    time, as in `until`.
 
     `ready()` calls this once the modal is mounted (#281). Call it again after
     anything that moves the layout, before reading a region or a click
@@ -213,15 +363,36 @@ async def settle(pilot, timeout: float = 10.0) -> None:
     def _layout():
         return tuple(w.region for w in pilot.app.screen.query("*"))
 
-    previous, stable, waited = None, 0, 0.0
+    deadline = _monotonic() + timeout
+    previous, stable = None, 0
     while stable < 3:
-        if waited >= timeout:
-            raise AssertionError("screen layout never settled")
-        await pilot.pause(0.05)
-        waited += 0.05
+        if _monotonic() >= deadline:
+            raise AssertionError(
+                f"screen layout never settled within {timeout}s\n" + ui_state(pilot.app)
+            )
+        await _step(pilot, deadline, "layout to settle")
         current = _layout()
         stable = stable + 1 if current == previous else 0
         previous = current
+
+
+async def click(pilot, target) -> None:
+    """`pilot.click` that fails when the click lands anywhere but its target.
+
+    Pilot reports whether the final event hit the widget it aimed at, and a bare
+    `await pilot.click(...)` drops that answer, so a click that fell on an
+    overlay surfaced waits later as a missing outcome. This fails at the click,
+    naming the widget under the pointer."""
+    app = pilot.app
+    widget = app.screen.query_one(target) if isinstance(target, str) else target
+    try:
+        hit = app.get_widget_at(widget.region.x, widget.region.y)[0]  # pilot's aim point
+    except Exception as e:  # off-screen: pilot.click raises OutOfBounds itself
+        hit = f"<nothing: {e!r}>"
+    landed = await pilot.click(widget)
+    trace(f"click {widget!r} landed={landed}")
+    if not landed:
+        raise AssertionError(f"click aimed at {widget!r} landed on {hit!r}\n" + ui_state(app))
 
 
 async def ready(pilot, selector: str, timeout: float = 10.0):
@@ -253,7 +424,7 @@ async def ready(pilot, selector: str, timeout: float = 10.0):
         node = hits.first() if hits else None
         return node if node is not None and node.region.area > 0 else None
 
-    await until(pilot, lambda: _hit() is not None, timeout)
+    await until(pilot, lambda: _hit() is not None, timeout, what=f"{selector} mounted and laid out")
     await settle(pilot, timeout)
     return _hit()
 
@@ -261,6 +432,112 @@ async def ready(pilot, selector: str, timeout: float = 10.0):
 def dashboard(app: BmadLoopApp) -> DashboardScreen:
     assert isinstance(app.screen, DashboardScreen)
     return app.screen
+
+
+# ------------------------------------------------------------ harness proofs
+
+
+async def test_notification_record_outlives_textual_expiry(project_tree, monkeypatch):
+    """A toast the app emitted stays observable after Textual reaps it, and one
+    it never emitted is still absent. Textual's notification clock is frozen and
+    then advanced past the lifetime, so the reap is certain, not raced.
+
+    Ablation: read `app._notifications` in `notifications()` again and the
+    expired row fails; drop the spy's record and the emitted row fails."""
+    from textual import notifications as textual_notifications
+
+    # `raised_at`'s default factory bound the real `time` at import, so the frozen
+    # clock starts from it and only `time_left`'s reading moves.
+    now = [time.time()]
+    monkeypatch.setattr(textual_notifications, "time", lambda: now[0])
+    app = BmadLoopApp(project_tree.project)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        app.notify("short-lived", severity="warning")
+        await until(
+            pilot,
+            lambda: any(n.message == "short-lived" for n in app._notifications),
+            what="Textual holds the notification",
+        )
+        now[0] += BmadLoopApp.NOTIFICATION_TIMEOUT + 1
+        assert not any(n.message == "short-lived" for n in app._notifications)  # reaped
+        assert ("short-lived", "warning") in notifications_with_severity(app)
+        with pytest.raises(AssertionError, match="not met within 0.3s: a toast never emitted"):
+            await until(
+                pilot, lambda: "never said" in notifications(app), 0.3, what="a toast never emitted"
+            )
+
+
+async def test_notify_spy_still_renders_the_toast(project_tree):
+    """The spy forwards: the real `notify` still mounts a toast with the emitted
+    severity. Ablation: return from the spy without calling the real method and
+    this fails."""
+    app = BmadLoopApp(project_tree.project)
+    async with app.run_test(notifications=True) as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        app.notify("shown to the operator", severity="warning")
+        await until(
+            pilot,
+            lambda: ("shown to the operator", "warning") in rendered_toasts(app),
+            what="the warning toast rendered",
+        )
+
+
+async def test_until_deadline_counts_elapsed_time_not_requested_sleeps(project_tree, monkeypatch):
+    """Each step here really takes a second, so a 3-second wait must give up
+    after three steps. Counting the 0.05s each step asked for, the old loop took
+    sixty — a wait that said ten seconds could run for minutes on a slow runner.
+
+    Ablation: count `waited += _STEP` instead of reading the clock and this
+    fails on the step count."""
+    app = BmadLoopApp(project_tree.project)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        clock = [0.0]
+        monkeypatch.setattr(sys.modules[__name__], "_monotonic", lambda: clock[0])
+        steps = []
+
+        class _SlowPilot:
+            app = pilot.app
+
+            async def pause(self, delay=None):
+                steps.append(delay)
+                clock[0] += 1.0
+                await pilot.pause()
+
+        with pytest.raises(AssertionError, match=r"not met within 3.0s: never true"):
+            await until(_SlowPilot(), lambda: False, 3.0, what="never true")
+        assert len(steps) == 3
+
+
+async def test_until_names_a_worker_that_finished_without_calling_back(project_tree):
+    """A worker that ends without posting its toast fails the wait, and the
+    failure says the worker succeeded and nothing was emitted — not a bare
+    "condition not met". Ablation: drop the worker record from `ui_state` and
+    the worker line fails."""
+    app = BmadLoopApp(project_tree.project)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        worker = app.run_worker(lambda: None, thread=True, name="silent", group="probe")
+        await worker.wait()
+        with pytest.raises(AssertionError) as caught:
+            await until(pilot, lambda: "done" in notifications(app), 0.3, what="its toast")
+    assert "probe/silent=SUCCESS" in str(caught.value)
+    assert "emitted: nothing" in str(caught.value)
+
+
+async def test_click_fails_when_it_lands_off_its_target(project_tree):
+    """A click aimed at a widget the modal covers lands on the modal, and the
+    helper says so at the click instead of letting a later wait time out.
+    Ablation: ignore `pilot.click`'s answer in `click` and this fails."""
+    app = BmadLoopApp(project_tree.project)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        covered = dashboard(app).query_one("#runs", DataTable)
+        app.push_screen(ConfirmModal("probe", "a modal over the run table?"))
+        await ready(pilot, "#ok")
+        with pytest.raises(AssertionError, match="landed on"):
+            await click(pilot, covered)
 
 
 async def test_empty_project_shows_hint(project_tree):
@@ -1419,7 +1696,7 @@ async def test_missed_decision_count_and_answer_via_modal(project):
         await until(pilot, lambda: "1 to answer" in str(deferred.border_title))
         await pilot.press("d")
         await until(pilot, lambda: isinstance(app.screen, DecisionModal))
-        await pilot.click(await ready(pilot, "#opt-1"))  # choose build
+        await click(pilot, await ready(pilot, "#opt-1"))  # choose build
         await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
     assert decisions.load_pre_answers(project.project)["DW-1"]["effect"] == "build"
 
@@ -1686,7 +1963,7 @@ async def test_resume_confirm_rechecks_liveness(project_tree, monkeypatch):
         await until(pilot, lambda: dashboard(app).selected_run_id is not None)
         await pilot.press("e")
         await until(pilot, lambda: isinstance(app.screen, ConfirmResumeModal))
-        await pilot.click(await ready(pilot, "#ok"))
+        await click(pilot, await ready(pilot, "#ok"))
         await until(pilot, lambda: any("may still be live" in m for m in notifications(app)))
         assert calls == []  # the callback re-checked and refused; nothing launched
 
@@ -2474,7 +2751,7 @@ async def test_dirty_worktree_blocks_launch(project, monkeypatch):
         await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
         await pilot.press("r")
         await until(pilot, lambda: isinstance(app.screen, StartRunModal))
-        await pilot.click(await ready(pilot, "#ok"))
+        await click(pilot, await ready(pilot, "#ok"))
         await until(pilot, lambda: any("not clean" in m for m in notifications(app)))
         assert not calls
 
@@ -2526,7 +2803,7 @@ async def test_worktree_isolation_under_a_repo_root_override_blocks_launch(
         await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
         await pilot.press("r")
         await until(pilot, lambda: isinstance(app.screen, StartRunModal))
-        await pilot.click(await ready(pilot, "#ok"))
+        await click(pilot, await ready(pilot, "#ok"))
         await until(pilot, lambda: expected in notifications(app))
         # The tree is dirty, so this also pins the ORDER: the clean-tree gate would
         # otherwise have spoken first and sent the operator to commit something
@@ -2560,7 +2837,7 @@ async def test_unreadable_policy_falls_through_the_isolation_guard(project, monk
         await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
         await pilot.press("r")
         await until(pilot, lambda: isinstance(app.screen, StartRunModal))
-        await pilot.click(await ready(pilot, "#ok"))
+        await click(pilot, await ready(pilot, "#ok"))
         await until(pilot, lambda: calls)
         assert not any("isolation" in m for m in notifications(app))
 
@@ -2586,7 +2863,7 @@ async def test_worktree_isolation_beside_a_nested_repo_root_launches(project, mo
         await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
         await pilot.press("r")
         await until(pilot, lambda: isinstance(app.screen, StartRunModal))
-        await pilot.click(await ready(pilot, "#ok"))
+        await click(pilot, await ready(pilot, "#ok"))
         await until(pilot, lambda: calls)
         assert not any("needs the project directory" in m for m in notifications(app))
 
@@ -2615,7 +2892,7 @@ async def test_a_nested_projects_policy_edit_does_not_block_launch(project, monk
         await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
         await pilot.press("r")
         await until(pilot, lambda: isinstance(app.screen, StartRunModal))
-        await pilot.click(await ready(pilot, "#ok"))
+        await click(pilot, await ready(pilot, "#ok"))
         await until(pilot, lambda: calls)
         assert not any("not clean" in m for m in notifications(app))
 
@@ -2644,7 +2921,7 @@ async def test_a_dirty_code_root_blocks_launch_under_a_nested_project(project, m
         await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
         await pilot.press("r")
         await until(pilot, lambda: isinstance(app.screen, StartRunModal))
-        await pilot.click(await ready(pilot, "#ok"))
+        await click(pilot, await ready(pilot, "#ok"))
         await until(pilot, lambda: any("not clean" in m for m in notifications(app)))
         assert not calls
 
@@ -2693,7 +2970,7 @@ async def test_an_under_floor_git_blocks_launch(project, monkeypatch):
         await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
         await pilot.press("r")
         await until(pilot, lambda: isinstance(app.screen, StartRunModal))
-        await pilot.click(await ready(pilot, "#ok"))
+        await click(pilot, await ready(pilot, "#ok"))
         await until(pilot, lambda: expected in notifications(app))
         assert not any("isolation" in m for m in notifications(app))
         assert not any("not clean" in m for m in notifications(app))
@@ -2730,7 +3007,7 @@ async def test_a_git_that_cannot_be_probed_falls_through_the_floor_guard(project
         await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
         await pilot.press("r")
         await until(pilot, lambda: isinstance(app.screen, StartRunModal))
-        await pilot.click(await ready(pilot, "#ok"))
+        await click(pilot, await ready(pilot, "#ok"))
         await until(pilot, lambda: bool(calls))
         assert probes == [5], "the guard must ask, and must ask with its own deadline"
 
@@ -2745,7 +3022,7 @@ async def test_live_run_asks_for_confirmation(project, monkeypatch):
         await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
         await pilot.press("r")
         await until(pilot, lambda: isinstance(app.screen, StartRunModal))
-        await pilot.click(await ready(pilot, "#ok"))
+        await click(pilot, await ready(pilot, "#ok"))
         await until(
             pilot,
             lambda: (
@@ -2753,7 +3030,7 @@ async def test_live_run_asks_for_confirmation(project, monkeypatch):
                 and not isinstance(app.screen, ConfirmResumeModal)
             ),
         )
-        await pilot.click(await ready(pilot, "#ok"))
+        await click(pilot, await ready(pilot, "#ok"))
         await until(pilot, lambda: bool(calls))
 
 
@@ -2854,7 +3131,7 @@ async def test_dry_run_shows_captured_output(project_tree, monkeypatch):
         await until(pilot, lambda: isinstance(app.screen, TextOutputModal))
         assert seen["tail"][0] == "run"
         assert "--dry-run" in seen["tail"]
-        await pilot.click(await ready(pilot, "#ok"))
+        await click(pilot, await ready(pilot, "#ok"))
         await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
 
 
@@ -3074,7 +3351,7 @@ async def test_resume_confirm_launches(project_tree, monkeypatch):
         await until(pilot, lambda: dashboard(app).selected_run_id is not None)
         await pilot.press("e")
         await until(pilot, lambda: isinstance(app.screen, ConfirmResumeModal))
-        await pilot.click(await ready(pilot, "#ok"))
+        await click(pilot, await ready(pilot, "#ok"))
         await until(pilot, lambda: calls == ["20260611-100000-aaaa"])
 
 
@@ -3097,7 +3374,7 @@ async def test_resume_uncaptured_window_id_warns(project_tree, monkeypatch):
         await until(pilot, lambda: dashboard(app).selected_run_id is not None)
         await pilot.press("e")
         await until(pilot, lambda: isinstance(app.screen, ConfirmResumeModal))
-        await pilot.click(await ready(pilot, "#ok"))
+        await click(pilot, await ready(pilot, "#ok"))
         await until(
             pilot, lambda: any("window id was not recorded" in m for m in notifications(app))
         )
@@ -3153,7 +3430,7 @@ async def test_cleanup_unknown_sessions_notifies(project, monkeypatch):
         await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
         await pilot.press("c")
         await until(pilot, lambda: isinstance(app.screen, ConfirmModal))
-        await pilot.click(await ready(pilot, "#ok"))
+        await click(pilot, await ready(pilot, "#ok"))
         await until(pilot, lambda: any("unverifiable engine pid" in m for m in notifications(app)))
         # `until`, not a bare assert: the summary toast is marshalled from the
         # worker AFTER the pid warning, so waiting on the earlier one does not
@@ -3193,7 +3470,7 @@ async def test_cleanup_sessions_mux_error_notifies(project, monkeypatch, fault, 
         await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
         await pilot.press("c")
         await until(pilot, lambda: isinstance(app.screen, ConfirmModal))
-        await pilot.click(await ready(pilot, "#ok"))
+        await click(pilot, await ready(pilot, "#ok"))
         await until(pilot, lambda: any(toast in m for m in notifications(app)))
         # the ctl-window failure is surfaced, but the session pruning that already
         # completed is still reported — not swallowed by an early return
@@ -3242,7 +3519,7 @@ async def test_cleanup_sessions_session_prune_error_notifies(project, monkeypatc
         await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
         await pilot.press("c")
         await until(pilot, lambda: isinstance(app.screen, ConfirmModal))
-        await pilot.click(await ready(pilot, "#ok"))
+        await click(pilot, await ready(pilot, "#ok"))
         await until(pilot, lambda: any(toast in m for m in notifications(app)))
         assert isinstance(app.screen, DashboardScreen)  # worker failed soft, no crash
         # nothing ran, so nothing is summarised as having run
@@ -3281,7 +3558,7 @@ async def test_cleanup_warns_about_sessions_left_in_the_legacy_registry(project,
         await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
         await pilot.press("c")
         await until(pilot, lambda: isinstance(app.screen, ConfirmModal))
-        await pilot.click(await ready(pilot, "#ok"))
+        await click(pilot, await ready(pilot, "#ok"))
         # One toast per registry, each naming its own — the CLI arm's twin.
         # A single toast calling both "the default registry" sent an operator
         # whose sessions are in their own displaced root to the wrong place.
@@ -3323,7 +3600,7 @@ async def test_cleanup_warns_about_a_legacy_registry_that_could_not_be_asked(pro
         await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
         await pilot.press("c")
         await until(pilot, lambda: isinstance(app.screen, ConfirmModal))
-        await pilot.click(await ready(pilot, "#ok"))
+        await click(pilot, await ready(pilot, "#ok"))
         await until(
             pilot,
             lambda: any(
@@ -3374,14 +3651,14 @@ async def test_launch_asks_before_launching_over_an_incomplete_run_listing(proje
         await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
         await pilot.press("r")
         await until(pilot, lambda: isinstance(app.screen, StartRunModal))
-        await pilot.click(await ready(pilot, "#ok"))
+        await click(pilot, await ready(pilot, "#ok"))
         await until(pilot, lambda: isinstance(app.screen, ConfirmModal))
         body = app.screen._body.plain
         assert "live or unknown: none readable" in body
         assert "run listing incomplete: /x/runs: cannot list the runs dir: EACCES" in body
         assert not calls
         # the ask is a real gate: confirming launches
-        await pilot.click(await ready(pilot, "#ok"))
+        await click(pilot, await ready(pilot, "#ok"))
         await until(pilot, lambda: calls)
 
 
@@ -3404,7 +3681,7 @@ async def test_cleanup_warns_about_ctl_windows_that_survived_the_kill(project, m
         await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
         await pilot.press("c")
         await until(pilot, lambda: isinstance(app.screen, ConfirmModal))
-        await pilot.click(await ready(pilot, "#ok"))
+        await click(pilot, await ready(pilot, "#ok"))
         await until(
             pilot,
             lambda: any("still open after the kill: stuck-1" in m for m in notifications(app)),
@@ -3522,7 +3799,7 @@ async def test_decision_banner_shows_and_clears(project_tree):
         assert "decision needed: DW-7" in header
         assert "press a to attach and answer" in header
         # the toast is posted via self.notify() onto textual's async message pump,
-        # so it lands in app._notifications a tick after _decision is set — wait
+        # so it is emitted a tick after _decision is set — wait
         # for it rather than asserting synchronously (matches the other notify tests)
         await until(pilot, lambda: any("reopen the cache work?" in m for m in notifications(app)))
 
@@ -3722,7 +3999,7 @@ async def test_resolve_escalation_launches_and_attaches(project_tree, monkeypatc
         await until(pilot, lambda: dashboard(app).selected_run_id is not None)
         await pilot.press("R")
         await until(pilot, lambda: isinstance(app.screen, ConfirmModal))
-        await pilot.click(await ready(pilot, "#ok"))
+        await click(pilot, await ready(pilot, "#ok"))
         await until(pilot, lambda: bool(calls))
         assert not any("was not recorded" in m for m in notifications(app))
     assert launched == ["20260611-100000-aaaa"]
@@ -3757,7 +4034,7 @@ async def test_resolve_warns_when_the_record_did_not_survive(project_tree, monke
         await until(pilot, lambda: dashboard(app).selected_run_id is not None)
         await pilot.press("R")
         await until(pilot, lambda: isinstance(app.screen, ConfirmModal))
-        await pilot.click(await ready(pilot, "#ok"))
+        await click(pilot, await ready(pilot, "#ok"))
         await until(pilot, lambda: any("was not recorded" in m for m in notifications(app)))
     assert selected == ["@7"]  # still attached to the window it minted
     assert calls == [["tmux", "switch-client", "-t", "=bmad-loop-ctl"]]
@@ -4061,7 +4338,7 @@ async def test_plan_checkpoint_approve_resumes(project_tree, monkeypatch):
     app = BmadLoopApp(project_tree.project)
     async with app.run_test() as pilot:
         await _open_review(app, pilot, SpecReviewModal)
-        await pilot.click(await ready(pilot, "#act-approve"))
+        await click(pilot, await ready(pilot, "#act-approve"))
         await until(pilot, lambda: calls == ["20260611-100000-aaaa"])
 
 
@@ -4088,7 +4365,7 @@ async def test_plan_checkpoint_replan_resets_and_resumes(project_tree, monkeypat
     app = BmadLoopApp(project_tree.project)
     async with app.run_test() as pilot:
         await _open_review(app, pilot, SpecReviewModal)
-        await pilot.click(await ready(pilot, "#act-replan"))
+        await click(pilot, await ready(pilot, "#act-replan"))
         await until(pilot, lambda: calls == ["20260611-100000-aaaa"])
         # the root is captured, not just the path: `_do_replan` has to pass the
         # project it built `run_dir` from, and a `confine_root` naming the spec's
@@ -4147,7 +4424,7 @@ async def test_plan_checkpoint_replan_restores_preimage_when_result_strip_fails(
     app = BmadLoopApp(project.project)
     async with app.run_test() as pilot:
         await _open_review(app, pilot, SpecReviewModal)
-        await pilot.click(await ready(pilot, "#act-replan"))
+        await click(pilot, await ready(pilot, "#act-replan"))
         await until(
             pilot,
             lambda: any("injected result-strip write failure" in m for m in notifications(app)),
@@ -4175,7 +4452,7 @@ async def test_plan_checkpoint_replan_does_not_strip_when_reset_refuses(project,
     app = BmadLoopApp(project.project)
     async with app.run_test() as pilot:
         await _open_review(app, pilot, SpecReviewModal)
-        await pilot.click(await ready(pilot, "#act-replan"))
+        await click(pilot, await ready(pilot, "#act-replan"))
         await until(pilot, lambda: any("could not reset" in m for m in notifications(app)))
     assert spec.read_bytes() == original
     assert calls == []
@@ -4213,7 +4490,7 @@ async def test_plan_checkpoint_replan_rollback_failure_stays_loud(project_tree, 
     app = BmadLoopApp(project_tree.project)
     async with app.run_test() as pilot:
         await _open_review(app, pilot, SpecReviewModal)
-        await pilot.click(await ready(pilot, "#act-replan"))
+        await click(pilot, await ready(pilot, "#act-replan"))
         await until(
             pilot,
             lambda: any("injected rollback failure" in m for m in notifications(app)),
@@ -4298,7 +4575,7 @@ async def test_plan_checkpoint_replan_writes_the_worktree_spec_not_the_main_twin
     app = BmadLoopApp(project.project)
     async with app.run_test() as pilot:
         await _open_review(app, pilot, SpecReviewModal)
-        await pilot.click(await ready(pilot, "#act-replan"))
+        await click(pilot, await ready(pilot, "#act-replan"))
         await until(pilot, lambda: calls == ["20260611-100000-aaaa"])
     assert verify.read_frontmatter(spec)["status"] == "draft"
     assert "## Auto Run Result" not in spec.read_text(encoding="utf-8")
@@ -4344,7 +4621,7 @@ async def test_plan_checkpoint_replan_refuses_a_worktree_mount_swapped_for_a_lin
         wt.rename(wt.with_name(wt.name + "-aside"))
         wt.symlink_to(outside, target_is_directory=True)
         untouched = outside_spec.read_bytes()
-        await pilot.click(await ready(pilot, "#act-replan"))
+        await click(pilot, await ready(pilot, "#act-replan"))
         await until(pilot, lambda: any("replan failed" in m for m in notifications(app)))
     assert calls == []
     assert outside_spec.read_bytes() == untouched
@@ -4381,7 +4658,7 @@ async def test_plan_checkpoint_replan_refuses_a_legacy_mount_with_no_identity_re
     app = BmadLoopApp(project_tree.project)
     async with app.run_test() as pilot:
         await _open_review(app, pilot, SpecReviewModal)
-        await pilot.click(await ready(pilot, "#act-replan"))
+        await click(pilot, await ready(pilot, "#act-replan"))
         await until(pilot, lambda: any("replan failed" in m for m in notifications(app)))
     assert calls == []
     assert spec.read_bytes() == untouched
@@ -4441,7 +4718,7 @@ async def test_plan_checkpoint_replan_confines_on_the_project_for_an_out_of_moun
     app = BmadLoopApp(project.project)
     async with app.run_test() as pilot:
         await _open_review(app, pilot, SpecReviewModal)
-        await pilot.click(await ready(pilot, "#act-replan"))
+        await click(pilot, await ready(pilot, "#act-replan"))
         await until(pilot, lambda: calls == ["20260611-100000-aaaa"])
     assert roots == [project.project, project.project]
     assert verify.read_frontmatter(spec)["status"] == "draft"
@@ -4562,7 +4839,7 @@ async def test_replan_on_an_undecodable_spec_does_not_crash_the_dashboard(
     app = BmadLoopApp(project_tree.project)
     async with app.run_test() as pilot:
         await _open_review(app, pilot, SpecReviewModal)
-        await pilot.click(await ready(pilot, "#act-replan"))
+        await click(pilot, await ready(pilot, "#act-replan"))
         await pilot.pause()
         assert app.is_running  # the dashboard survived the failed write
     assert calls == []  # and the run was NOT resumed on an unreplanned spec
@@ -4825,7 +5102,7 @@ async def test_plan_checkpoint_replan_refuses_a_control_alias_run_before_mutatin
     app = BmadLoopApp(project_tree.project)
     async with app.run_test() as pilot:
         await _open_review(app, pilot, SpecReviewModal)
-        await pilot.click(await ready(pilot, "#act-replan"))
+        await click(pilot, await ready(pilot, "#act-replan"))
         await until(pilot, lambda: not isinstance(app.screen, SpecReviewModal))
         await pilot.pause()
         assert resets == []  # the spec was NOT rewritten ahead of the refusal
@@ -4905,7 +5182,7 @@ async def test_resume_confirm_refuses_unreadable_sweep_ledger(project_tree, monk
         await until(pilot, lambda: dashboard(app).selected_run_id == run_dir.name)
         await pilot.press("e")
         await until(pilot, lambda: isinstance(app.screen, ConfirmResumeModal))
-        await pilot.click(await ready(pilot, "#ok"))
+        await click(pilot, await ready(pilot, "#ok"))
         await pilot.pause()
         assert resumes == []
         assert (run_dir / "state.json").read_bytes() == original_state
@@ -4922,7 +5199,7 @@ async def test_resume_confirm_refuses_unreadable_sweep_ledger(project_tree, monk
         ledger.write_bytes(READABLE_LEDGER)
         await pilot.press("e")
         await until(pilot, lambda: isinstance(app.screen, ConfirmResumeModal))
-        await pilot.click(await ready(pilot, "#ok"))
+        await click(pilot, await ready(pilot, "#ok"))
         await until(pilot, lambda: resumes == [run_dir.name])
         await pilot.pause()
         assert resumes == [run_dir.name]
@@ -4960,7 +5237,7 @@ async def test_resume_confirm_ledger_probe_preserves_handoff(project_tree, monke
         await until(pilot, lambda: isinstance(app.screen, ConfirmResumeModal))
         if case == "state":
             (run_dir / "state.json").unlink()
-        await pilot.click(await ready(pilot, "#ok"))
+        await click(pilot, await ready(pilot, "#ok"))
         await until(pilot, lambda: resumes == [run_dir.name])
         await pilot.pause()
         assert any(f"resume of {run_dir.name} launched" in m for m in notifications(app))
@@ -5003,7 +5280,7 @@ async def test_resume_confirm_guards_precede_ledger_probe(project_tree, monkeypa
             if guard == "unknown":
                 (run_dir / "engine.pid").write_text("4242 123.0", encoding="utf-8")
             message, severity = "may still be live", "warning"
-        await pilot.click(await ready(pilot, "#ok"))
+        await click(pilot, await ready(pilot, "#ok"))
         await pilot.pause()
         assert probes == []
         assert resumes == []
@@ -5268,7 +5545,7 @@ async def test_story_checkpoint_continue_resumes(project, monkeypatch):
     app = BmadLoopApp(project.project)
     async with app.run_test() as pilot:
         await _open_review(app, pilot, StoryCheckpointModal)
-        await pilot.click(await ready(pilot, "#act-continue"))
+        await click(pilot, await ready(pilot, "#act-continue"))
         await until(pilot, lambda: calls == ["20260611-100000-aaaa"])
 
 
@@ -5291,7 +5568,7 @@ async def test_story_checkpoint_stop_marks_stopped(project_tree, monkeypatch):
     app = BmadLoopApp(project_tree.project)
     async with app.run_test() as pilot:
         await _open_review(app, pilot, StoryCheckpointModal)
-        await pilot.click(await ready(pilot, "#act-stop"))
+        await click(pilot, await ready(pilot, "#act-stop"))
         await until(pilot, lambda: len(kills) == 1)
     assert stops == [project_tree.project / runs.RUNS_DIR / "20260611-100000-aaaa"]
     assert kills == [(project_tree.project, "20260611-100000-aaaa")]
@@ -5364,7 +5641,7 @@ async def test_stop_run_stops_and_kills_ctl_window(project_tree, monkeypatch):
         await until(pilot, lambda: dashboard(app).selected_run_id == "20260611-100000-aaaa")
         await pilot.press("x")
         await until(pilot, lambda: isinstance(app.screen, ConfirmModal))
-        await pilot.click(await ready(pilot, "#ok"))
+        await click(pilot, await ready(pilot, "#ok"))
         needle = "run 20260611-100000-aaaa stopped"
         await until(pilot, lambda: any(needle in m for m in notifications(app)))
     assert stops == [project_tree.project / RUNS_DIR / "20260611-100000-aaaa"]
@@ -5421,7 +5698,7 @@ async def test_archive_run_archives_and_forgets(project_tree, monkeypatch):
         await until(pilot, lambda: dashboard(app).selected_run_id == "20260611-100000-aaaa")
         await pilot.press("A")
         await until(pilot, lambda: isinstance(app.screen, ConfirmModal))
-        await pilot.click(await ready(pilot, "#ok"))
+        await click(pilot, await ready(pilot, "#ok"))
         await until(pilot, lambda: any(str(dest) in m for m in notifications(app)))
     assert archived == [
         (project_tree.project, project_tree.project / RUNS_DIR / "20260611-100000-aaaa")
@@ -5456,6 +5733,68 @@ async def test_archive_live_run_refused_without_calling(project_tree, monkeypatc
         assert not isinstance(app.screen, ConfirmModal)
 
 
+def run_worker_body(app: BmadLoopApp, worker: str, *args) -> list[tuple[str, tuple, dict]]:
+    """Run a `@work` method's undecorated body on this thread and return every
+    callback it marshalled to the UI, in order, as ``("app.notify", args,
+    kwargs)``-shaped records.
+
+    `call_from_thread` is a worker's only route to the UI, so the recorder sees
+    exactly what the real worker posts, and nothing runs: no app is started. This
+    is the `__wrapped__` entry `_poll`'s lock test uses; the Pilot rows below keep
+    the keybinding, modal, dispatch and rendering in the loop."""
+    posted: list[tuple[str, tuple, dict]] = []
+    owners = {id(app): "app", id(app._dashboard): "dashboard"}
+
+    def record(callback, *a, **kw):
+        posted.append((f"{owners[id(callback.__self__)]}.{callback.__name__}", a, kw))
+
+    app.call_from_thread = record
+    getattr(BmadLoopApp, worker).__wrapped__(app, *args)
+    return posted
+
+
+def observe_helper(monkeypatch, name: str) -> list[str]:
+    """Forward `runs.<name>`, recording how each call ended, so a Pilot row can
+    tell a worker that never reached the helper from one whose outcome never
+    reached the UI."""
+    real = getattr(runs_mod, name)
+    outcomes: list[str] = []
+
+    def forward(*args, **kwargs):
+        trace(f"runs.{name} entered")
+        try:
+            result = real(*args, **kwargs)
+        except BaseException as e:
+            outcomes.append(f"raised {e!r}")
+            trace(f"runs.{name} raised {e!r}")
+            raise
+        outcomes.append(f"returned {result!r}")
+        trace(f"runs.{name} returned {result!r}")
+        return result
+
+    monkeypatch.setattr(runs_mod, name, forward)
+    return outcomes
+
+
+async def confirm_lifecycle(pilot, key: str, helper: str, outcomes: list[str]) -> None:
+    """Drive a D/A through its keybinding and confirm modal, then wait on each
+    stage in turn — modal open, click landed, modal dismissed, the worker's
+    helper call finished — so a failure names the stage that stalled."""
+    app = pilot.app
+    await pilot.press(key)
+    await until(pilot, lambda: isinstance(app.screen, ConfirmModal), what=f"{key} opens its modal")
+    await click(pilot, await ready(pilot, "#ok"))
+    await until(
+        pilot,
+        lambda: not isinstance(app.screen, ConfirmModal),
+        what="the click dismisses the modal",
+    )
+    await until(pilot, lambda: bool(outcomes), what=f"the worker's runs.{helper} call to finish")
+
+
+_LIFECYCLE_WORKERS = {"D": "_delete_run_worker", "A": "_archive_run_worker"}
+
+
 @pytest.mark.parametrize(
     "key, helper, failure, expected",
     [
@@ -5475,17 +5814,16 @@ async def test_archive_live_run_refused_without_calling(project_tree, monkeypatc
         ),
     ],
 )
-async def test_lifecycle_workers_report_authoritative_failures_and_keep_the_run_visible(
+def test_lifecycle_workers_report_authoritative_failures_and_keep_the_run_visible(
     project_tree, monkeypatch, key, helper, failure, expected
 ):
     """The modal's liveness sample is advisory. A later lifecycle or state-lock
-    refusal is toasted from the worker, and the dashboard forget happens only on
-    success.
+    refusal is toasted from the worker as an error, and the dashboard forget —
+    what drops the run from the table and the selection — is posted only on
+    success. The Pilot twin below keeps one row per action in the running app.
 
-    Ablation: omit either new exception type from the worker catch and the worker
-    dies without the expected notification. Verified.
-    """
-    monkeypatch.setattr(data, "liveness", lambda _run_dir: "dead")
+    Ablation: omit either new exception type from the worker catch and its rows
+    raise out of the worker body instead of posting the toast. Verified."""
 
     def fail(*_args, **_kwargs):
         raise failure
@@ -5493,12 +5831,45 @@ async def test_lifecycle_workers_report_authoritative_failures_and_keep_the_run_
     monkeypatch.setattr(runs_mod, helper, fail)
     run_dir = make_run(project_tree.project, "20260611-100000-aaaa", finished=True)
     app = BmadLoopApp(project_tree.project)
+
+    posted = run_worker_body(app, _LIFECYCLE_WORKERS[key], run_dir.name, run_dir)
+
+    assert posted == [("app.notify", (f"{expected}: {failure}",), {"severity": "error"})]
+    assert run_dir.is_dir()
+
+
+@pytest.mark.parametrize(
+    "key, helper, expected",
+    [("D", "delete_run", "delete failed"), ("A", "archive_run", "archive failed")],
+    ids=["delete", "archive"],
+)
+async def test_lifecycle_refusal_is_an_error_toast_and_keeps_the_run_selected(
+    project_tree, monkeypatch, key, helper, expected
+):
+    """The authoritative refusal through the running app: keybinding, modal, the
+    worker's dispatch and its error toast, with the run still selected. The
+    exception-type matrix lives in the worker-body rows above.
+
+    Ablation: drop `LiveEngineError` from either worker's catch and its row
+    fails — the worker error takes the app down under run_test. Verified."""
+    monkeypatch.setattr(data, "liveness", lambda _run_dir: "dead")
+
+    def fail(*_args, **_kwargs):
+        raise runs_mod.LiveEngineError("engine resumed")
+
+    monkeypatch.setattr(runs_mod, helper, fail)
+    outcomes = observe_helper(monkeypatch, helper)
+    run_dir = make_run(project_tree.project, "20260611-100000-aaaa", finished=True)
+    app = BmadLoopApp(project_tree.project)
     async with app.run_test() as pilot:
         await until(pilot, lambda: dashboard(app).selected_run_id == run_dir.name)
-        await pilot.press(key)
-        await until(pilot, lambda: isinstance(app.screen, ConfirmModal))
-        await pilot.click(await ready(pilot, "#ok"))
-        await until(pilot, lambda: any(expected in note for note in notifications(app)))
+        await confirm_lifecycle(pilot, key, helper, outcomes)
+        assert outcomes == ["raised LiveEngineError('engine resumed')"]
+        await until(
+            pilot,
+            lambda: (f"{expected}: engine resumed", "error") in notifications_with_severity(app),
+            what="the refusal's error toast",
+        )
         assert dashboard(app).selected_run_id == run_dir.name
 
     assert run_dir.is_dir()
@@ -5524,6 +5895,23 @@ def _unselectable_mux():
     raise MultiplexerError("[mux] backend = 'ghost' matches no registered backend")
 
 
+def _removed_toast(key: str, run_dir: Path, project: Path) -> str:
+    if key == "D":
+        return f"run {run_dir.name} deleted"
+    return f"run {run_dir.name} archived to {project / '.bmad-loop' / 'archive'}"
+
+
+def _spy_prints(monkeypatch, *modules) -> list[str]:
+    # Textual redirects stderr while an app runs, so capsys cannot see a print
+    # made under it; spy on each module's own `print` instead.
+    printed: list[str] = []
+    for module in modules:
+        monkeypatch.setattr(
+            module, "print", lambda *a, **_kw: printed.append(" ".join(map(str, a))), raising=False
+        )
+    return printed
+
+
 @pytest.mark.parametrize(
     "select, what",
     [
@@ -5532,50 +5920,41 @@ def _unselectable_mux():
     ],
     ids=["unselectable", "listing-raised"],
 )
-@pytest.mark.parametrize(
-    "key, removed",
-    [("D", "run 20260611-100000-aaaa deleted"), ("A", "run 20260611-100000-aaaa archived")],
-    ids=["delete", "archive"],
-)
-async def test_lifecycle_workers_toast_an_unasked_session_guard(
-    project_tree, monkeypatch, select, what, key, removed
+@pytest.mark.parametrize("key", ["D", "A"], ids=["delete", "archive"])
+def test_lifecycle_workers_toast_an_unasked_session_guard(
+    project_tree, monkeypatch, select, what, key
 ):
     """The #419 guard could not ask the multiplexer, so the removal went ahead
     as if no session were live (DW-466). The CLI says so on stderr, but Textual
     captures stderr for the app's whole run, so under the TUI that print reached
     nobody: the run dir vanished with nothing shown. The worker now hands
-    `delete_run`/`archive_run` a sink and toasts the note as a warning — and the
-    stderr print does not fire on top of it (one route per frontend).
+    `delete_run`/`archive_run` a sink and toasts the note as a warning — ahead of
+    the forget and the removal toast — and the stderr print does not fire on top
+    of it (one route per frontend).
 
-    Drives the real removal helpers; only the multiplexer seam is faked.
+    Drives the real removal helpers in the real worker bodies; only the
+    multiplexer seam is faked. The running-app twin is
+    test_lifecycle_guard_warning_renders_through_the_running_app.
 
-    Ablation: drop `_notify_guard_notes` from either worker and its rows fail at
-    the toast wait (the removal toast arrives, the warning never does). Verified."""
-    monkeypatch.setattr(data, "liveness", lambda _run_dir: "dead")
+    Ablation: drop `_notify_guard_notes` from either worker and its rows fail on
+    the posted sequence (the removal toast arrives, the warning never does).
+    Verified."""
     monkeypatch.setattr(runs_mod, "get_multiplexer", select)
     run_dir = make_run(project_tree.project, "20260611-100000-aaaa", finished=True)
-    # Textual redirects stderr while the app runs, so capsys cannot see a print
-    # made under it; spy on the runs module's own `print` instead.
-    printed: list[str] = []
-    monkeypatch.setattr(
-        runs_mod, "print", lambda *a, **_kw: printed.append(" ".join(map(str, a))), raising=False
-    )
+    printed = _spy_prints(monkeypatch, runs_mod)
     note = f"run 20260611-100000-aaaa: could not check for a live agent session — {what}: "
     app = BmadLoopApp(project_tree.project)
-    async with app.run_test() as pilot:
-        await until(pilot, lambda: dashboard(app).selected_run_id == run_dir.name)
-        await pilot.press(key)
-        await until(pilot, lambda: isinstance(app.screen, ConfirmModal))
-        await pilot.click(await ready(pilot, "#ok"))
-        await until(pilot, lambda: any(removed in m for m in notifications(app)))
-        await until(
-            pilot,
-            lambda: any(
-                m.startswith(note) and sev == "warning"
-                for m, sev in notifications_with_severity(app)
-            ),
-        )
 
+    posted = run_worker_body(app, _LIFECYCLE_WORKERS[key], run_dir.name, run_dir)
+
+    assert [(name, kw) for name, _args, kw in posted] == [
+        ("app.notify", {"severity": "warning"}),
+        ("dashboard.forget_run", {}),
+        ("app.notify", {}),
+    ]
+    assert posted[0][1][0].startswith(note)
+    assert posted[1][1] == (run_dir.name,)
+    assert posted[2][1][0].startswith(_removed_toast(key, run_dir, project_tree.project))
     assert not run_dir.exists()
     assert not [p for p in printed if "could not check for a live agent session" in p]
 
@@ -5588,13 +5967,9 @@ async def test_lifecycle_workers_toast_an_unasked_session_guard(
     ],
     ids=["unproven", "no-server"],
 )
-@pytest.mark.parametrize(
-    "key, removed",
-    [("D", "run 20260611-100000-aaaa deleted"), ("A", "run 20260611-100000-aaaa archived")],
-    ids=["delete", "archive"],
-)
-async def test_lifecycle_workers_toast_a_folded_session_listing(
-    project_tree, monkeypatch, stderr, faulted, key, removed
+@pytest.mark.parametrize("key", ["D", "A"], ids=["delete", "archive"])
+def test_lifecycle_workers_toast_a_folded_session_listing(
+    project_tree, monkeypatch, stderr, faulted, key
 ):
     """The stock backends never raise from the listing: a failed `list-sessions`
     folds into `[]` with a stderr warning (DW-458), and Textual captures stderr,
@@ -5603,48 +5978,99 @@ async def test_lifecycle_workers_toast_a_folded_session_listing(
     DW-466 raise — and neither the backend nor the guard prints on top of it.
     A gone server is an answer, not a fault: no warning toast.
 
-    Drives the real removal helpers and the real tmux-family fold; only the
-    spawn is faked (see test_runs._folding_tmux).
+    Drives the real removal helpers, the real tmux-family fold and the real
+    worker bodies; only the spawn is faked (see test_runs._folding_tmux). The
+    sink-to-toast wiring in the running app is pinned by
+    test_lifecycle_guard_warning_renders_through_the_running_app.
 
     Ablation: pass `on_fault=None` unconditionally from the guard and the
-    `unproven` rows fail at the toast wait. Verified."""
+    `unproven` rows fail on the posted sequence. Verified."""
     from test_runs import _folding_tmux
 
     from bmad_loop.adapters import tmux_base
 
-    monkeypatch.setattr(data, "liveness", lambda _run_dir: "dead")
     monkeypatch.setattr(runs_mod, "get_multiplexer", lambda: _folding_tmux(stderr))
     run_dir = make_run(project_tree.project, "20260611-100000-aaaa", finished=True)
-    printed: list[str] = []
-    for module in (runs_mod, tmux_base):
-        monkeypatch.setattr(
-            module, "print", lambda *a, **_kw: printed.append(" ".join(map(str, a))), raising=False
-        )
+    printed = _spy_prints(monkeypatch, runs_mod, tmux_base)
     note = (
         "run 20260611-100000-aaaa: could not check for a live agent session — the "
         f"session listing failed: {sys.executable} list-sessions exited 1 without "
         "proving the session gone: error connecting to"
     )
     app = BmadLoopApp(project_tree.project)
-    async with app.run_test() as pilot:
+
+    posted = run_worker_body(app, _LIFECYCLE_WORKERS[key], run_dir.name, run_dir)
+
+    warnings = [a[0] for name, a, kw in posted if kw == {"severity": "warning"}]
+    assert warnings == ([warnings[0]] if faulted else [])
+    if faulted:
+        assert warnings[0].startswith(note)
+    assert [(name, kw) for name, _args, kw in posted if kw != {"severity": "warning"}] == [
+        ("dashboard.forget_run", {}),
+        ("app.notify", {}),
+    ]
+    assert posted[-1][1][0].startswith(_removed_toast(key, run_dir, project_tree.project))
+    assert not run_dir.exists()
+    assert printed == []
+
+
+@pytest.mark.parametrize("key", ["D", "A"], ids=["delete", "archive"])
+async def test_lifecycle_guard_warning_renders_through_the_running_app(
+    project_tree, monkeypatch, key
+):
+    """The DW-466 degrade end to end in the running app, one row per action:
+    keybinding, modal, the worker's real removal helper, its warning toast and
+    removal toast, the forget and the removed run dir — each awaited as its own
+    stage (`confirm_lifecycle`), so a timeout names the stage that stalled rather
+    than "condition not met". The warning is read twice: as emitted, and as the
+    toast widget the operator actually sees, severity class included — which
+    needs `run_test(notifications=True)`: Textual's test default mounts no toasts.
+
+    The guard/listing matrices run against the worker bodies above.
+
+    Ablation: drop `_notify_guard_notes` from either worker and its row fails at
+    the warning wait; emit the note at `information` and the rendered-severity
+    wait fails. Verified."""
+    helper = {"D": "delete_run", "A": "archive_run"}[key]
+    monkeypatch.setattr(data, "liveness", lambda _run_dir: "dead")
+    monkeypatch.setattr(runs_mod, "get_multiplexer", _UnaskableMux)
+    outcomes = observe_helper(monkeypatch, helper)
+    run_dir = make_run(project_tree.project, "20260611-100000-aaaa", finished=True)
+    printed = _spy_prints(monkeypatch, runs_mod)
+    note = (
+        "run 20260611-100000-aaaa: could not check for a live agent session — "
+        "the session listing raised: "
+    )
+    removed = _removed_toast(key, run_dir, project_tree.project)
+    app = BmadLoopApp(project_tree.project)
+    async with app.run_test(notifications=True) as pilot:
         await until(pilot, lambda: dashboard(app).selected_run_id == run_dir.name)
-        await pilot.press(key)
-        await until(pilot, lambda: isinstance(app.screen, ConfirmModal))
-        await pilot.click(await ready(pilot, "#ok"))
-        await until(pilot, lambda: any(removed in m for m in notifications(app)))
-        if faulted:
-            await until(
-                pilot,
-                lambda: any(
-                    m.startswith(note) and sev == "warning"
-                    for m, sev in notifications_with_severity(app)
-                ),
-            )
-        warnings = [m for m, sev in notifications_with_severity(app) if sev == "warning"]
+        await confirm_lifecycle(pilot, key, helper, outcomes)
+        assert len(outcomes) == 1 and outcomes[0].startswith("returned"), outcomes
+        await until(
+            pilot,
+            lambda: any(
+                m.startswith(note) and sev == "warning"
+                for m, sev in notifications_with_severity(app)
+            ),
+            what="the guard's warning emitted",
+        )
+        await until(
+            pilot,
+            lambda: any(m.startswith(removed) for m in notifications(app)),
+            what="removal toast",
+        )
+        await until(
+            pilot,
+            lambda: any(t.startswith(note) and sev == "warning" for t, sev in rendered_toasts(app)),
+            what="the guard's warning rendered as a warning toast",
+        )
+        await until(
+            pilot, lambda: dashboard(app).selected_run_id != run_dir.name, what="the run forgotten"
+        )
 
     assert not run_dir.exists()
-    assert len(warnings) == (1 if faulted else 0)
-    assert printed == []
+    assert not [p for p in printed if "could not check for a live agent session" in p]
 
 
 # ------------------------------------------------------------ graceful stop (S)
@@ -5665,7 +6091,7 @@ async def test_graceful_stop_requests_via_helper(project_tree, monkeypatch):
         await until(pilot, lambda: dashboard(app).selected_run_id == "20260611-100000-aaaa")
         await pilot.press("S")
         await until(pilot, lambda: isinstance(app.screen, ConfirmModal))
-        await pilot.click(await ready(pilot, "#ok"))
+        await click(pilot, await ready(pilot, "#ok"))
         await until(pilot, lambda: len(calls) == 1)
         assert calls[0].name == "20260611-100000-aaaa"
         await until(pilot, lambda: any("graceful stop requested" in m for m in notifications(app)))
@@ -5690,7 +6116,7 @@ async def test_graceful_stop_token_messages(project_tree, monkeypatch, token, ne
         await until(pilot, lambda: dashboard(app).selected_run_id == "20260611-100000-aaaa")
         await pilot.press("S")
         await until(pilot, lambda: isinstance(app.screen, ConfirmModal))
-        await pilot.click(await ready(pilot, "#ok"))
+        await click(pilot, await ready(pilot, "#ok"))
         await until(pilot, lambda: any(needle in m for m in notifications(app)))
 
 
@@ -5716,7 +6142,7 @@ async def test_graceful_stop_write_failure_notifies_instead_of_crashing(project_
         await until(pilot, lambda: dashboard(app).selected_run_id == "20260611-100000-aaaa")
         await pilot.press("S")
         await until(pilot, lambda: isinstance(app.screen, ConfirmModal))
-        await pilot.click(await ready(pilot, "#ok"))
+        await click(pilot, await ready(pilot, "#ok"))
         await until(pilot, lambda: any("could not be written" in m for m in notifications(app)))
         assert app.is_running  # the dashboard survived the refusal
 
@@ -5759,7 +6185,7 @@ async def test_graceful_stop_unknown_liveness_proceeds(project, monkeypatch):
         await until(pilot, lambda: dashboard(app).selected_run_id == "20260611-100000-aaaa")
         await pilot.press("S")
         await until(pilot, lambda: isinstance(app.screen, ConfirmModal))
-        await pilot.click(await ready(pilot, "#ok"))
+        await click(pilot, await ready(pilot, "#ok"))
         await until(pilot, lambda: len(calls) == 1)
         assert calls[0].name == "20260611-100000-aaaa"
         needle = "could not confirm a live engine"
@@ -5782,7 +6208,7 @@ async def test_graceful_stop_error_toasts(project_tree, monkeypatch):
         await until(pilot, lambda: dashboard(app).selected_run_id == "20260611-100000-aaaa")
         await pilot.press("S")
         await until(pilot, lambda: isinstance(app.screen, ConfirmModal))
-        await pilot.click(await ready(pilot, "#ok"))
+        await click(pilot, await ready(pilot, "#ok"))
         await until(pilot, lambda: any("nothing to stop" in m for m in notifications(app)))
 
 
@@ -6226,7 +6652,7 @@ async def test_escalation_rearm_resumes_when_resolution_ready(project_tree, monk
         # story context + blocking condition were resolved from stories.yaml + the spec
         assert app.screen._description == "does a thing"
         assert "Auto Run Result" in app.screen._blocking
-        await pilot.click(await ready(pilot, "#act-rearm"))
+        await click(pilot, await ready(pilot, "#act-rearm"))
         await until(pilot, lambda: rearms == ["1"] and calls == ["20260611-100000-aaaa"])
 
 
@@ -6341,7 +6767,7 @@ async def test_escalation_rearm_hands_the_rearm_the_live_isolation_mode(project_
     app = BmadLoopApp(project_tree.project)
     async with app.run_test() as pilot:
         await _open_review(app, pilot, EscalationModal)
-        await pilot.click(await ready(pilot, "#act-rearm"))
+        await click(pilot, await ready(pilot, "#act-rearm"))
         await until(pilot, lambda: seen == [True])
     assert roots == [project_tree.project]  # the live tree, not the recorded one
 
@@ -6351,7 +6777,7 @@ async def test_escalation_rearm_hands_the_rearm_the_live_isolation_mode(project_
     app = BmadLoopApp(project_tree.project)
     async with app.run_test() as pilot:
         await _open_review(app, pilot, EscalationModal)
-        await pilot.click(await ready(pilot, "#act-rearm"))
+        await click(pilot, await ready(pilot, "#act-rearm"))
         await until(pilot, lambda: seen == [False])
 
 
@@ -6407,7 +6833,7 @@ async def test_escalation_rearm_refuses_when_the_policy_cannot_be_read(project_t
     app = BmadLoopApp(project_tree.project)
     async with app.run_test() as pilot:
         await _open_review(app, pilot, EscalationModal)
-        await pilot.click(await ready(pilot, "#act-rearm"))
+        await click(pilot, await ready(pilot, "#act-rearm"))
         await until(pilot, lambda: any("isolation mode" in n for n in notes))
 
     assert rearms == []  # the escalation is NOT consumed
@@ -6469,7 +6895,7 @@ async def test_escalation_rearm_warns_when_restore_recorded(project_tree, monkey
     async with app.run_test() as pilot:
         await _open_review(app, pilot, EscalationModal)
         assert app.screen._restore_recorded is True  # the modal shows the warning hint
-        await pilot.click(await ready(pilot, "#act-rearm"))
+        await click(pilot, await ready(pilot, "#act-rearm"))
         await until(pilot, lambda: rearms == ["1"] and calls == ["20260611-100000-aaaa"])
     assert any("NOT honored" in n for n in notes)  # the drop was surfaced, not silent
 
@@ -6527,7 +6953,7 @@ async def test_escalation_rearm_surfaces_a_failed_baseline_advance(project_tree,
     app = BmadLoopApp(project_tree.project)
     async with app.run_test() as pilot:
         await _open_review(app, pilot, EscalationModal)
-        await pilot.click(await ready(pilot, "#act-rearm"))
+        await click(pilot, await ready(pilot, "#act-rearm"))
         await until(pilot, lambda: calls == ["20260611-100000-aaaa"])
     assert any("could not advance the re-drive baseline" in n for n in notes)
     assert any("re-armed 1" in n for n in notes)  # the ordinary notice still fires
@@ -6591,7 +7017,7 @@ async def test_escalation_rearm_aims_the_code_root_before_it_rearms(project_tree
     app = BmadLoopApp(project_tree.project)
     async with app.run_test() as pilot:
         await _open_review(app, pilot, EscalationModal)
-        await pilot.click(await ready(pilot, "#act-rearm"))
+        await click(pilot, await ready(pilot, "#act-rearm"))
         await until(pilot, lambda: calls == ["20260611-100000-aaaa"])
 
     assert seen == [moved.resolve()]
@@ -7057,7 +7483,7 @@ async def test_escalation_rearm_refuses_the_isolation_conflict_before_it_mutates
     app = BmadLoopApp(project.project)
     async with app.run_test() as pilot:
         await _open_review(app, pilot, EscalationModal)
-        await pilot.click(await ready(pilot, "#act-rearm"))
+        await click(pilot, await ready(pilot, "#act-rearm"))
         await until(pilot, lambda: expected in notes)
 
     assert not calls  # the resume folded into this gesture never fired
@@ -7217,7 +7643,7 @@ async def test_escalation_rearm_surfaces_the_kinds_it_used_to_drop(project, monk
     app = BmadLoopApp(project.project)
     async with app.run_test() as pilot:
         await _open_review(app, pilot, EscalationModal)
-        await pilot.click(await ready(pilot, "#act-rearm"))
+        await click(pilot, await ready(pilot, "#act-rearm"))
         await until(pilot, lambda: calls == ["20260611-100000-aaaa"])
 
     def severity_of(fragment: str) -> str:
@@ -7332,7 +7758,7 @@ async def test_escalation_rearm_holds_the_resume_it_folds_in(project, monkeypatc
     app = BmadLoopApp(project.project)
     async with app.run_test() as pilot:
         await _open_review(app, pilot, EscalationModal)
-        await pilot.click(await ready(pilot, "#act-rearm"))
+        await click(pilot, await ready(pilot, "#act-rearm"))
         await until(pilot, lambda: any("not resuming" in n for n in notes))
 
     assert calls == []  # the resume this gesture folds in did NOT fire
@@ -7412,7 +7838,7 @@ async def test_escalation_rearm_hold_names_the_holding_record_s_own_remedy(
     app = BmadLoopApp(project.project)
     async with app.run_test() as pilot:
         await _open_review(app, pilot, EscalationModal)
-        await pilot.click(await ready(pilot, "#act-rearm"))
+        await click(pilot, await ready(pilot, "#act-rearm"))
         await until(pilot, lambda: any("not resuming" in n for n in notes))
 
     assert calls == []  # this arm holds, so the folded-in resume did NOT fire
@@ -7461,7 +7887,7 @@ async def test_escalation_rearm_holds_without_a_renderable_notice(project_tree, 
     app = BmadLoopApp(project_tree.project)
     async with app.run_test() as pilot:
         await _open_review(app, pilot, EscalationModal)
-        await pilot.click(await ready(pilot, "#act-rearm"))
+        await click(pilot, await ready(pilot, "#act-rearm"))
         await until(pilot, lambda: any("not resuming" in note for note in notes))
 
     assert calls == []
@@ -7521,7 +7947,7 @@ async def test_escalation_rearm_echoes_residue_when_the_rearm_aborts(project, mo
     app = BmadLoopApp(project.project)
     async with app.run_test() as pilot:
         await _open_review(app, pilot, EscalationModal)
-        await pilot.click(await ready(pilot, "#act-rearm"))
+        await click(pilot, await ready(pilot, "#act-rearm"))
         await until(pilot, lambda: any("re-arm failed" in n for n in notes))
     # the abort is reported AND the residue it already wrote is surfaced
     assert any("commit(s) sit below" in n for n in notes), notes
@@ -7590,7 +8016,7 @@ async def test_escalation_rearm_survives_a_corrupt_journal(project_tree, monkeyp
     app = BmadLoopApp(project_tree.project)
     async with app.run_test() as pilot:
         await _open_review(app, pilot, EscalationModal)
-        await pilot.click(await ready(pilot, "#act-rearm"))
+        await click(pilot, await ready(pilot, "#act-rearm"))
         await until(pilot, lambda: any("not resuming" in n for n in notes))
     # the re-arm ran, its outcome rendered, and the authoritative hold stopped resume
     assert any("re-armed 1" in n for n in notes)
@@ -7635,7 +8061,7 @@ async def test_gate_pause_resume(project_tree, monkeypatch):
     app = BmadLoopApp(project_tree.project)
     async with app.run_test() as pilot:
         await _open_review(app, pilot, SpecReviewModal)
-        await pilot.click(await ready(pilot, "#act-resume"))
+        await click(pilot, await ready(pilot, "#act-resume"))
         await until(pilot, lambda: calls == ["20260611-100000-aaaa"])
 
 
@@ -7707,7 +8133,7 @@ async def test_story_gate_pause_shows_reason_and_resumes(
         body = render(app.screen.query_one("#reason Static", Static).content)
         assert "gated by unlanded deferred work" in body
         assert "DW-1" in body, "the reason names the blocking entry, not a blank pane"
-        await pilot.click(await ready(pilot, "#act-resume"))
+        await click(pilot, await ready(pilot, "#act-resume"))
         await until(pilot, lambda: calls == ["20260611-100000-aaaa"])
 
 
@@ -8412,7 +8838,7 @@ async def test_decision_modal_survives_lock_and_state_root_failures(project, mon
         await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
         await pilot.press("d")
         await until(pilot, lambda: isinstance(app.screen, DecisionModal))
-        await pilot.click(await ready(pilot, "#opt-1"))
+        await click(pilot, await ready(pilot, "#opt-1"))
 
         # OSError: toast, no crash.
         await until(pilot, lambda: any("failed to record DW-1" in m for m in notifications(app)))
@@ -8421,13 +8847,13 @@ async def test_decision_modal_survives_lock_and_state_root_failures(project, mon
             pilot,
             lambda: isinstance(app.screen, DecisionModal) and app.screen._decision.id == "DW-2",
         )
-        await pilot.click(await ready(pilot, "#opt-1"))
+        await click(pilot, await ready(pilot, "#opt-1"))
 
         # StateRootError: same degradation, and it is not an OSError.
         await until(pilot, lambda: any("failed to record DW-2" in m for m in notifications(app)))
         await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
 
-        toasts = [n for n in app._notifications if "failed to record" in n.message]
+        toasts = [n for n in emitted(app) if "failed to record" in n.message]
         assert len(toasts) == 2
         assert {n.severity for n in toasts} == {"error"}
         assert "Resource deadlock avoided" in toasts[0].message
@@ -8474,10 +8900,10 @@ async def test_decision_modal_survives_a_ledger_corrupted_while_it_is_open(proje
         # The human is looking at the modal; the ledger goes bad underneath them.
         corrupted = b"# Deferred Work\n\n### DW-1: bad \xff byte\n\nstatus: open\n"
         project.deferred_work.write_bytes(corrupted)
-        await pilot.click(await ready(pilot, "#opt-1"))
+        await click(pilot, await ready(pilot, "#opt-1"))
 
         await until(pilot, lambda: any("failed to record DW-1" in m for m in notifications(app)))
-        toasts = [n for n in app._notifications if "failed to record" in n.message]
+        toasts = [n for n in emitted(app) if "failed to record" in n.message]
         assert toasts and toasts[0].severity == "error"
         assert "not valid UTF-8" in toasts[0].message
         # The walk carried on rather than ending on the failure...
@@ -8513,12 +8939,12 @@ async def test_decision_modal_counts_the_answers_the_ledger_did_take(project):
         await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
         await pilot.press("d")
         await until(pilot, lambda: isinstance(app.screen, DecisionModal))
-        await pilot.click(await ready(pilot, "#opt-1"))
+        await click(pilot, await ready(pilot, "#opt-1"))
         await until(
             pilot,
             lambda: isinstance(app.screen, DecisionModal) and app.screen._decision.id == "DW-2",
         )
-        await pilot.click(await ready(pilot, "#opt-1"))
+        await click(pilot, await ready(pilot, "#opt-1"))
         await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
 
         await until(pilot, lambda: any("recorded 2 decision(s)" in m for m in notifications(app)))
@@ -8595,7 +9021,7 @@ async def test_decision_modal_toasts_a_ledger_that_took_no_decision_line(
                 "### DW-9: unrelated\n\norigin: t\nlocation: c.py:1\nreason: t.\nstatus: open\n",
                 encoding="utf-8",
             )
-        await pilot.click(await ready(pilot, "#opt-1"))
+        await click(pilot, await ready(pilot, "#opt-1"))
 
         await until(
             pilot,
@@ -8606,14 +9032,14 @@ async def test_decision_modal_toasts_a_ledger_that_took_no_decision_line(
             pilot,
             lambda: isinstance(app.screen, DecisionModal) and app.screen._decision.id == "DW-2",
         )
-        await pilot.click(await ready(pilot, "#opt-1"))
+        await click(pilot, await ready(pilot, "#opt-1"))
         await until(
             pilot,
             lambda: any("DW-2: no decision line was written" in m for m in notifications(app)),
         )
         await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
 
-        toasts = [n for n in app._notifications if "no decision line was written" in n.message]
+        toasts = [n for n in emitted(app) if "no decision line was written" in n.message]
         assert len(toasts) == 2
         assert {n.severity for n in toasts} == {"warning"}
         # Ablation: make the saved-answer suffix unconditional in _record_decision;
@@ -8691,7 +9117,7 @@ async def test_decision_modal_toast_carries_both_a_non_write_and_a_refusal(
             "### DW-9: unrelated\n\norigin: t\nlocation: c.py:1\nreason: t.\nstatus: open\n",
             encoding="utf-8",
         )
-        await pilot.click(await ready(pilot, "#opt-1"))
+        await click(pilot, await ready(pilot, "#opt-1"))
         await until(
             pilot,
             lambda: any("DW-1: no decision line was written" in m for m in notifications(app)),
@@ -8700,10 +9126,10 @@ async def test_decision_modal_toast_carries_both_a_non_write_and_a_refusal(
             pilot,
             lambda: isinstance(app.screen, DecisionModal) and app.screen._decision.id == "DW-2",
         )
-        await pilot.click(await ready(pilot, "#opt-1"))
+        await click(pilot, await ready(pilot, "#opt-1"))
         await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
 
-        toasts = [n for n in app._notifications if "DW-1" in n.message]
+        toasts = [n for n in emitted(app) if "DW-1" in n.message]
         assert len(toasts) == 1  # ONE toast, not the non-write one plus a second
         [toast] = toasts
         assert toast.severity == "warning"
@@ -8765,7 +9191,7 @@ async def test_decision_modal_toasts_an_answer_it_could_not_publish(
         await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
         await pilot.press("d")
         await until(pilot, lambda: isinstance(app.screen, DecisionModal))
-        await pilot.click(await ready(pilot, "#opt-1"))
+        await click(pilot, await ready(pilot, "#opt-1"))
         await until(
             pilot,
             lambda: any("DW-1: not committed to git" in m for m in notifications(app)),
@@ -8774,7 +9200,7 @@ async def test_decision_modal_toasts_an_answer_it_could_not_publish(
             pilot,
             lambda: isinstance(app.screen, DecisionModal) and app.screen._decision.id == "DW-2",
         )
-        await pilot.click(await ready(pilot, "#opt-1"))
+        await click(pilot, await ready(pilot, "#opt-1"))
         # Wait for DW-2's toast as the sibling no-decision-line row waits for its
         # own, not merely for the dashboard: `Screen.dismiss` swaps `app.screen`
         # and hands the result callback to `call_next`, so the modal is gone one
@@ -8786,7 +9212,7 @@ async def test_decision_modal_toasts_an_answer_it_could_not_publish(
         )
         await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
 
-        toasts = [n for n in app._notifications if "not committed to git" in n.message]
+        toasts = [n for n in emitted(app) if "not committed to git" in n.message]
         assert len(toasts) == 2
         assert {n.severity for n in toasts} == {"warning"}
         assert all(f"deferred-work.md ({detail})" in n.message for n in toasts)
@@ -8843,7 +9269,7 @@ async def test_decision_modal_toasts_an_answer_git_could_not_commit(project, mon
         await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
         await pilot.press("d")
         await until(pilot, lambda: isinstance(app.screen, DecisionModal))
-        await pilot.click(await ready(pilot, "#opt-1"))
+        await click(pilot, await ready(pilot, "#opt-1"))
         await until(
             pilot,
             lambda: any("DW-1: not committed to git" in m for m in notifications(app)),
@@ -8852,7 +9278,7 @@ async def test_decision_modal_toasts_an_answer_git_could_not_commit(project, mon
             pilot,
             lambda: isinstance(app.screen, DecisionModal) and app.screen._decision.id == "DW-2",
         )
-        await pilot.click(await ready(pilot, "#opt-1"))
+        await click(pilot, await ready(pilot, "#opt-1"))
         # DW-2's toast, not merely the dashboard: see the sibling row above for
         # the `dismiss`/`call_next` window the Windows runners hit.
         await until(
@@ -8861,7 +9287,7 @@ async def test_decision_modal_toasts_an_answer_git_could_not_commit(project, mon
         )
         await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
 
-        toasts = [n for n in app._notifications if "not committed to git" in n.message]
+        toasts = [n for n in emitted(app) if "not committed to git" in n.message]
         assert len(toasts) == 2
         assert {n.severity for n in toasts} == {"warning"}
         assert all(
@@ -8905,7 +9331,7 @@ async def test_decision_walk_counts_only_the_answer_the_ledger_took(project):
             pilot,
             lambda: isinstance(app.screen, DecisionModal) and app.screen._decision.id == "DW-1",
         )
-        await pilot.click(await ready(pilot, "#opt-1"))
+        await click(pilot, await ready(pilot, "#opt-1"))
 
         # ...then a rival writer retires DW-2 while its modal is up: this one must not.
         await until(
@@ -8918,7 +9344,7 @@ async def test_decision_walk_counts_only_the_answer_the_ledger_took(project):
             "status: open\n\ndecision: 2026-06-13 Widen — widen it\n",
             encoding="utf-8",
         )
-        await pilot.click(await ready(pilot, "#opt-1"))
+        await click(pilot, await ready(pilot, "#opt-1"))
 
         await until(
             pilot,
