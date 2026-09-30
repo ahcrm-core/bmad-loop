@@ -744,6 +744,49 @@ def test_wrapper_stops_the_tree_when_post_spawn_bookkeeping_raises(tmp_path, mon
     assert _json(tmp_path / "m" / perf_report.RUNNER)["state"] == "running"
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX signal-to-self")
+def test_wrapper_writes_the_exit_record_through_a_late_cancel(tmp_path, monkeypatch):
+    """A cancel landing after pytest exited, while the wrapper writes its
+    terminal record, must not abort that write: the record closes as
+    ``exited`` and the caller's handler is back once ``main`` returns.
+
+    Ablation: write the record after the handlers are restored and the caller's
+    handler raises out of ``main`` with the record at ``running``."""
+
+    class LateCancel(Exception):
+        pass
+
+    def caller_handler(signum, frame):
+        raise LateCancel(signum)
+
+    class Spawned:
+        pid = 424246
+        returncode = 0
+
+        def wait(self, timeout=None):
+            return self.returncode
+
+    real_write = run_test_benchmark._write_runner
+
+    def write_runner(root, record):
+        if record["state"] == "exited":
+            os.kill(os.getpid(), signal.SIGTERM)
+        real_write(root, record)
+
+    monkeypatch.setattr(run_test_benchmark.subprocess, "Popen", lambda *a, **k: Spawned())
+    monkeypatch.setattr(run_test_benchmark, "_write_runner", write_runner)
+    previous = signal.signal(signal.SIGTERM, caller_handler)
+    try:
+        rc = run_test_benchmark.main(["--metrics-dir", str(tmp_path / "m"), "--", "-q"])
+        assert signal.getsignal(signal.SIGTERM) is caller_handler
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+
+    assert rc == 0
+    runner = _json(tmp_path / "m" / perf_report.RUNNER)
+    assert (runner["state"], runner["exit_code"]) == ("exited", 0)
+
+
 def test_wrapper_wait_counts_setup_time_against_the_deadline(tmp_path, monkeypatch):
     """The deadline is one fixed instant from the wrapper's start: time spent
     before the wait (here a slow ``child_pid`` record write) comes out of the

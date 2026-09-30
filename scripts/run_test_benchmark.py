@@ -459,6 +459,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                 None if deadline_mono is None else max(0.0, deadline_mono - time.monotonic())
             )
             returncode = proc.wait(timeout=remaining)
+            # pytest is done. Hold signals until the terminal record is written:
+            # the ``finally`` below still has the raising handler installed while
+            # it closes the job, and restores the caller's before this record
+            # would otherwise be written, so a late cancel would escape ``main``
+            # with the record at ``running``. One that lands before the hold is
+            # still caught below.
+            _hold_signals_for_cleanup()
+            finish("exited", returncode)
         except subprocess.TimeoutExpired:
             _hold_signals_for_cleanup()
             sys.stderr.write(
@@ -497,7 +505,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         for sig, handler in previous.items():
             signal.signal(sig, handler)
 
-    finish("exited", returncode)
     _summarize(root)
     if returncode < 0:
         return 128 - returncode
