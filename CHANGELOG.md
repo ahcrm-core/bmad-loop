@@ -78,6 +78,11 @@ breaking changes may land in a minor release.
   invalid YAML, and any anchored value (`value-is-anchored`), aliased or not. A quoted value
   with a glued comment (`'backlog'#c`) is now refused (`unreadable-value`) rather than
   rewritten (DW-514, DW-516).
+- Advance the sprint-status row the reader reads, matched by its parsed key rather than
+  its text (`advance`'s epic lift now lifts a lone `epic-01` row as epic 1). Refuse two distinct keys that
+  read as one (`"2001-01-04"` and the date `2001-01-04`; `epic-1` and `epic-01`) as
+  `key-ambiguous`, publishing nothing, instead of rewriting a row the reader ignores or
+  regressing a `done` epic (DW-515).
 
 ## [0.13.0] — 2026-09-28
 

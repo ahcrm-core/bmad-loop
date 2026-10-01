@@ -33,7 +33,11 @@ decided to move and cannot rewrite raises :class:`SprintStatusWriteRefused`
 (board, row, current, target, a stable reason) and publishes nothing, rather than
 echoing the unchanged status a caller would read as "the session never got there".
 An absent row, a missing board, and a row already at or past target still answer
-by return value.
+by return value. The writer finds a row by the key :func:`load` reads, not by its
+text (DW-515): ``str()`` of the constructed key, with epic numbers as ints, so
+``epic-01`` is epic 1. Two distinct keys that read as one
+(``"2001-01-04"`` and the date ``2001-01-04``, or ``epic-1`` and ``epic-01``) are
+refused as ``key-ambiguous``, the epic lift included.
 
 Retro action items (DW-388): ``bmad-retrospective`` appends the items a retro
 commits to a top-level ``action_items:`` list, each with a stable ``id`` and a
@@ -112,6 +116,7 @@ RefusalReason = Literal[
     "multiline-value",  # runs past the key line in a shape the collapse cannot read
     "unreadable-value",  # one line, but the text around the value span is not gap + comment
     "row-not-in-mapping",  # the reader resolves the key only through a `<<` merge
+    "key-ambiguous",  # two or more distinct keys read as this one key (DW-515)
 ]
 
 _REFUSAL_TEXT: dict[RefusalReason, str] = {
@@ -123,11 +128,13 @@ _REFUSAL_TEXT: dict[RefusalReason, str] = {
     "multiline-value": "its value runs past the key line in a shape the writer cannot collapse",
     "unreadable-value": "the text after its key is not a value the writer can read whole",
     "row-not-in-mapping": "development_status reaches it only through a `<<` merge",
+    "key-ambiguous": "two or more rows of development_status read as this one key",
 }
 
 
 class SprintStatusWriteRefused(SprintStatusError):
-    """An existing story row had to move, and the line-edit writer would not rewrite it.
+    """An existing story row had to move, and the line-edit writer would not rewrite it
+    (or its epic lift hit ``key-ambiguous``; ``story_key`` is then ``epic-N``).
 
     Raised by :func:`advance` (and :func:`advanced_bytes`) only after the locked,
     authoritative read found the row and the call's own decision was to write it
@@ -139,7 +146,14 @@ class SprintStatusWriteRefused(SprintStatusError):
     ``path`` is the board, or None when the refusal came from
     :func:`advanced_bytes`, which works on bytes and never names a file.
     ``current`` is the row's status as :func:`story_status` reads it; ``reason``
-    is a stable :data:`RefusalReason` token."""
+    is a stable :data:`RefusalReason` token.
+
+    The epic lift raises it too, for ``key-ambiguous`` only (DW-515): two distinct
+    keys reading as the story's epic (``epic-1`` and ``epic-01``) leave no row the
+    lift could edit that is certainly the one :func:`load` reports. ``story_key`` is
+    then the epic's canonical key ``epic-N`` and ``current`` its status as
+    :func:`load` reads it; the story row is not written either. Every other epic
+    refusal stays best effort and raises nothing."""
 
     path: Path | None
     story_key: str
@@ -161,11 +175,19 @@ class SprintStatusWriteRefused(SprintStatusError):
         self.target = target
         self.reason = reason
         board = str(path) if path is not None else "the sprint-status board"
+        if reason == "key-ambiguous":
+            repair = (
+                f"keep exactly one row reading as `{story_key}` (delete or rename the"
+                " others), then retry."
+            )
+        else:
+            repair = (
+                f"rewrite the row as a plain one-line `{story_key}: <status>` entry, then retry."
+            )
         super().__init__(
             f"sprint status row {story_key!r} in {board} is {current!r} and could not be"
             f" rewritten to {target!r}: {_REFUSAL_TEXT[reason]} ({reason}). The board was"
-            f" left unchanged; rewrite the row as a plain one-line `{story_key}: <status>`"
-            " entry, then retry."
+            f" left unchanged; {repair}"
         )
 
 
@@ -445,6 +467,8 @@ class _RowSpan:
     value_end_col: int
     style: str | None  # PyYAML's ScalarNode.style: None for plain
     value: str
+    # the key node's parsed text; equal to the source for the plain keys the editor accepts
+    key_text: str
 
 
 def _locate_row(lines: list[str], key: str, scope: _Scope) -> _RowSpan | RefusalReason | None:
@@ -456,9 +480,19 @@ def _locate_row(lines: list[str], key: str, scope: _Scope) -> _RowSpan | Refusal
     document's top-level mapping; ``development_status`` is the mapping under
     that key. Text that merely looks like the row (inside a block scalar, under
     another mapping) is never a node of the right mapping, so it cannot be
-    selected. A duplicate key resolves last-wins in both mappings, as the
+    selected.
+
+    The row is matched by the key :func:`load` READS, not by its node text
+    (DW-515): :func:`_resolve_entry` constructs every key of the merge-flattened
+    mapping and compares :func:`_key_identity` — so ``epic-01`` answers for
+    ``epic-1`` — and the editor then rewrites the row under its own key text
+    (``key_text``). Entries constructing to one key resolve last-wins, as the
     constructor's dict assignment does, so the row found here is the row
-    :func:`story_status` read.
+    :func:`story_status` read. Two or more DISTINCT constructed keys sharing the
+    identity (``"2001-01-04"`` and the date ``2001-01-04``; ``epic-1`` and
+    ``epic-01``) leave the reader's answer to iteration order, and come back as
+    ``"key-ambiguous"``. The ``development_status`` section itself is still found
+    by its last ``development_status`` node.
 
     Returns None when the mapping has no such entry: the key is absent or only
     reachable through a ``<<`` merge. An entry whose value is a collection, an
@@ -468,9 +502,9 @@ def _locate_row(lines: list[str], key: str, scope: _Scope) -> _RowSpan | Refusal
     share lines with values), IS the row, so it comes back as the
     :data:`RefusalReason` the writer must decline it with rather than as None —
     "not here" and "here, but not editable" are different answers. Raises
-    :class:`SprintStatusError` when the lines do not parse — the caller parsed
-    this board before editing it, so that can only be an edit gone wrong, and it
-    must not be published."""
+    :class:`SprintStatusError` when the lines do not parse, or a key does not
+    construct — the caller parsed this board before editing it, so that can only
+    be an edit gone wrong, and it must not be published."""
     text = "".join(lines)
     try:
         root = yaml.compose(text, Loader=yaml.SafeLoader)
@@ -480,9 +514,11 @@ def _locate_row(lines: list[str], key: str, scope: _Scope) -> _RowSpan | Refusal
     if scope == "development_status":
         section = _last_entry(root, "development_status")
         mapping = section[1] if section else None
-    entry = _last_entry(mapping, key)
+    entry = _resolve_entry(mapping, key, scope)
     if entry is None:
         return None
+    if isinstance(entry, str):  # "key-ambiguous"
+        return entry
     if any(isinstance(m, yaml.MappingNode) and m.flow_style for m in (root, mapping)):
         return "mapping-is-flow"
     key_node, value_node = entry
@@ -518,7 +554,68 @@ def _locate_row(lines: list[str], key: str, scope: _Scope) -> _RowSpan | Refusal
         value_end_col=end_col,
         style=value_node.style,
         value=value_node.value,
+        key_text=key_node.value,
     )
+
+
+# How :func:`load` tells one key from another: ``("epic", n)`` for an epic row,
+# which it files by number, ``("key", text)`` for every other row the writer edits.
+_KeyIdentity = tuple[str, str | int]
+
+
+def _key_identity(key: object, scope: _Scope) -> _KeyIdentity:
+    """The identity :func:`load` gives a ``development_status`` key, or the root.
+
+    ``str()`` of the constructed key, then — under ``development_status`` only —
+    an epic key collapses to its int number, as :func:`load` files it in
+    ``epics``. The root (``last_updated``) is read by ``str()`` alone."""
+    text = str(key)
+    if scope == "development_status" and (m := EPIC_RE.match(text)):
+        return ("epic", int(m.group(1)))
+    return ("key", text)
+
+
+def _resolve_entry(
+    mapping: object, key: str, scope: _Scope
+) -> tuple[yaml.Node, yaml.Node] | Literal["key-ambiguous"] | None:
+    """The ``(key, value)`` node pair of ``mapping``'s entry the reader reads as ``key``.
+
+    Mirrors the constructor (DW-515): merges are flattened first (merged entries
+    before the mapping's own, as ``construct_mapping`` does), every scalar key is
+    constructed, and the entries are collected into a dict keyed by the
+    constructed value — so entries constructing to one key resolve last-wins,
+    exactly as the reader's dict does, and the dict keeps the first key object it
+    saw. Of those, the ones whose :func:`_key_identity` is ``key``'s are the
+    candidates. More than one distinct candidate is ``"key-ambiguous"``: the
+    reader's answer then rests on iteration order (:func:`load`'s ``epics`` keeps
+    the last, :func:`story_status` the first), and no single row is certainly it.
+    None when there is no candidate, or the one candidate came from a ``<<``
+    merge — the mapping holds no entry of its own to edit.
+
+    ``mapping`` is mutated by the flattening; the caller composed it for this one
+    lookup. A merge or key the constructor refuses raises
+    :class:`SprintStatusError`."""
+    if not isinstance(mapping, yaml.MappingNode):
+        return None
+    own = {id(entry) for entry in mapping.value}
+    constructor = yaml.constructor.SafeConstructor()
+    entries: dict[object, tuple[yaml.Node, yaml.Node]] = {}
+    try:
+        constructor.flatten_mapping(mapping)
+        for entry in mapping.value:
+            key_node = entry[0]
+            if not isinstance(key_node, yaml.ScalarNode):
+                continue  # a collection key is unhashable: load() could not have read it
+            entries[constructor.construct_object(key_node, deep=True)] = entry
+    except yaml.YAMLError as e:
+        raise SprintStatusError(f"sprint status key could not be read: {e}") from e
+    target = _key_identity(key, scope)
+    found = [e for k, e in entries.items() if _key_identity(k, scope) == target]
+    if len(found) > 1:
+        return "key-ambiguous"
+    if not found or id(found[0]) not in own:
+        return None
+    return found[0]
 
 
 def _last_entry(mapping: object, key: str) -> tuple[yaml.Node, yaml.Node] | None:
@@ -555,6 +652,9 @@ def _set_mapping_value(lines: list[str], key: str, new_value: str, *, scope: _Sc
     at the root). A textual scan would take the first line that merely looks like
     the row — inside an earlier block scalar, under another mapping, or a
     duplicate the parser overrides — and rewrite it while the real row stays put.
+    ``key`` names the row by the key the reader reads (DW-515), so ``epic-1``
+    finds an ``epic-01:`` row, and the edit keeps that row's own key text. Two
+    distinct keys reading as ``key`` refuse as ``key-ambiguous``.
 
     A one-line value is edited as a SPLICE of exactly its source span (DW-514,
     DW-516): the parser has already proved where the scalar starts and ends on
@@ -605,7 +705,7 @@ def _set_mapping_value(lines: list[str], key: str, new_value: str, *, scope: _Sc
         return _Refused(row)
     line = lines[row.key_line]
     stripped = line.rstrip("\r\n")
-    km = re.match(rf"^(?P<indent>\s*){re.escape(key)}:", stripped)
+    km = re.match(rf"^(?P<indent>\s*){re.escape(row.key_text)}:", stripped)
     if km is None or len(km.group("indent")) != row.key_col:
         return _Refused("key-not-plain")
     indent, remainder = km.group("indent"), stripped[km.end() :]
@@ -616,7 +716,9 @@ def _set_mapping_value(lines: list[str], key: str, new_value: str, *, scope: _Sc
             return "equal"  # already at target — idempotent no-op
         last = lines[row.value_last_line]
         nl = last[len(last.rstrip("\r\n")) :]
-        lines[row.key_line : row.value_last_line + 1] = [f"{indent}{key}: {new_value}" + nl]
+        lines[row.key_line : row.value_last_line + 1] = [
+            f"{indent}{row.key_text}: {new_value}" + nl
+        ]
         return "changed"
     if row.value_last_line != row.key_line:
         # the value runs onto later lines — a one-line edit would orphan them
@@ -872,7 +974,13 @@ def _advance_locked(
     ``<<`` merge no entry of ``development_status`` holds. It raises before the
     epic lift and ``last_updated`` are touched and before the write, so a refused
     call publishes nothing. :func:`advance`'s pre-lock probe cannot reach it: the
-    probe only ever answers "nothing to write", and swallows whatever it meets."""
+    probe only ever answers "nothing to write", and swallows whatever it meets.
+
+    The epic lift is best effort, save one answer: an epic edit refused as
+    ``key-ambiguous`` (DW-515) raises :class:`SprintStatusWriteRefused` for the
+    epic's canonical key, before the write, so the story row is not published
+    either — lifting whichever row the writer picked could regress the one the
+    reader does not report."""
     if not path.is_file():
         return None
     current = story_status(path, story_key)
@@ -905,9 +1013,17 @@ def _advance_locked(
         if m:
             epic_key = f"epic-{int(m.group(1))}"
             ss = load(path)
-            if ss.epics.get(int(m.group(1))) == "backlog":
-                # best effort, as before: an epic row the writer declines stays put
-                _set_mapping_value(lines, epic_key, "in-progress", scope="development_status")
+            epic_status = ss.epics.get(int(m.group(1)))
+            if epic_status == "backlog":
+                # best effort, as before: an epic row the writer declines stays put —
+                # unless two rows read as this epic, which nothing could lift safely
+                epic_edit = _set_mapping_value(
+                    lines, epic_key, "in-progress", scope="development_status"
+                )
+                if epic_edit == _Refused("key-ambiguous"):
+                    raise SprintStatusWriteRefused(
+                        path, epic_key, epic_status, "in-progress", "key-ambiguous"
+                    )
 
     if now is not None:
         _set_mapping_value(lines, "last_updated", now, scope="root")  # best effort, likewise
@@ -942,7 +1058,8 @@ def advanced_bytes(source: bytes, story_key: str, target: str) -> bytes | None:
     ``advance`` writes nothing for it, so ``source`` byte-identical IS this run's
     advance, and a caller is right to accept an untouched board.
 
-    A row below ``target`` whose line ``_set_mapping_value`` will not rewrite is not
+    A row below ``target`` whose line ``_set_mapping_value`` will not rewrite (or
+    whose epic lift is ``key-ambiguous``, ``story_key`` then ``epic-N``) is not
     that case, and raises :class:`SprintStatusWriteRefused` (with ``path`` None — the
     shadow is no board anyone can repair). ``advance`` raises there too, so no board
     on disk holds that advance; returning ``source`` would let a caller match an
