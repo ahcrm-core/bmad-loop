@@ -956,12 +956,14 @@ class Engine:
         # so a gate that fails before reaching its commands publishes "no pass
         # ran", never a previous gate's records.
         self._review_verify_records: VerifyCommandRecords = NO_VERIFY_COMMANDS
-        # Whether `[environment] probes` passed since the last session launch
-        # (DW-523). Transient on purpose — never persisted: a resumed process
-        # has not probed anything yet. Set by `_run_environment_probes` on a
-        # healthy pass, reset at the top of every `_run_session`, because a
-        # session may have changed the environment the pass vouched for.
-        self._env_probes_fresh = False
+        # The workspace root `[environment] probes` last passed in since the last
+        # session launch (DW-523), or None. Transient on purpose — never
+        # persisted: a resumed process has not probed anything yet. Set by
+        # `_run_environment_probes` on a healthy pass, reset at the top of every
+        # `_run_session`, because a session may have changed the environment the
+        # pass vouched for. A root, not a flag: probes may be cwd-sensitive, so a
+        # pass in one worktree vouches for nothing in another.
+        self._env_probes_fresh_root: Path | None = None
         # Per-unit worktree isolation + integration flow (issue #244 F-3/F-9a).
         # Built from narrow deps + engine callbacks; the same-name Engine._* worktree
         # methods below delegate to it. `emit` is late-bound (a lambda, not the bound
@@ -6231,27 +6233,30 @@ class Engine:
             results=results, stage=verification_stage, sequence=sequence
         )
 
-    def _run_environment_probes(self, task: StoryTask, *, site: str) -> verify.ProbeOutcome:
-        """Run ``[environment] probes`` in the workspace root (where the verify
-        commands run) and record the result: a failed pass journals
-        ``env-probe-failed`` naming the ``site`` that asked; a healthy one marks
-        the probes fresh until the next session launch. An interrupted pass
-        stops the run (DW-353) before anything decides on it."""
-        probe = verify.run_environment_probes(self.policy, self.workspace.root)
-        self._observe_environment_probes(task, probe, site=site)
+    def _run_environment_probes(
+        self, task: StoryTask, *, site: str, root: Path | None = None
+    ) -> verify.ProbeOutcome:
+        """Run ``[environment] probes`` in ``root`` — by default the workspace root,
+        where the verify commands run — and record the result: a failed pass
+        journals ``env-probe-failed`` naming the ``site`` that asked; a healthy one
+        marks the probes fresh for that root until the next session launch. An
+        interrupted pass stops the run (DW-353) before anything decides on it."""
+        where = self.workspace.root if root is None else root
+        probe = verify.run_environment_probes(self.policy, where)
+        self._observe_environment_probes(task, probe, site=site, root=where)
         return probe
 
     def _observe_environment_probes(
-        self, task: StoryTask, probe: verify.ProbeOutcome, *, site: str
+        self, task: StoryTask, probe: verify.ProbeOutcome, *, site: str, root: Path
     ) -> None:
         """The record-and-stop half of :meth:`_run_environment_probes`, shared
         with the review gates' :meth:`_review_probe_sink` (whose pass core runs)."""
         self._stop_if_verify_interrupted(probe.results)
         failed = probe.failed
         if failed is None:
-            self._env_probes_fresh = True
+            self._env_probes_fresh_root = root
             return
-        self._env_probes_fresh = False
+        self._env_probes_fresh_root = None
         # Two literal writes rather than a conditional `**` splat, so the journal
         # field guard reads every name; `spawn_error` appears only when set.
         if failed.spawn_error is None:
@@ -6283,9 +6288,11 @@ class Engine:
         no session started, no attempt or cycle was charged, and the tree is the
         one the pause found. Skipped when no probes are configured (the default —
         nothing spawns or journals) and when a probe pass already ran since the
-        last session launch (``_env_probes_fresh``): a retry or fix dispatch
-        follows the failure-decision seam, which probed before charging it."""
-        if not self.policy.environment.probes or self._env_probes_fresh:
+        last session launch (``_env_probes_fresh_root``): a retry or fix dispatch
+        follows the failure-decision seam, which probed before charging it. Fresh
+        means fresh for THIS workspace root: a pass in another story's worktree
+        (or in main) does not vouch for a cwd-sensitive probe here."""
+        if not self.policy.environment.probes or self._env_probes_fresh_root == self.workspace.root:
             return
         site = f"{ENV_FAULT_SITE_DISPATCH_PREFIX}{role}"
         probe = self._run_environment_probes(task, site=site)
@@ -6322,7 +6329,11 @@ class Engine:
         """Consume a dispatch-site environment pause on resume (DW-523).
 
         Returns None unless ``task`` paused at a ``probe:dispatch:<role>`` site.
-        Then the probes re-run in the workspace root: still failing re-pauses at
+        Then the probes re-run where the paused dispatch would have launched — the
+        task's recorded worktree when it has one (resume has not swapped the
+        workspace onto the unit yet, and a probe may be cwd-sensitive), else the
+        workspace root; a missing worktree falls back to the workspace root and is
+        escalated by the unit reopen that follows. Still failing re-pauses at
         the same site with the task unchanged; healthy journals
         ``env-fault-cleared``, clears the site, saves, and returns the role whose
         dispatch the pause withheld — the caller dispatches it without a rollback,
@@ -6330,7 +6341,9 @@ class Engine:
         site = task.env_fault_site
         if site is None or not site.startswith(ENV_FAULT_SITE_DISPATCH_PREFIX):
             return None
-        probe = self._run_environment_probes(task, site=site)
+        mount = Path(task.worktree_path) if task.worktree_path else None
+        root = mount if mount is not None and mount.is_dir() else None
+        probe = self._run_environment_probes(task, site=site, root=root)
         if not probe.ok:
             self._pause_environment(task, site=site, probe=probe)
         self.journal.append("env-fault-cleared", story_key=task.story_key, site=site)
@@ -7526,7 +7539,9 @@ class Engine:
         raises ``RunStopped``, a healthy pass marks the probes fresh."""
 
         def sink(probe: verify.ProbeOutcome) -> None:
-            self._observe_environment_probes(task, probe, site="verify:review")
+            self._observe_environment_probes(
+                task, probe, site="verify:review", root=self.workspace.root
+            )
 
         return sink
 
@@ -7842,7 +7857,7 @@ class Engine:
     ) -> SessionResult:
         # A session may change the environment a probe pass vouched for, so no
         # pass survives a launch (DW-523).
-        self._env_probes_fresh = False
+        self._env_probes_fresh_root = None
         # ``label`` names a non-standard session (a plugin-provided workflow) so
         # its task_id stays distinct from the role's own dev/review attempts.
         task_id = _session_task_id(task.story_key, label if label else role, seq, task.generation)

@@ -14087,7 +14087,7 @@ def test_dispatch_gate_skips_when_probes_fresh(project, tmp_path):
     """A probe pass since the last session launch stands in for the gate: the dev
     dispatch probes (1), the dev verify preflight probes (2) and leaves them fresh,
     so the review dispatch does NOT re-probe; the review verify preflight (3) is
-    the last. Ablation: drop the `_env_probes_fresh` short-circuit in
+    the last. Ablation: drop the `_env_probes_fresh_root` short-circuit in
     `_gate_dispatch` and the review dispatch probes a fourth time."""
     write_sprint(project, {"1-1-a": "ready-for-dev"})
     counter = tmp_path / "probe-count"
@@ -14380,6 +14380,68 @@ def test_isolated_dispatch_pause_reopens_unit(project, tmp_path):
     assert _rows(engine2, "resume-env-dispatch")
     assert not _rows(engine2, "resume-restart")
     assert _rows(engine2, "unit-merged")
+
+
+def test_isolated_dispatch_pause_reprobes_inside_the_unit(project, tmp_path):
+    """Resume re-probes a dispatch pause where the paused session would launch —
+    the kept unit — not in the main checkout the resumed engine starts in: a
+    probe may be cwd-sensitive (`docker compose ps`). Ablation, performed: probe
+    `self.workspace.root` in `_take_env_dispatch_pause` and the first resumed
+    probe runs in the main checkout."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    rig = _env_rig(tmp_path, up=False)
+    cwds = tmp_path / "probe-cwds"
+    probe = _python_cmd(
+        rig.root / "cwd_probe.py",
+        "import os, sys\n"
+        f"open(r'{cwds}', 'a', encoding='utf-8').write(os.getcwd() + '\\n')\n"
+        f"sys.exit(0 if os.path.exists(r'{rig.up}') else 3)\n",
+    )
+    policy = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        environment=EnvironmentPolicy(probes=(probe,)),
+        review=ReviewPolicy(enabled=False),
+        scm=ScmPolicy(isolation="worktree"),
+    )
+    engine, _ = make_engine(project, [], policy=policy)
+    engine.run()
+    unit_path = Path(_dispatch_paused(engine).worktree_path).resolve()
+    probed_before = len(cwds.read_text(encoding="utf-8").splitlines())
+
+    def dev_in_the_unit(spec):
+        return dev_effect(project.rebased(spec.cwd), "1-1-a", followup_review=False)(spec)
+
+    rig.up.write_text("up\n")
+    engine2, _ = resume_engine(project, engine, [dev_in_the_unit])
+    assert engine2.run().done == 1
+
+    resumed = cwds.read_text(encoding="utf-8").splitlines()[probed_before:]
+    assert resumed and Path(resumed[0]).resolve() == unit_path
+    (cleared,) = _rows(engine2, "env-fault-cleared")
+    assert cleared["site"] == "probe:dispatch:dev"
+
+
+def test_dispatch_gate_freshness_is_scoped_to_the_probed_root(project, tmp_path):
+    """A probe pass vouches only for the root it ran in: fresh for another
+    worktree (or main), the gate still probes here and pauses on a failure;
+    fresh for this root, it skips. Ablation, performed: compare against any
+    fresh root (the old engine-global flag) and the first half never pauses."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    rig = _env_rig(tmp_path, up=False)
+    engine, _ = make_engine(project, [], policy=_env_policy(rig))
+    task = StoryTask(story_key="1-1-a", epic=1)
+    engine.state.tasks[task.story_key] = task
+
+    engine._env_probes_fresh_root = tmp_path / "another-unit"
+    with pytest.raises(RunPaused):
+        engine._gate_dispatch(task, "dev")
+    assert task.env_fault_site == "probe:dispatch:dev"
+
+    task.env_fault_site = None
+    engine._env_probes_fresh_root = engine.workspace.root
+    engine._gate_dispatch(task, "dev")  # fresh here: no probe, no pause
+    assert task.env_fault_site is None
 
 
 # ---------------------------- session-transport environment faults (#194) ----
