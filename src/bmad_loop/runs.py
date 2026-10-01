@@ -6129,7 +6129,8 @@ def reverify_refusal(
     * the story is DEFERRED, or ESCALATED at an environment-fault site that left a
       product (`model.env_fault_site_reverifiable`) — any other escalation needs the
       plain re-arm, whose remedy is a spec decision, not a replay;
-    * it has a spec, a completed dev session whose result the replay can read, and
+    * it has a spec, a completed dev session whose result the replay can read and
+      no failed dev or fix session after it, and
       no stories-mode plan review owed;
     * the run is paused (a finished run has no resume to replay on). In place, the
       pause must be the escalation stage naming THIS story, and the story the last
@@ -6172,6 +6173,17 @@ def reverify_refusal(
         return (
             f"story {story_key} has no completed dev session result to re-verify; "
             f"re-arm it with {rearm_hint}"
+        )
+    # The completed record must BE the latest dev-role one (fix sessions included):
+    # a crashed or timed-out session after it left its partial work on the tree,
+    # which the earlier result does not describe. The escalated sites check this in
+    # `env_fault_site_reverifiable`; a DEFERRED story reaches here without it.
+    last_dev = next(s for s in reversed(task.sessions) if s.role == "dev")
+    if last_dev is not latest:
+        return (
+            f"story {story_key}'s latest dev session ({last_dev.task_id}) ended "
+            f"{last_dev.status}, so the tree holds its partial work, not a finished "
+            f"attempt; re-arm it with {rearm_hint}"
         )
     if task.plan_review_owed or task.plan_checkpoint_pending:
         return (

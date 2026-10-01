@@ -9508,6 +9508,15 @@ def _state_edit(fn):
     return lambda run_dir, _project: _edit_reverify_state(run_dir, fn)
 
 
+def _crashed_fix_after_dev(run_dir, _project):
+    from bmad_loop.model import SessionRecord
+
+    def edit(_state, task):
+        task.sessions.append(SessionRecord(task_id="1-1-a-dev-2", role="dev", status="crashed"))
+
+    _edit_reverify_state(run_dir, edit)
+
+
 def _spec_gone(_run_dir, project):
     (project / _REVERIFY_SPEC_REL).unlink()
 
@@ -9539,6 +9548,9 @@ _REVERIFY_REFUSALS = [
         _state_edit(lambda _s, t: setattr(t.sessions[0], "result_json", None)),
         "no completed dev session result",
     ),
+    # a fix session (recorded under the dev role) crashed after the completed dev
+    # pass: the tree holds its partial work, which the earlier result does not describe
+    ("latest_dev_session_failed", "deferred", None, _crashed_fix_after_dev, "ended crashed"),
     ("missing_spec_no_stash", "deferred", None, _spec_gone, "neither at"),
     (
         "escalation_without_reverifiable_site",
