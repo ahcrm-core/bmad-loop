@@ -5419,6 +5419,10 @@ def _rearm_escalation_locked(
     # A re-arm abandons any adoption a prior `resolve --adopt-branch` latched (DW-386):
     # the re-drive re-implements from the baseline, so no adopt leg may fire on it.
     task.adopt_pending = False
+    # Likewise a `resolve --reverify` latch (DW-522) left by a replay that escalated
+    # before its decision cleared it (a refused board write): left set, the fresh
+    # attempt's next DEV_VERIFY pause would resume through the verify-replay arm.
+    task.reverify_from = ""
 
     # The spec this re-arm writes to and the bytes it FOUND there — the two inputs the
     # rollback below needs. Declared out here because their consumers sit past every

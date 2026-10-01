@@ -4489,6 +4489,24 @@ def test_rearm_resets_followup_reviews_spent(tmp_path):
     assert task.review_cycle == 0  # reset in lockstep with the counter
 
 
+def test_rearm_clears_a_stale_reverify_latch(tmp_path):
+    """A verify replay that escalated before its decision (a refused board write)
+    leaves `reverify_from` on the escalated task. A plain re-arm re-implements from
+    the baseline, so it spends the latch; left set, the fresh attempt's next
+    DEV_VERIFY pause would resume through the verify-replay arm.
+
+    Ablation, performed: drop the clear in `_rearm_escalation_locked` and this
+    reddens on the surviving latch."""
+    run_dir, _ = _escalated_run(tmp_path, _SPEC_WITH_ARR)
+    state = load_state(run_dir)
+    state.tasks["1-1-a"].reverify_from = "deferred"
+    save_state(run_dir, state)
+
+    runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
+
+    assert load_state(run_dir).tasks["1-1-a"].reverify_from == ""
+
+
 # --------------------------------------------- #90: abandoned restore-latch residue
 
 
