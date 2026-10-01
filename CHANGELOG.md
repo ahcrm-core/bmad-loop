@@ -9,36 +9,29 @@ breaking changes may land in a minor release.
 
 ### Added
 
-- Add `[environment] probes` (+ `probe_timeout_s`): operator health checks run in
-  the project root before any `[verify]` command; a failing, hanging or unrunnable
-  probe pauses the run as an environment fault without running the commands or
-  charging the attempt (DW-523).
-- Add `[verify] env_fault_rc` (0 = disabled; 75 = EX_TEMPFAIL suggested): a verify
-  command exiting with it declares an environment fault instead of a code
-  failure (DW-523).
-- Re-probe the environment before a failure is charged: when `[environment]
-probes` are set, every retry, defer or budget-exhausted decision (dev, fix,
-  review, blocking workflow) re-runs them first, and a failing probe pauses the
-  run as an environment fault instead — the attempt is not charged and the
-  story's `env_fault_site` records where it was detected (DW-523).
-- Gate each dev and review session launch on `[environment] probes`: a failing
-  probe pauses the run at the new `environment` stage before anything is charged,
-  and a plain `bmad-loop resume` re-probes and dispatches the same session with no
-  rollback (DW-523).
+- Add `[environment] probes` (+ `probe_timeout_s`): operator health checks run
+  before `[verify]` commands, before each dev and review session launch, and
+  before a failed attempt is charged; a failing, hanging or unrunnable probe
+  pauses the run as an environment fault and charges nothing (DW-523).
+- Add `[verify] env_fault_rc` (0 = disabled, 75 suggested): a verify command
+  exiting with it declares an environment fault, not a code failure (DW-523).
+- Add the `environment` pause stage: a probe failing before a session launch
+  pauses there, and a plain `bmad-loop resume` re-probes and launches the same
+  session with no rollback (DW-523).
 - Treat an `Environment fault: <text>` line in a session's Auto Run Result as a
-  probe trigger: the orchestrator re-runs its `[environment] probes` and pauses
-  only if one fails — the claim is never trusted alone (DW-523).
-- Add `bmad-loop resolve <run> --reverify`: re-verify a DEFERRED (or
-  environment-fault escalated) story's kept work — HEAD in place, or the kept
-  worktree unit under isolation — the `[verify]` commands are replayed, then
-  review follows policy and the story commits (a unit merges) on a pass, with no
-  dev session and no resolve agent. A worktree unit is accepted under any pause
-  when `--story` names it; sweep runs are refused (DW-522).
+  probe trigger: the run pauses only when a probe confirms it (DW-523).
+- Add `bmad-loop resolve <run> --reverify`: replay `[verify]` on a DEFERRED or
+  environment-fault escalated story's kept work — HEAD in place, or the kept
+  worktree unit — then review per policy and commit or merge, with no dev
+  session and no resolve agent; a worktree unit is accepted under any pause
+  when `--story` names it, and sweep runs are refused (DW-522).
 
 ### Changed
 
-- Reword the rc 126/127 environment-fault pause: it names the shell convention
+- Reword the rc 126/127 environment-fault pause to name the shell convention
   instead of asserting "command not found / not executable" (DW-523).
+- Point deferred-story and environment-fault pause notices, and the TUI `R`/`p`
+  gestures on a deferred story, at `bmad-loop resolve <run> --reverify` (DW-522).
 
 ### Fixed
 
