@@ -35,6 +35,10 @@ prose alone (or by nothing):
   isolation-refusal call site is enumerated —
   ``test_refusal_helper_inventory_is_complete`` and
   ``test_isolation_conflict_refusal_sites_are_enumerated``.
+* every text-mode ``open`` / ``io.open`` / ``Path.open`` / ``read_text`` /
+  ``write_text`` names an explicit, non-``None`` encoding (Windows decodes with the locale codepage until Python 3.15,
+  PEP 686) — ``test_text_io_pins_an_encoding``, and over the two release scripts
+  ``test_release_scripts_pin_text_encoding``.
 
 If this test flags something unexpected, fix the source (route it through the
 seam / a platform helper) rather than widening an allowlist.
@@ -3081,6 +3085,84 @@ def _consults_liveness_before(fn: ast.AST | None, lineno: int) -> bool:
     return False
 
 
+def _imported_module_names(tree: ast.AST) -> set[str]:
+    """Names this file binds with a plain ``import X`` / ``import X as Y`` — the
+    receivers whose ``.open`` is a module function (``os.open``, ``tarfile.open``,
+    ``webbrowser.open``) rather than ``Path.open``. ``import a.b`` binds ``a``."""
+    return {
+        alias.asname or alias.name.split(".", 1)[0]
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Import)
+        for alias in node.names
+    }
+
+
+def _call_arg(call: ast.Call, index: int, keyword: str) -> tuple[bool, ast.expr | None]:
+    """``(known, value)`` for one parameter of a call: the ``keyword=`` argument,
+    else the positional at ``index``. ``known`` is False when a ``*`` splat sits at
+    or before ``index`` and no keyword names the parameter — its value is then
+    unverifiable. ``(True, None)`` means the parameter is visibly not passed."""
+    for kw in call.keywords:
+        if kw.arg == keyword:
+            return True, kw.value
+    positional = call.args[: index + 1]
+    if any(isinstance(arg, ast.Starred) for arg in positional):
+        return False, None
+    return True, call.args[index] if len(call.args) > index else None
+
+
+def _encoding_less_text_io(call: ast.Call, module_names: set[str]) -> bool:
+    """Whether ``call`` opens, reads or writes a file in TEXT mode without an
+    explicit non-``None`` encoding — which decodes with the locale codepage on a
+    Windows host not in UTF-8 mode (the default until Python 3.15, PEP 686).
+
+    The shapes, with each one's ``(mode, encoding)`` positional slots:
+
+    * builtin ``open`` — the bare name, or ``io.open`` — ``(1, 3)``;
+    * ``.read_text`` — encoding at 0; ``.write_text`` — encoding at 1;
+    * ``.open`` on any receiver that is NOT a name the file binds with ``import``
+      — ``Path.open``, ``(0, 2)``. A module receiver (``os``, ``tarfile``,
+      ``webbrowser``) is a module function and is skipped.
+
+    A str-constant mode containing ``"b"`` is binary and skipped. A mode that is
+    not a constant flags anyway (a false positive is a review prompt), as does a
+    ``**`` splat or a ``*`` splat covering the encoding slot — unverifiable.
+
+    NOT COVERED: ``os.fdopen``, ``open`` rebound to another name, and
+    ``from io import open as o``; text-capable module functions the
+    imported-module exemption skips (``gzip`` / ``bz2`` / ``lzma`` / ``codecs``
+    ``.open``, ``builtins.open``, ``io.open`` under ``import io as x``); the unbound
+    ``Path.read_text(p)`` form; a parameter or local that shadows an imported module
+    name, since the import binding is file-wide rather than scope-aware; and text
+    I/O that is not a file open at all (``subprocess`` with ``text=True``,
+    ``tempfile.NamedTemporaryFile("w")``, ``io.TextIOWrapper``)."""
+    func = call.func
+    if isinstance(func, ast.Name) and func.id == "open":
+        mode_slot, encoding_slot = 1, 3
+    elif not isinstance(func, ast.Attribute):
+        return False
+    elif func.attr == "open" and isinstance(func.value, ast.Name) and func.value.id == "io":
+        mode_slot, encoding_slot = 1, 3
+    elif func.attr == "read_text":
+        mode_slot, encoding_slot = None, 0
+    elif func.attr == "write_text":
+        mode_slot, encoding_slot = None, 1
+    elif func.attr == "open" and not (
+        isinstance(func.value, ast.Name) and func.value.id in module_names
+    ):
+        mode_slot, encoding_slot = 0, 2
+    else:
+        return False
+    if mode_slot is not None:
+        _, mode = _call_arg(call, mode_slot, "mode")
+        if isinstance(mode, ast.Constant) and isinstance(mode.value, str) and "b" in mode.value:
+            return False
+    known, encoding = _call_arg(call, encoding_slot, "encoding")
+    if not known or encoding is None:
+        return True
+    return isinstance(encoding, ast.Constant) and encoding.value is None
+
+
 def _scan():
     """Single pass over the tree → list of (kind, rel, lineno, line_text)."""
     findings = []
@@ -3143,6 +3225,7 @@ def _scan_source(src: str, rel: str):
     git_heads, git_commands = _git_name_bindings(tree)
     tmux_heads = _tmux_head_names(tree)
     signal_modules, signal_enums = _signal_aliases(tree)
+    module_names = _imported_module_names(tree)
 
     # Calls inside the value of a `probe = ...` assignment that sits inside the
     # `try` of a bare `except Exception` — `deferredwork.py`'s ADVISORY pre-lock
@@ -3265,6 +3348,12 @@ def _scan_source(src: str, rel: str):
         return lines[lineno - 1] if 1 <= lineno <= len(lines) else ""
 
     for node in ast.walk(tree):
+        # Text I/O with no explicit encoding — builtin/`io.open`, `.read_text`,
+        # `.write_text`, and `Path.open` on a non-module receiver; see
+        # `_encoding_less_text_io` for the shapes and what stays uncovered.
+        if isinstance(node, ast.Call) and _encoding_less_text_io(node, module_names):
+            findings.append(("encoding", rel, node.lineno, line_at(node.lineno)))
+
         # spawn-argv literals: ["tmux", ...] / ["git", ...] — each quarantined to
         # its owner. tmux matches lists only: the which-list *tuple*
         # ("tmux", ...) is a real lookup shape in the tree. A tmux head resolves
@@ -5864,6 +5953,133 @@ def test_tmux_detector_sees_the_backends_own_spelling():
         "the tmux detector no longer flags the backend's own `[self._BINARY, ...]` "
         f"spawn; files it did flag: {sorted(rels)}"
     )
+
+
+def test_text_io_pins_an_encoding():
+    """Every text-mode ``open`` / ``Path.open`` / ``read_text`` / ``write_text`` in
+    ``src/bmad_loop`` names an explicit, non-``None`` encoding. Without one, Python
+    decodes with the locale codepage on a Windows host that is not in UTF-8 mode —
+    the default until Python 3.15 (PEP 686) — so a non-ASCII byte becomes mojibake
+    or a ``UnicodeDecodeError`` there and nowhere else. No allowlist: the tree has
+    zero offenders. Shapes and the uncovered spellings: ``_encoding_less_text_io``.
+
+    Ablation: drop the ``encoding="utf-8"`` from any ``read_text`` in src and this
+    test fails naming that file:line."""
+    offenders = _of("encoding")
+    assert not offenders, (
+        'text I/O without an explicit encoding — pin `encoding="utf-8"` (the locale '
+        "codepage is the default on Windows until Python 3.15, PEP 686):\n"
+        + "\n".join(f"  {rel}:{ln}: {txt.strip()}" for _, rel, ln, txt in offenders)
+    )
+
+
+# The release scripts read and write CHANGELOG.md (non-ASCII em dashes),
+# pyproject.toml, module.yaml and marketplace.json. They live outside `SRC`, so the
+# tree-wide scan never sees them; this names them explicitly.
+RELEASE_SCRIPTS = ("scripts/release.py", "scripts/sync_version.py")
+
+
+def test_release_scripts_pin_text_encoding():
+    """The encoding guard, run over the two release scripts: their own file reads
+    and writes of CHANGELOG.md and the version files must not go through the locale
+    codepage on a Windows host.
+
+    Ablation: drop one ``encoding="utf-8"`` from ``scripts/release.py`` and this
+    fails naming that line."""
+    root = Path(__file__).resolve().parent.parent
+    offenders = [
+        f"  {rel}:{ln}: {txt.strip()}"
+        for rel in RELEASE_SCRIPTS
+        for kind, _, ln, txt, *_ in _scan_source((root / rel).read_text(encoding="utf-8"), rel)
+        if kind == "encoding"
+    ]
+    assert not offenders, 'release-script text I/O without `encoding="utf-8"`:\n' + "\n".join(
+        offenders
+    )
+
+
+# Must-flag / must-stay-silent rows for the encoding detector, `(label, source)`,
+# each driven through `_scan_source`. One row per shape `_encoding_less_text_io`
+# claims, and one per lookalike it must leave alone.
+ENCODING_PROBES = [
+    ("builtin-open-default-mode", "f = open(p)\n"),
+    ("builtin-open-write", 'f = open(p, "w")\n'),
+    ("builtin-open-mode-keyword", 'f = open(p, mode="w")\n'),
+    ("io-open", "import io\nf = io.open(p)\n"),
+    ("path-read-text", "s = p.read_text()\n"),
+    ("path-write-text", "p.write_text(s)\n"),
+    ("path-open-default-mode", "f = p.open()\n"),
+    ("path-open-append", 'f = p.open("a")\n'),
+    ("path-open-on-call-receiver", 'from pathlib import Path\nf = Path(x).open("w")\n'),
+    ("path-open-on-attribute-receiver", "f = self._file.open()\n"),
+    ("explicit-encoding-none", "s = p.read_text(encoding=None)\n"),
+    ("positional-encoding-none", "s = p.read_text(None)\n"),
+    ("non-constant-mode", "f = open(p, mode)\n"),
+    ("kwargs-splat", "f = open(p, **kw)\n"),
+    ("args-splat-over-encoding", "f = open(*args)\n"),
+    ("args-splat-at-encoding-slot", 'f = open(p, "w", -1, *rest)\n'),
+    ("read-text-args-splat", "s = p.read_text(*args)\n"),
+    ("write-text-encoding-none", "p.write_text(s, encoding=None)\n"),
+    ("write-text-positional-encoding-none", "p.write_text(s, None)\n"),
+    ("text-mode-constant", 'f = open(p, "rt")\n'),
+    ("multi-line-call", "s = (\n    p.read_text()\n)\n"),
+]
+ENCODING_NON_PROBES = [
+    ("builtin-open-pinned", 'f = open(p, "w", encoding="utf-8")\n'),
+    ("read-text-pinned-variable", "s = p.read_text(encoding=enc)\n"),
+    ("builtin-open-positional-encoding", 'f = open(p, "r", -1, "utf-8")\n'),
+    ("read-text-positional-encoding", 's = p.read_text("utf-8")\n'),
+    ("write-text-positional-encoding", 'p.write_text(s, "utf-8")\n'),
+    ("write-text-pinned", 'p.write_text(s, encoding="utf-8")\n'),
+    ("path-open-positional-encoding", 'f = p.open("r", -1, "utf-8")\n'),
+    ("io-open-pinned", 'import io\nf = io.open(p, encoding="utf-8")\n'),
+    ("kwargs-splat-with-explicit-encoding", 'f = open(p, encoding="utf-8", **kw)\n'),
+    ("builtin-open-binary", 'f = open(p, "rb")\n'),
+    ("path-open-binary", 'f = p.open("wb")\n'),
+    ("builtin-open-binary-keyword", 'f = open(p, mode="rb")\n'),
+    ("path-open-append-binary", 'f = p.open("ab")\n'),
+    ("builtin-open-update-binary", 'f = open(p, "r+b")\n'),
+    ("os-open", "import os\nfd = os.open(p, flags)\n"),
+    ("tarfile-open", "import tarfile\nt = tarfile.open(p)\n"),
+    ("webbrowser-open", "import webbrowser\nwebbrowser.open(u)\n"),
+    ("aliased-module-open", "import tarfile as tf\nt = tf.open(p)\n"),
+    ("dotted-import-open", "import os.path\nfd = os.open(p, flags)\n"),
+    (
+        "docstring-prose",
+        'def f():\n    """Calls p.read_text() and open(p)."""\n    return 1\n',
+    ),
+    ("string-prose", 'MSG = "p.read_text() without an encoding"\n'),
+]
+
+
+def test_encoding_probe_tables_are_not_empty():
+    """The floor that stops a parametrize over an empty table passing vacuously."""
+    assert ENCODING_PROBES, "ENCODING_PROBES is empty"
+    assert ENCODING_NON_PROBES, "ENCODING_NON_PROBES is empty"
+
+
+@pytest.mark.parametrize(
+    ("label", "source"), ENCODING_PROBES, ids=[label for label, _ in ENCODING_PROBES]
+)
+def test_encoding_detector_flags_every_claimed_shape(label, source):
+    """Each claimed encoding-less text-I/O shape produces an ``encoding`` finding,
+    through the same ``_scan_source`` the real scan uses."""
+    found = [f for f in _scan_source(source, "probe.py") if f[0] == "encoding"]
+    assert found, f"the {label!r} shape produced no `encoding` finding:\n{source}"
+
+
+@pytest.mark.parametrize(
+    ("label", "source"), ENCODING_NON_PROBES, ids=[label for label, _ in ENCODING_NON_PROBES]
+)
+def test_encoding_detector_stays_silent_on_lookalikes(label, source):
+    """Pinned encodings (keyword or positional), binary modes, module-level
+    ``open`` functions and prose produce no ``encoding`` finding.
+
+    Ablations: drop the binary-mode skip and the ``*-binary`` rows fail; drop the
+    imported-module receiver check and ``os-open`` / ``tarfile-open`` /
+    ``webbrowser-open`` fail."""
+    found = [f for f in _scan_source(source, "probe.py") if f[0] == "encoding"]
+    assert not found, f"the {label!r} shape was flagged as `encoding`:\n{source}"
 
 
 def test_bmad_loop_env_reads_only_in_the_registry():

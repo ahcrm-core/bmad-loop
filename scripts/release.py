@@ -486,7 +486,7 @@ def cmd_prepare(args: argparse.Namespace) -> int:
     last_tag = last_release_tag()
 
     # --- preconditions ----------------------------------------------------- #
-    changelog = CHANGELOG.read_text()
+    changelog = CHANGELOG.read_text(encoding="utf-8")
     problems: list[str] = []
     if branch == "main":
         problems.append("on `main`; run prepare from a feature branch")
@@ -607,7 +607,9 @@ def cmd_prepare(args: argparse.Namespace) -> int:
         return 0
 
     # --- mutate ------------------------------------------------------------ #
-    CHANGELOG.write_text(ensure_link_ref(CHANGELOG.read_text(), version, url))
+    CHANGELOG.write_text(
+        ensure_link_ref(CHANGELOG.read_text(encoding="utf-8"), version, url), encoding="utf-8"
+    )
 
     print(f"stamping version via {SYNC_VERSION.name} ...")
     _run(["uv", "run", "python", str(SYNC_VERSION), version])
@@ -633,7 +635,7 @@ def cmd_prepare(args: argparse.Namespace) -> int:
 
 def _commit_summary(version: str) -> str:
     """A short subject tail derived from the first content line of the section."""
-    body = extract_section(CHANGELOG.read_text(), version) or ""
+    body = extract_section(CHANGELOG.read_text(encoding="utf-8"), version) or ""
     for line in body.splitlines():
         stripped = re.sub(r"^\s*[-*]\s+", "", line)  # drop the bullet marker only
         stripped = re.sub(r"\*\*(.+?)\*\*", r"\1", stripped).strip()  # drop bold markers
@@ -648,7 +650,7 @@ def _release_notes(version: str) -> str:
     Shared by both create paths (fresh tag, existing tag with no release). Dies
     when the section is absent; says so when the body had to be truncated.
     """
-    notes = extract_section(CHANGELOG.read_text(), version)
+    notes = extract_section(CHANGELOG.read_text(encoding="utf-8"), version)
     if not notes:
         _die(f"no CHANGELOG `## [{version}]` section — cannot publish release notes")
 
@@ -815,7 +817,7 @@ def cmd_check(args: argparse.Namespace) -> int:
     if sync_version.check() != 0:
         rc = 1
     version = sync_version.read_canonical()
-    text = CHANGELOG.read_text()
+    text = CHANGELOG.read_text(encoding="utf-8")
     if has_curated_section(text, version):
         print(f"changelog: `## [{version}]` section present")
     else:

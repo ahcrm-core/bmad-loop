@@ -69,7 +69,7 @@ def parse_canonical(text: str) -> str | None:
 
 
 def read_canonical() -> str:
-    version = parse_canonical(INIT.read_text())
+    version = parse_canonical(INIT.read_text(encoding="utf-8"))
     if version is None:
         sys.exit(f"error: could not find __version__ in {INIT}")
     return version
@@ -86,24 +86,34 @@ def stamp(version: str) -> None:
     if not _VERSION_RE.match(version):
         sys.exit(f"error: {version!r} is not a valid X.Y.Z version")
 
-    INIT.write_text(_sub_once(_INIT_PAT, rf"\g<1>{version}\g<2>", INIT.read_text(), INIT))
+    INIT.write_text(
+        _sub_once(_INIT_PAT, rf"\g<1>{version}\g<2>", INIT.read_text(encoding="utf-8"), INIT),
+        encoding="utf-8",
+    )
     PYPROJECT.write_text(
-        _sub_once(_PYPROJECT_PAT, rf"\g<1>{version}\g<2>", PYPROJECT.read_text(), PYPROJECT)
+        _sub_once(
+            _PYPROJECT_PAT,
+            rf"\g<1>{version}\g<2>",
+            PYPROJECT.read_text(encoding="utf-8"),
+            PYPROJECT,
+        ),
+        encoding="utf-8",
     )
     CANONICAL_MODULE_YAML.write_text(
         _sub_once(
             _MODULE_VERSION_PAT,
             rf"\g<1>{version}",
-            CANONICAL_MODULE_YAML.read_text(),
+            CANONICAL_MODULE_YAML.read_text(encoding="utf-8"),
             CANONICAL_MODULE_YAML,
-        )
+        ),
+        encoding="utf-8",
     )
 
-    market_text = MARKETPLACE.read_text()
+    market_text = MARKETPLACE.read_text(encoding="utf-8")
     market_new, n = _MARKET_PAT.subn(rf"\g<1>{version}\g<2>", market_text)
     if n == 0:
         sys.exit(f"error: found no version field in {MARKETPLACE}")
-    MARKETPLACE.write_text(market_new)
+    MARKETPLACE.write_text(market_new, encoding="utf-8")
 
     # Regenerate the installer-discoverable repo-root mirror from the canonical copy.
     shutil.copyfile(CANONICAL_MODULE_YAML, ROOT_MODULE_YAML)
@@ -137,16 +147,16 @@ def check() -> int:
     canonical = read_canonical()
     problems: list[str] = []
 
-    py = _field(_PYPROJECT_PAT, PYPROJECT.read_text())
+    py = _field(_PYPROJECT_PAT, PYPROJECT.read_text(encoding="utf-8"))
     if py != canonical:
         problems.append(f"pyproject.toml [project].version = {py!r} (expected {canonical!r})")
 
-    mv = _MODULE_VERSION_PAT.search(CANONICAL_MODULE_YAML.read_text())
+    mv = _MODULE_VERSION_PAT.search(CANONICAL_MODULE_YAML.read_text(encoding="utf-8"))
     mv_val = mv.group(0).split(":", 1)[1].strip() if mv else None
     if mv_val != canonical:
         problems.append(f"module.yaml module_version = {mv_val!r} (expected {canonical!r})")
 
-    market = json.loads(MARKETPLACE.read_text())
+    market = json.loads(MARKETPLACE.read_text(encoding="utf-8"))
     # Refuse to pass vacuously. `market.get("plugins", [])` iterates zero times when the
     # key is renamed, dropped or emptied, so the loop below would report agreement it
     # never checked — green on exactly the corruption this gate exists to catch. Same

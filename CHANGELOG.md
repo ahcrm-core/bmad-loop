@@ -38,6 +38,9 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Read and write CHANGELOG and version files as UTF-8 in the release scripts; a portability
+  guard now refuses file `open` / `read_text` / `write_text` without an explicit encoding in
+  `src/bmad_loop` (DW-513).
 - Ignore hook events from nested coding-CLI sessions that inherit the relay environment,
   so a child's `Stop`/`SessionEnd` no longer completes or crashes the launched session:
   an id that announces its own `SessionStart` after the launched session's first is
