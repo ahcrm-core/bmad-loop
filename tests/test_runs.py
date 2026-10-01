@@ -5,6 +5,7 @@ import errno
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -2994,6 +2995,106 @@ def test_delete_run_removes_the_out_of_tree_state_counterpart(tmp_path):
 
     assert not run_dir.exists()
     assert not state_dir.exists()
+
+
+@pytest.mark.parametrize("op", ["delete", "archive"])
+def test_run_removal_retries_a_transient_windows_sharing_violation(tmp_path, monkeypatch, op):
+    """DW-519: a concurrent reader's open handle (Python's ``open()`` grants no
+    ``FILE_SHARE_DELETE``) denies one file's delete on Windows. The run-dir removal
+    retries it under the shared backoff instead of failing the whole operation.
+
+    ``sys.platform`` reads ``"win32"`` ONLY between the injected denial and the
+    retried unlink — never across ``state_lock``, whose win32 branch imports
+    ``msvcrt``; the ``rmtree`` wrapper closes the window even if the denial escapes.
+
+    Ablation: revert either call site to a bare ``shutil.rmtree`` and its row
+    raises the injected ``PermissionError``. Verified for both."""
+    run_id = "20260611-100000-aaaa"
+    run_dir = _make_state_run(tmp_path, run_id)
+    (run_dir / "journal.jsonl").write_text('{"kind":"x"}\n')
+    state_dir = _seed_state_dir(tmp_path, run_id)
+    real_platform = sys.platform
+    monkeypatch.setattr(platform_util.sys, "platform", real_platform)  # restore on teardown
+    sleeps: list[float] = []
+    monkeypatch.setattr(platform_util.time, "sleep", lambda s: sleeps.append(s))
+    real_unlink = os.unlink
+    calls = {"n": 0}
+
+    def held_once(path, *args, **kwargs):
+        if os.path.basename(os.fspath(path)) == "journal.jsonl":
+            calls["n"] += 1
+            if calls["n"] == 1:
+                platform_util.sys.platform = "win32"  # the reader's window opens
+                raise PermissionError(13, "The process cannot access the file")
+            platform_util.sys.platform = real_platform  # ... and closes on the retry
+        return real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "unlink", held_once)
+    real_rmtree = shutil.rmtree
+
+    def window_closing_rmtree(*args, **kwargs):
+        # Closes the window however the removal ends: should the denial escape
+        # (no retry), it must not reach the state_lock release still reading win32.
+        try:
+            return real_rmtree(*args, **kwargs)
+        finally:
+            platform_util.sys.platform = real_platform
+
+    monkeypatch.setattr(shutil, "rmtree", window_closing_rmtree)
+
+    if op == "delete":
+        runs.delete_run(tmp_path, run_dir)
+    else:
+        dest = runs.archive_run(tmp_path, run_dir)
+        assert dest.is_file()
+
+    assert calls["n"] == 2  # the denial was injected, then retried
+    assert sleeps == []  # the retry's first attempt succeeded
+    assert sys.platform == real_platform
+    assert not run_dir.exists()
+    assert not state_dir.exists()
+
+
+@pytest.mark.parametrize("op", ["delete", "archive"])
+def test_run_removal_final_failure_propagates_and_keeps_the_state_dir(tmp_path, monkeypatch, op):
+    """A run dir that could not be removed keeps its control plane: the error
+    escapes ``delete_run`` / ``archive_run`` and ``_discard_state_dir`` never runs.
+    Off win32 the ``PermissionError`` surfaces after one attempt with no backoff,
+    exactly as the bare ``shutil.rmtree`` raised it; on win32 only after the
+    retries run out."""
+    run_id = "20260611-100000-aaaa"
+    run_dir = _make_state_run(tmp_path, run_id)
+    (run_dir / "journal.jsonl").write_text('{"kind":"x"}\n')
+    state_dir = _seed_state_dir(tmp_path, run_id)
+    sleeps: list[float] = []
+    monkeypatch.setattr(platform_util.time, "sleep", lambda s: sleeps.append(s))
+    real_unlink = os.unlink
+    calls = {"n": 0}
+    denied = PermissionError(13, "Permission denied")
+
+    def always_denied(path, *args, **kwargs):
+        if os.path.basename(os.fspath(path)) == "journal.jsonl":
+            calls["n"] += 1
+            raise denied
+        return real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "unlink", always_denied)
+
+    with pytest.raises(PermissionError) as caught:
+        if op == "delete":
+            runs.delete_run(tmp_path, run_dir)
+        else:
+            runs.archive_run(tmp_path, run_dir)
+
+    assert caught.value is denied
+    if sys.platform == "win32":
+        assert calls["n"] == 1 + platform_util._REPLACE_ATTEMPTS
+    else:
+        assert calls["n"] == 1
+        assert sleeps == []
+    assert state_dir.is_dir()
+    assert run_dir.is_dir()
+    assert (run_dir / "journal.jsonl").is_file()
 
 
 @pytest.mark.parametrize(

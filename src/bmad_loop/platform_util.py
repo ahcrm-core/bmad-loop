@@ -55,6 +55,15 @@ _REPLACE_CAP_S = 0.7
 # holding characters win32 forbids outright, which no shorter prefix fixes.
 _WINERROR_FILENAME_EXCED_RANGE = 206
 
+# Windows-only: a parent os.rmdir fails with ERROR_DIR_NOT_EMPTY (145) while a child
+# is delete-pending — its unlink succeeded, but another process still holds a
+# FILE_SHARE_DELETE handle, so the name lingers until that handle closes. That is
+# the legacy delete every non-NTFS volume (FAT32/exFAT) still gets; recent Windows
+# 10+ tries a POSIX delete on NTFS, which should unlink the name at once — whether
+# NTFS can still hit this is unverified. retrying_rmtree retries it for rmdir alone.
+# CPython maps it to ENOTEMPTY, so only .winerror tells it from a POSIX ENOTEMPTY.
+_WINERROR_DIR_NOT_EMPTY = 145
+
 # Reserved on Windows regardless of extension: CON.txt is as illegal as CON. The
 # COM0/LPT0 and superscript (COM¹/COM²/COM³) forms are reserved by the same rule,
 # as are the console device names CONIN$/CONOUT$.
@@ -410,24 +419,48 @@ def resolve_or_lexical(path: str | Path) -> Path:
         return lexical
 
 
-def _retry_on_sharing_violation(op: Callable[[], None]) -> None:
+def _is_sharing_violation(exc: BaseException) -> bool:
+    """Whether ``exc`` is the retryable open-handle denial a concurrent handle on
+    the file triggers on Windows (WinError 5/32), not a genuine permission fault.
+    Platform-blind: callers gate the retry to win32 themselves."""
+    winerror = getattr(exc, "winerror", None)
+    return isinstance(exc, PermissionError) or winerror in (5, 32)
+
+
+def _is_rmdir_retryable(exc: BaseException) -> bool:
+    """Whether a failed ``os.rmdir`` is worth retrying on Windows: a sharing
+    violation (:func:`_is_sharing_violation`), or ``_WINERROR_DIR_NOT_EMPTY``
+    (145) — a child whose unlink succeeded is still delete-pending under another
+    process's ``FILE_SHARE_DELETE`` handle, so the directory is "not empty" until
+    that handle closes. That is the legacy delete a non-NTFS volume (FAT32/exFAT)
+    always gets; under the POSIX delete recent Windows uses on NTFS the name should
+    go at once, so whether NTFS still produces this is unverified. Kept apart from
+    :func:`_is_sharing_violation` so ``atomic_replace``/``retrying_unlink`` still
+    raise a 145 at once.
+    Platform-blind: callers gate the retry to win32 themselves."""
+    return _is_sharing_violation(exc) or getattr(exc, "winerror", None) == _WINERROR_DIR_NOT_EMPTY
+
+
+def _retry_on_sharing_violation(
+    op: Callable[[], None],
+    *,
+    retryable: Callable[[BaseException], bool] = _is_sharing_violation,
+) -> None:
     """Run ``op``, retrying the transient Windows sharing violation a concurrent
     handle on the file triggers (WinError 5/32). Gated to win32 so a real POSIX
     EACCES/EPERM surfaces immediately instead of after a pointless backoff.
     Worst-case total wait is ~5 s of jittered exponential backoff before the final
-    failure propagates."""
+    failure propagates. ``retryable`` widens what counts as transient for one
+    caller (``retrying_rmtree``'s rmdir); the default is the sharing violation."""
     for attempt in range(_REPLACE_ATTEMPTS):
         try:
             op()
             return
         except OSError as exc:
             last = attempt == _REPLACE_ATTEMPTS - 1
-            # a retryable open-handle denial, not a genuine permission fault
-            winerror = getattr(exc, "winerror", None)
-            retryable = isinstance(exc, PermissionError) or winerror in (5, 32)
             # portability: only Windows denies a rename/delete over an open handle;
             # elsewhere a permission error is real and must surface at once.
-            if sys.platform != "win32" or last or not retryable:
+            if sys.platform != "win32" or last or not retryable(exc):
                 raise
             delay = min(_REPLACE_CAP_S, _REPLACE_BASE_S * 2**attempt)
             time.sleep(delay + random.uniform(0, _REPLACE_BASE_S))  # nosec B311 - retry jitter
@@ -2039,6 +2072,74 @@ def retrying_unlink(path: Path) -> None:
     an AV/indexer scanning the just-written source file fails the unlink. Pair the
     two whenever a move must not half-apply."""
     _retry_on_sharing_violation(path.unlink)
+
+
+def retrying_rmtree(path: Path) -> None:
+    """``shutil.rmtree(path)`` with the same win32 retry as :func:`atomic_replace`,
+    applied per failing entry.
+
+    Windows denies a delete against an open handle — Python's ``open()`` grants no
+    ``FILE_SHARE_DELETE`` — so a concurrent reader (a TUI refresh, an AV/indexer
+    scan) holding any one file in the tree fails a bare ``rmtree`` outright on the
+    first sharing violation. The handler retries just that path under the shared
+    backoff and lets the walk continue. Only the removal ops (``os.unlink``,
+    ``os.rmdir``) are retried: rmtree's probes and scans (``os.lstat``,
+    ``os.path.islink``, ``os.scandir``, ...) make the walk return early or skip a
+    directory once the handler returns, so "retrying" one would report a removal
+    that never happened. Off win32, for those non-removal ops, and for any error
+    not retryable for that op, the handler re-raises the original exception
+    at once, so the failure surfaces exactly as a bare ``rmtree``'s would. A path
+    gone by retry time is treated as removed. After the retries run out the error
+    propagates and the tree stays partially removed, as with a bare ``rmtree``.
+    A failed ``os.rmdir`` also retries WinError 145 (:func:`_is_rmdir_retryable`):
+    a child unlinked under another process's ``FILE_SHARE_DELETE`` handle stays
+    delete-pending, leaving its parent "not empty" until that handle closes. The
+    trade-off: a directory that is genuinely non-empty (a child created after the
+    walk) also reports 145, so it fails only after the backoff runs out.
+
+    ``shutil.rmtree`` is looked up on the module at call time so tests that patch
+    it still intercept this call.
+
+    ``surfaced`` holds each exception that escaped an exhausted retry; immediate
+    re-raises are not recorded. It guards against re-entry by the iterative
+    fd-based walk (3.13+), which catches an exception the handler raised for an
+    entry and calls the handler AGAIN for the enclosing directory with the same
+    exception object. That walk is POSIX-only, so this re-entry is never reached on
+    real Windows; only with a faked win32 platform on POSIX. The removal-op check
+    already re-raises that second call (it reports ``os.scandir``); the identity
+    check keeps the final failure from being swallowed whatever op is reported."""
+    surfaced: list[BaseException] = []
+
+    def _retry(func: Callable[..., object], failed: str, exc: BaseException) -> None:
+        # looked up at call time: shutil passes whatever os.rmdir is now
+        retryable = _is_rmdir_retryable if func is os.rmdir else _is_sharing_violation
+        if (
+            any(exc is seen for seen in surfaced)
+            or sys.platform != "win32"
+            # looked up at call time: shutil passes whatever os.unlink is now
+            or (func is not os.unlink and func is not os.rmdir)
+            or not retryable(exc)
+        ):
+            raise exc
+
+        def _again() -> None:
+            func(failed)
+
+        try:
+            with suppress(FileNotFoundError):  # already gone is the goal
+                # the loop needs the same predicate, or a repeated 145 raises after
+                # a single re-attempt
+                _retry_on_sharing_violation(_again, retryable=retryable)
+        except BaseException as final:
+            surfaced.append(final)
+            raise
+
+    if sys.version_info >= (3, 12):
+        shutil.rmtree(path, onexc=_retry)
+    else:  # 3.11: no `onexc`; `onerror` (deprecated from 3.12) carries exc_info
+        shutil.rmtree(
+            path, onerror=lambda func, failed, exc_info: _retry(func, failed, exc_info[1])
+        )
 
 
 class LockUnavailableError(OSError):
