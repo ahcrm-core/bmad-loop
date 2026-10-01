@@ -153,6 +153,13 @@ def config_digest(
     the exec-reachable surface:
 
     * ``verify.commands`` — order-preserved; they run in sequence.
+    * ``environment.probes`` — order-preserved like ``verify.commands`` and run
+      the same way (``shell=True``, DW-523), so they are the same host-exec
+      surface. Hashed only when non-empty, for the ``session_id_flag`` reason
+      below: an unset list runs nothing, and leaving the key out keeps the payload
+      byte-identical to a digest stamped before the field existed.
+      ``verify.env_fault_rc`` and ``environment.probe_timeout_s`` are not: they
+      classify or bound a command's run, and neither can name a program.
     * ``sorted(plugins.enabled)`` — set semantics, so order is not meaningful.
     * per :data:`ROLES`, every field that decides **which program runs and with
       what flags and environment**. That rule, not a hand-picked list, is what
@@ -427,6 +434,9 @@ def config_digest(
         "plugins_enabled": sorted(policy.plugins.enabled),
         "profiles": launch,
     }
+    # Same byte-identity rule as `session_id_flag` above: no probes, no key.
+    if policy.environment.probes:
+        payload["environment_probes"] = list(policy.environment.probes)
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
 
 

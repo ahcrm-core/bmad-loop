@@ -7,6 +7,21 @@ breaking changes may land in a minor release.
 
 ## [Unreleased]
 
+### Added
+
+- Add `[environment] probes` (+ `probe_timeout_s`): operator health checks run in
+  the project root before any `[verify]` command; a failing, hanging or unrunnable
+  probe pauses the run as an environment fault without running the commands or
+  charging the attempt (DW-523).
+- Add `[verify] env_fault_rc` (0 = disabled; 75 = EX_TEMPFAIL suggested): a verify
+  command exiting with it declares an environment fault instead of a code
+  failure (DW-523).
+
+### Changed
+
+- Reword the rc 126/127 environment-fault pause: it names the shell convention
+  instead of asserting "command not found / not executable" (DW-523).
+
 ## [0.13.1] — 2026-10-01
 
 ### Added

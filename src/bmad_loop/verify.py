@@ -9389,10 +9389,39 @@ def _win32_env_fault_reason(result: CommandResult, cwd: Path) -> str | None:
     return None
 
 
-def env_fault_reason(result: CommandResult, cwd: Path) -> str | None:
+def _env_fault_cause(
+    result: CommandResult, cwd: Path, *, env_fault_rc: int = 0
+) -> tuple[str, str] | None:
+    """``(cause, reason)`` for a verify command that is an environment fault, or
+    None. ``cause`` is the :attr:`VerifyOutcome.env_fault_cause` vocabulary bar
+    ``"probe"`` (a probe is not a verify command); ``reason`` is what
+    :func:`env_fault_reason` reports.
+
+    Order: spawn -> declared-rc -> shell-rc -> cmd. A spawn fault has no rc to
+    read (see :func:`env_fault_reason`). The declared code outranks 126/127
+    because an operator who set ``env_fault_rc = 127`` has said what 127 means
+    for their commands, and it outranks the win32 arm because cmd exits 1 for a
+    missing tool, so a declared 1 would otherwise be reported as cmd's guess."""
+    if result.spawn_error is not None:
+        return "spawn", result.spawn_error
+    if env_fault_rc and result.returncode == env_fault_rc:
+        return "declared-rc", f"rc={result.returncode}, [verify] env_fault_rc"
+    if result.returncode in ENV_FAULT_RCS:
+        return "shell-rc", f"rc={result.returncode}"
+    if sys.platform != "win32":
+        return None
+    reason = _win32_env_fault_reason(result, cwd)
+    return None if reason is None else ("cmd", reason)
+
+
+def env_fault_reason(result: CommandResult, cwd: Path, *, env_fault_rc: int = 0) -> str | None:
     """Why this verify command is an environment fault rather than a story
     failure, or None if it is not one. Per-shell: verify commands run through
     the host shell, and sh and cmd signal a broken environment differently.
+
+    ``env_fault_rc`` is the operator's declared code (``[verify] env_fault_rc``,
+    DW-523): a command exiting with it is an environment fault whatever the
+    shell. 0 disables it, leaving only the shell's own signals.
 
     ``spawn_error`` is answered FIRST and unconditionally, before any rc reading
     and before the win32 probe. Not merely an ordering preference: the probe
@@ -9401,13 +9430,8 @@ def env_fault_reason(result: CommandResult, cwd: Path) -> str | None:
     directory nothing ever entered and cannot speak to why. The result also
     carries no exit status to read (see :data:`SPAWN_FAULT_RC`), which is why
     the rc arms cannot classify it either."""
-    if result.spawn_error is not None:
-        return result.spawn_error
-    if result.returncode in ENV_FAULT_RCS:
-        return f"rc={result.returncode}"
-    if sys.platform != "win32":
-        return None
-    return _win32_env_fault_reason(result, cwd)
+    found = _env_fault_cause(result, cwd, env_fault_rc=env_fault_rc)
+    return None if found is None else found[1]
 
 
 def _timeout_stream(value: str | bytes | None) -> str:
@@ -9454,81 +9478,83 @@ def run_verify_commands(policy: Policy, cwd: Path) -> list[CommandResult]:
         if interrupted:
             results.append(_interrupted_result(command, "", "", tail=_NOT_STARTED_TAIL))
             continue
-        try:
-            # COMMAND_TIMEOUT_S is read here, at call time, so a patched module
-            # value reaches the child.
-            child = childrun.run_child(command, cwd=cwd, timeout=COMMAND_TIMEOUT_S)
-        except (OSError, ValueError) as exc:
-            # The child was never started, so no exit status exists to classify:
-            # `Popen` raises out of the fork/exec (or CreateProcess)
-            # itself when `cwd` is unusable — FileNotFoundError (missing),
-            # NotADirectoryError (a regular file, or a path beneath one),
-            # PermissionError (a directory without +x) — or raises ValueError
-            # before spawn when the command or cwd contains an embedded NUL.
-            # The OSError arm uses the base class rather than the three names
-            # because they are the reachable OS shapes TODAY, not a closed set:
-            # the base class is what the platform actually guarantees, and one
-            # uncaught sibling here crashes the whole run.
-            #
-            # Translated instead of raised, the same doctrine `_run_git` follows
-            # for the faults that land before a return code exists (#343): left
-            # uncaught this escapes every `except` in the engine's verification
-            # path and ends the run as a crash, when the fact it reports — a cwd
-            # no command can run in — is a textbook environment fault, identical
-            # for every story and unfixable by a repair session.
-            #
-            # A result is APPENDED and the loop CONTINUES, honouring this
-            # function's documented "one CommandResult apiece": a caller zipping
-            # results against `policy.verify.commands` must not silently lose the
-            # tail of the list to the first broken spawn.
-            results.append(
-                CommandResult(
-                    command,
-                    SPAWN_FAULT_RC,
-                    f"{type(exc).__name__}: {exc}",
-                    # What was OBSERVED, not a diagnosis. `except OSError` is
-                    # wider than the cwd shapes that motivated it — a missing
-                    # `/bin/sh`, EMFILE, ENOMEM all land here — so the cwd is
-                    # named as context ("cwd was X") rather than blamed, and the
-                    # exception carries whatever the real cause was. No "could
-                    # not run" phrasing: `cli._reverify` prefixes its own
-                    # ("<cmd>' could not run: ..."), and the two stuttered.
-                    spawn_error=(f"child not started; cwd was {cwd}; {type(exc).__name__}: {exc}"),
-                )
-            )
-            continue
-
-        # Keep result processing outside the spawn-fault handler. A ValueError
-        # here is a programmer defect, not rejected process configuration, and
-        # must remain fail-loud rather than being mislabeled as an environment
-        # fault.
-        if child.interrupted:
-            interrupted = True
-            results.append(_interrupted_result(command, child.stdout, child.stderr))
-            continue
-        stdout, stdout_full = byte_tail(child.stdout, MAX_STREAM_MEMORY_BYTES)
-        stderr, stderr_full = byte_tail(child.stderr, MAX_STREAM_MEMORY_BYTES)
-        if child.timed_out or child.returncode is None:
-            # the timeout leg is bounded too: a command killed at COMMAND_TIMEOUT_S
-            # is exactly the one that may have been spewing output when it died.
-            # (`returncode is None` is also possible without either flag set:
-            # run_child reports None when the killed root could not be reaped, as
-            # well as for an interrupt. It is not an exit status, so it must not
-            # be classified as one.)
-            results.append(
-                CommandResult(command, -1, "timed out", stdout, stderr, stdout_full, stderr_full)
-            )
-            continue
-        # merged from the ceilinged streams, not the raw pair: 2000 chars sits
-        # far below the ceiling, so the tail is identical while the full
-        # concatenation — a transient copy of both whole streams — is not built.
-        output = (stdout + stderr)[-2000:]
-        results.append(
-            CommandResult(
-                command, child.returncode, output, stdout, stderr, stdout_full, stderr_full
-            )
-        )
+        # COMMAND_TIMEOUT_S is read here, at call time, so a patched module
+        # value reaches the child.
+        result = _run_shell_command(command, cwd, COMMAND_TIMEOUT_S)
+        interrupted = result.interrupted
+        results.append(result)
     return results
+
+
+def _run_shell_command(command: str, cwd: Path, timeout: float) -> CommandResult:
+    """Run one operator shell command — a ``[verify]`` command or an
+    ``[environment]`` probe — to exactly one :class:`CommandResult`, on the four
+    legs :func:`run_verify_commands` documents: completed, timed out (``rc=-1``,
+    ``"timed out"``), never spawned (``spawn_error``), interrupted by a hard stop
+    (``interrupted``). Not spawning anything after an interrupt is the CALLER's
+    loop latch, not this function's."""
+    try:
+        child = childrun.run_child(command, cwd=cwd, timeout=timeout)
+    except (OSError, ValueError) as exc:
+        # The child was never started, so no exit status exists to classify:
+        # `Popen` raises out of the fork/exec (or CreateProcess)
+        # itself when `cwd` is unusable — FileNotFoundError (missing),
+        # NotADirectoryError (a regular file, or a path beneath one),
+        # PermissionError (a directory without +x) — or raises ValueError
+        # before spawn when the command or cwd contains an embedded NUL.
+        # The OSError arm uses the base class rather than the three names
+        # because they are the reachable OS shapes TODAY, not a closed set:
+        # the base class is what the platform actually guarantees, and one
+        # uncaught sibling here crashes the whole run.
+        #
+        # Translated instead of raised, the same doctrine `_run_git` follows
+        # for the faults that land before a return code exists (#343): left
+        # uncaught this escapes every `except` in the engine's verification
+        # path and ends the run as a crash, when the fact it reports — a cwd
+        # no command can run in — is a textbook environment fault, identical
+        # for every story and unfixable by a repair session.
+        #
+        # A result is RETURNED rather than raised, so `run_verify_commands`
+        # honours its documented "one CommandResult apiece": a caller zipping
+        # results against `policy.verify.commands` must not silently lose the
+        # tail of the list to the first broken spawn.
+        return CommandResult(
+            command,
+            SPAWN_FAULT_RC,
+            f"{type(exc).__name__}: {exc}",
+            # What was OBSERVED, not a diagnosis. `except OSError` is
+            # wider than the cwd shapes that motivated it — a missing
+            # `/bin/sh`, EMFILE, ENOMEM all land here — so the cwd is
+            # named as context ("cwd was X") rather than blamed, and the
+            # exception carries whatever the real cause was. No "could
+            # not run" phrasing: `cli._reverify` prefixes its own
+            # ("<cmd>' could not run: ..."), and the two stuttered.
+            spawn_error=(f"child not started; cwd was {cwd}; {type(exc).__name__}: {exc}"),
+        )
+
+    # Keep result processing outside the spawn-fault handler. A ValueError
+    # here is a programmer defect, not rejected process configuration, and
+    # must remain fail-loud rather than being mislabeled as an environment
+    # fault.
+    if child.interrupted:
+        return _interrupted_result(command, child.stdout, child.stderr)
+    stdout, stdout_full = byte_tail(child.stdout, MAX_STREAM_MEMORY_BYTES)
+    stderr, stderr_full = byte_tail(child.stderr, MAX_STREAM_MEMORY_BYTES)
+    if child.timed_out or child.returncode is None:
+        # the timeout leg is bounded too: a command killed at its timeout is
+        # exactly the one that may have been spewing output when it died.
+        # (`returncode is None` is also possible without either flag set:
+        # run_child reports None when the killed root could not be reaped, as
+        # well as for an interrupt. It is not an exit status, so it must not
+        # be classified as one.)
+        return CommandResult(command, -1, "timed out", stdout, stderr, stdout_full, stderr_full)
+    # merged from the ceilinged streams, not the raw pair: 2000 chars sits
+    # far below the ceiling, so the tail is identical while the full
+    # concatenation — a transient copy of both whole streams — is not built.
+    output = (stdout + stderr)[-2000:]
+    return CommandResult(
+        command, child.returncode, output, stdout, stderr, stdout_full, stderr_full
+    )
 
 
 # The journalled `output_tail` is what tells a command the hard stop KILLED apart
@@ -9558,13 +9584,50 @@ def _interrupted_result(
     )
 
 
-def verify_command_results_outcome(results: list[CommandResult], cwd: Path) -> VerifyOutcome:
+# The explanatory clause of an env-fault escalation, by cause (DW-523). Each one
+# says only what the orchestrator OBSERVED: rc 127 is the shell's code for a
+# missing command, but a command may exit 127 (or 126) on purpose — the only
+# operator escape for "environment broken" before `env_fault_rc` existed — so
+# that clause names the convention instead of asserting it. A spawn fault was
+# never looked for at all, so naming a binary would send the reader hunting for
+# one when the directory is what is broken.
+_ENV_FAULT_CLAUSES = {
+    "spawn": "the command could not be started at all",
+    "declared-rc": "the command exited with the configured environment-fault code",
+    "shell-rc": (
+        "the shell exits 127 when it cannot find a command (126 when it cannot "
+        "execute one), and a command may also exit with it deliberately"
+    ),
+    "cmd": "cmd could not run the command",
+    "probe": "an [environment] probe failed, so no [verify] command was run",
+}
+
+
+def _env_fault_outcome(result: CommandResult, reason: str, cause: str) -> VerifyOutcome:
+    """The one env-fault escalation shape every cause shares: the first line
+    names the reason and the command, the clause names the cause, and the tail
+    (fix the environment, re-arm) is the same because the remedy is."""
+    output = "" if result.spawn_error is not None else f"\n{result.output_tail}"
+    return VerifyOutcome.escalate(
+        f"verify environment fault ({reason}): {result.command}\n"
+        f"{_ENV_FAULT_CLAUSES[cause]} — this is the run environment, "
+        "not the story; fix the environment, then re-arm the escalation "
+        f"(the attempt budget resets on re-arm){output}",
+        env_fault=True,
+        env_fault_cause=cause,
+    )
+
+
+def verify_command_results_outcome(
+    results: list[CommandResult], cwd: Path, *, env_fault_rc: int = 0
+) -> VerifyOutcome:
     """Classify already-observed verifier results without discarding them.
 
     Kept separate from :func:`verify_commands_outcome` so the engine can retain
     and expose exactly the same results it asks core to classify. Failures are fixable:
     the captured output is concrete feedback a repair session can act on —
-    except environment faults (see env_fault_reason), which escalate so the run
+    except environment faults (see env_fault_reason, which ``env_fault_rc`` is
+    handed to), which escalate so the run
     pauses for an environment fix instead of burning story budgets. An env
     fault anywhere in the run wins over earlier ordinary failures: a repair
     session dispatched for the ordinary failure would still run in the
@@ -9580,27 +9643,10 @@ def verify_command_results_outcome(results: list[CommandResult], cwd: Path) -> V
             f"verify results interrupted by a hard stop request: {', '.join(interrupted)}"
         )
     for result in results:
-        reason = env_fault_reason(result, cwd)
-        if reason is not None:
-            # The explanatory clause branches on WHICH fault this is, because the
-            # rc-based one is a claim about the command and the spawn one is not:
-            # a child that never started was never looked for, so "command not
-            # found / not executable" would send the reader hunting for a binary
-            # when the directory is what is broken. Everything after the dash is
-            # shared — the remedy (fix the environment, re-arm) is the same.
-            clause = (
-                "the command could not be started at all"
-                if result.spawn_error is not None
-                else "command not found / not executable"
-            )
-            output = "" if result.spawn_error is not None else f"\n{result.output_tail}"
-            return VerifyOutcome.escalate(
-                f"verify environment fault ({reason}): {result.command}\n"
-                f"{clause} — this is the run environment, "
-                "not the story; fix the environment, then re-arm the escalation "
-                f"(the attempt budget resets on re-arm){output}",
-                env_fault=True,
-            )
+        found = _env_fault_cause(result, cwd, env_fault_rc=env_fault_rc)
+        if found is not None:
+            cause, reason = found
+            return _env_fault_outcome(result, reason, cause)
     for result in results:
         if result.returncode != 0:
             return VerifyOutcome.retry(
@@ -9611,8 +9657,123 @@ def verify_command_results_outcome(results: list[CommandResult], cwd: Path) -> V
     return VerifyOutcome.passed()
 
 
+@dataclass(frozen=True)
+class ProbeOutcome:
+    """One pass over ``[environment] probes`` (DW-523), fail-fast.
+
+    ``results`` holds every probe that RAN, in order — the pass stops at the
+    first failure or interrupt, so a probe after it never spawned and is absent.
+    ``failed`` is that first failing result, None when none failed. ``reason``
+    is :func:`probe_failure_reason` for it ("" when none failed). ``timeout_s``
+    is the per-probe bound the pass ran under."""
+
+    results: tuple[CommandResult, ...]
+    failed: CommandResult | None
+    timeout_s: int
+    reason: str = ""
+
+    @property
+    def interrupted(self) -> bool:
+        return any(result.interrupted for result in self.results)
+
+    @property
+    def ok(self) -> bool:
+        return self.failed is None and not self.interrupted
+
+
+# The sink a caller hands :func:`verify_commands_outcome` to observe an
+# environment preflight — the engine journals a failed probe through it.
+ProbeSink = Callable[[ProbeOutcome], None]
+
+
+def preflight_required(policy: Policy) -> bool:
+    """Whether a verify composition runs the environment preflight: only when it
+    would run a ``[verify]`` command at all, and only when probes are configured.
+    With no probes (the default) nothing extra spawns, journals or changes."""
+    return bool(policy.verify.commands) and bool(policy.environment.probes)
+
+
+def _probe_timed_out(result: CommandResult) -> bool:
+    # `_run_shell_command`'s timeout leg: rc -1 with the literal tail. A
+    # signal-killed child (rc -1 is SIGHUP) carries its own output instead.
+    return result.returncode == -1 and result.output_tail == "timed out" and not result.spawn_error
+
+
+def probe_failure_reason(result: CommandResult, timeout_s: int, *, cwd: Path | None = None) -> str:
+    """Why a probe counts as failed, phrased for an operator: ``"rc=N"``,
+    ``"timed out after Ns"``, or ``"could not be started: ..."``. ``cwd`` lets a
+    probe that exited 0 yet was never run (win32 cmd handed a non-PATHEXT file,
+    #302) name why; without it that leg reads ``"rc=0"``."""
+    if result.spawn_error is not None:
+        return f"could not be started: {result.spawn_error}"
+    if _probe_timed_out(result):
+        return f"timed out after {timeout_s}s"
+    if result.returncode == 0 and cwd is not None:
+        unrunnable = env_fault_reason(result, cwd)
+        if unrunnable is not None:
+            return unrunnable
+    return f"rc={result.returncode}"
+
+
+def _probe_failed(result: CommandResult, cwd: Path) -> bool:
+    return (
+        result.spawn_error is not None
+        or result.returncode != 0
+        or _probe_timed_out(result)
+        # rc 0 is not proof on win32: cmd exits 0 for a file it cannot execute
+        or env_fault_reason(result, cwd) is not None
+    )
+
+
+def run_environment_probes(policy: Policy, cwd: Path) -> ProbeOutcome:
+    """Run ``[environment] probes`` in ``cwd`` in order, stopping at the first
+    failure: a nonzero exit, a timeout (``probe_timeout_s``), a probe that could
+    not be started, or one the host shell could not run (see
+    :func:`env_fault_reason`). An interrupted probe (hard stop) also ends the
+    pass; it is not a failure — :attr:`ProbeOutcome.interrupted` says so. No
+    probes configured spawns nothing and returns an ``ok`` outcome."""
+    timeout_s = policy.environment.probe_timeout_s
+    results: list[CommandResult] = []
+    for probe in policy.environment.probes:
+        result = _run_shell_command(probe, cwd, timeout_s)
+        results.append(result)
+        if result.interrupted:
+            break
+        if _probe_failed(result, cwd):
+            return ProbeOutcome(
+                tuple(results),
+                result,
+                timeout_s,
+                probe_failure_reason(result, timeout_s, cwd=cwd),
+            )
+    return ProbeOutcome(tuple(results), None, timeout_s)
+
+
+def environment_preflight_outcome(probe: ProbeOutcome) -> VerifyOutcome:
+    """The escalation for a failed environment preflight: an env fault with
+    cause ``"probe"``, so the run pauses without charging the attempt and no
+    ``[verify]`` command ran. Built directly, never through
+    :func:`verify_command_results_outcome` — a probe is not a verify result, and
+    the classifier's callers are pinned (tests/test_portability_guard.py).
+
+    An interrupted pass raises :class:`VerifyInterrupted`, the classifier's
+    backstop for the same missed boundary."""
+    if probe.interrupted:
+        commands = ", ".join(r.command for r in probe.results if r.interrupted)
+        raise VerifyInterrupted(
+            f"environment probes interrupted by a hard stop request: {commands}"
+        )
+    if probe.failed is None:
+        raise ValueError("environment_preflight_outcome needs a failed probe pass")
+    return _env_fault_outcome(probe.failed, f"environment probe {probe.reason}", "probe")
+
+
 def verify_commands_outcome(
-    policy: Policy, cwd: Path, *, on_results: CommandSink | None = None
+    policy: Policy,
+    cwd: Path,
+    *,
+    on_results: CommandSink | None = None,
+    on_probes: ProbeSink | None = None,
 ) -> VerifyOutcome:
     """Run the policy's deterministic verify commands and classify the results.
 
@@ -9632,15 +9793,32 @@ def verify_commands_outcome(
     dir still propagates. That is the same fail-loud boundary the dev leg already
     stands on, and wrapping the call here would trade it for silence: a lost
     journal write is a lost audit record, which is exactly the class of failure
-    that must not pass quietly."""
+    that must not pass quietly.
+
+    The environment preflight (DW-523) runs first when :func:`preflight_required`:
+    ``on_probes`` observes the probe pass whatever it found, and a failed pass
+    returns :func:`environment_preflight_outcome` straight away — no ``[verify]``
+    command runs, so ``on_results`` is NOT called (nothing ran to record). The
+    same must-not-raise contract applies to ``on_probes``, save that the
+    engine's sink raises ``RunStopped`` on an interrupted pass, deliberately."""
+    if preflight_required(policy):
+        probe = run_environment_probes(policy, cwd)
+        if on_probes is not None:
+            on_probes(probe)
+        if not probe.ok:
+            return environment_preflight_outcome(probe)
     results = run_verify_commands(policy, cwd)
     if on_results is not None:
         on_results(tuple(results))
-    return verify_command_results_outcome(results, cwd)
+    return verify_command_results_outcome(results, cwd, env_fault_rc=policy.verify.env_fault_rc)
 
 
 def _verify_review_commands(
-    policy: Policy, paths: ProjectPaths, *, on_results: CommandSink | None = None
+    policy: Policy,
+    paths: ProjectPaths,
+    *,
+    on_results: CommandSink | None = None,
+    on_probes: ProbeSink | None = None,
 ) -> VerifyOutcome:
     """Run a review gate's ``[verify] commands`` in ``paths.repo_root``.
 
@@ -9675,7 +9853,8 @@ def _verify_review_commands(
     whole dataclass to keep the three call sites uniform, not because it consults
     anything else. A future caller must not infer that artifact paths reach here.
 
-    ``on_results`` is forwarded, not consumed: an engine-supplied sink is how
+    ``on_results`` (and ``on_probes``, the environment preflight's) is forwarded,
+    not consumed: an engine-supplied sink is how
     review-gate results reach the journal, which the dev side has always had and
     these gates had not. Optional, so the gates stay callable from core (and from
     tests) with no engine at all — no sink simply means nothing is recorded,
@@ -9685,7 +9864,9 @@ def _verify_review_commands(
     fourth gate reaching past it would re-open #695. Enforced, not merely stated
     — see ``tests/test_portability_guard.py``.
     """
-    return verify_commands_outcome(policy, paths.repo_root, on_results=on_results)
+    return verify_commands_outcome(
+        policy, paths.repo_root, on_results=on_results, on_probes=on_probes
+    )
 
 
 def verify_review(
@@ -9696,6 +9877,7 @@ def verify_review(
     sprint_reached_done: bool = False,
     operator_park: bool = False,
     on_results: CommandSink | None = None,
+    on_probes: ProbeSink | None = None,
 ) -> VerifyOutcome:
     """Gate a completed review pass: spec at ``done``, sprint-status at ``done``,
     deterministic verify commands green.
@@ -9774,7 +9956,7 @@ def verify_review(
             f"sprint-status for {task.story_key} is {sprint!r}, expected {expected!r}"
         )
 
-    return _verify_review_commands(policy, paths, on_results=on_results)
+    return _verify_review_commands(policy, paths, on_results=on_results, on_probes=on_probes)
 
 
 def _is_signoff_regression(sprint: str | None, sprint_reached_done: bool, policy: Policy) -> bool:
@@ -9799,6 +9981,7 @@ def verify_review_stories(
     policy: Policy,
     *,
     on_results: CommandSink | None = None,
+    on_probes: ProbeSink | None = None,
 ) -> VerifyOutcome:
     """verify_review for stories mode: same spec-done + verify-commands gates,
     minus the sprint-status gate (stories mode has no sprint board — the story
@@ -9817,7 +10000,7 @@ def verify_review_stories(
     status = status_of(fm)
     if status != "done":
         return VerifyOutcome.retry(f"spec status is {status!r}, expected 'done'")
-    return _verify_review_commands(policy, paths, on_results=on_results)
+    return _verify_review_commands(policy, paths, on_results=on_results, on_probes=on_probes)
 
 
 def verify_review_bundle(
@@ -9826,6 +10009,7 @@ def verify_review_bundle(
     policy: Policy,
     *,
     on_results: CommandSink | None = None,
+    on_probes: ProbeSink | None = None,
 ) -> VerifyOutcome:
     """verify_review for a deferred-work bundle: no sprint-status check, but
     every dw id the bundle owns must be marked done in the ledger on disk. The
@@ -9885,7 +10069,7 @@ def verify_review_bundle(
             fixable=True,
         )
 
-    return _verify_review_commands(policy, paths, on_results=on_results)
+    return _verify_review_commands(policy, paths, on_results=on_results, on_probes=on_probes)
 
 
 def commit_story(repo: Path, message: str) -> str:

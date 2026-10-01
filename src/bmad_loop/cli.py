@@ -4476,10 +4476,26 @@ def _reverify(project: Path, cwd: Path) -> str | None:
     if not pol.verify.commands:
         print("note: --reverify: no [verify] commands are configured — nothing to re-run")
         return None
+    # The environment preflight (DW-523), same gate as every other composition:
+    # a failed probe means the environment, not the story, so no command runs.
+    probe = verify.run_environment_probes(pol, cwd)
+    if probe.failed is not None:
+        return (
+            f"environment probe {probe.failed.command!r} failed ({probe.reason}) — the run "
+            "environment, not the story; fix it and re-run"
+        )
     print(f"re-running {len(pol.verify.commands)} verify command(s)...")
+    env_fault_rc = pol.verify.env_fault_rc
     for result in verify.run_verify_commands(pol, cwd):
-        fault = verify.env_fault_reason(result, cwd)
+        fault = verify.env_fault_reason(result, cwd, env_fault_rc=env_fault_rc)
         if fault is not None:
+            if result.spawn_error is None and env_fault_rc and result.returncode == env_fault_rc:
+                # The command RAN and said so on purpose; "could not run" would
+                # misreport it (same order as verify's cause: spawn, then declared).
+                return (
+                    f"{result.command!r} reported an environment fault "
+                    f"(rc={result.returncode}, [verify] env_fault_rc)"
+                )
             return f"{result.command!r} could not run: {fault}"
         if result.returncode != 0:
             return f"{result.command!r} failed (rc {result.returncode}):\n{result.output_tail}"

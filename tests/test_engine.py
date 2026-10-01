@@ -84,6 +84,7 @@ from bmad_loop.model import (
 from bmad_loop.policy import (
     AdapterPolicy,
     DevPolicy,
+    EnvironmentPolicy,
     GatesPolicy,
     LimitsPolicy,
     NotifyPolicy,
@@ -3636,9 +3637,9 @@ def test_dev_stage_verify_commands_run_in_the_code_tree(project, monkeypatch, ma
     classify_cwds: list[Path] = []
     real_classify = verify.verify_command_results_outcome
 
-    def classify_in(results, cwd):
+    def classify_in(results, cwd, **kwargs):
         classify_cwds.append(cwd)
-        return real_classify(results, cwd)
+        return real_classify(results, cwd, **kwargs)
 
     monkeypatch.setattr(verify, "verify_command_results_outcome", classify_in)
 
@@ -3737,9 +3738,9 @@ def test_fix_stage_verify_commands_run_in_the_code_tree(project, monkeypatch, ma
     classify_cwds: list[Path] = []
     real_classify = verify.verify_command_results_outcome
 
-    def classify_in(results, cwd):
+    def classify_in(results, cwd, **kwargs):
         classify_cwds.append(cwd)
-        return real_classify(results, cwd)
+        return real_classify(results, cwd, **kwargs)
 
     monkeypatch.setattr(verify, "verify_command_results_outcome", classify_in)
 
@@ -13047,6 +13048,114 @@ def test_verify_env_fault_pauses_dev_without_burning_budget(project):
     assert task.attempt == 1  # budget untouched beyond the one real session
     assert engine.state.paused_stage == PAUSE_ESCALATION
     assert "rc=127" in engine.state.paused_reason
+    decision = [e for e in engine.journal.entries() if e["kind"] == "dev-decision"][-1]
+    assert decision["env_fault"] is True
+
+
+def _python_cmd(script: Path, body: str) -> str:
+    """A command running `body` under this interpreter — honored by sh and cmd."""
+    script.write_text(body, encoding="utf-8")
+    return f'"{sys.executable}" "{script}"'
+
+
+def test_dev_preflight_probe_failure_pauses_without_running_commands(project):
+    """DW-523: a failed `[environment]` probe at the dev gate is an env fault with
+    cause "probe" — the run pauses through the existing escalation path, the
+    attempt is not charged, and no `[verify]` command runs (so none is recorded).
+    Ablation: drop the preflight block from `_verify_commands_with_results` and
+    the marker command runs and the story commits."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    marker = project.project / "verify-ran"
+    command = _python_cmd(project.project / "mark.py", f"open(r'{marker}', 'w').close()\n")
+    policy = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        verify=VerifyPolicy(commands=(command,)),
+        environment=EnvironmentPolicy(probes=("exit 5",)),
+    )
+    # only one dev session scripted: a repair session must never be requested
+    engine, adapter = make_engine(project, [dev_effect(project, "1-1-a")], policy=policy)
+    summary = engine.run()
+
+    assert summary.paused and summary.escalated == 1 and summary.deferred == 0
+    assert [s.role for s in adapter.sessions] == ["dev"]
+    task = engine.state.tasks["1-1-a"]
+    assert task.phase == Phase.ESCALATED and task.attempt == 1
+    assert engine.state.paused_stage == PAUSE_ESCALATION
+    assert "environment probe rc=5" in engine.state.paused_reason
+    assert "no [verify] command was run" in engine.state.paused_reason
+    assert not marker.exists()
+    entries = engine.journal.entries()
+    assert not [e for e in entries if e["kind"] == "verify-command-result"]
+    (failed,) = [e for e in entries if e["kind"] == "env-probe-failed"]
+    assert failed["site"] == "verify:dev" and failed["command"] == "exit 5"
+    assert failed["rc"] == 5 and failed["story_key"] == "1-1-a"
+    assert "spawn_error" not in failed
+    decision = [e for e in entries if e["kind"] == "dev-decision"][-1]
+    assert decision["env_fault"] is True
+
+
+def test_review_gate_preflight_failure_escalates_instead_of_fix_session(project):
+    """The review gate's preflight (the reported case: the environment dies after
+    dev verified) pauses the run — no fix session, no review cycle burned — and
+    is journaled with site "verify:review". The probe passes once, then fails."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    counter = project.project / "probe-count"
+    probe = _python_cmd(
+        project.project / "probe.py",
+        "import pathlib, sys\n"
+        f"p = pathlib.Path(r'{counter}')\n"
+        "n = int(p.read_text()) + 1 if p.exists() else 1\n"
+        "p.write_text(str(n))\n"
+        "sys.exit(0 if n == 1 else 9)\n",
+    )
+    policy = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        verify=VerifyPolicy(commands=(_OK,)),
+        environment=EnvironmentPolicy(probes=(probe,)),
+    )
+    engine, adapter = make_engine(
+        project,
+        [dev_effect(project, "1-1-a"), review_effect(project, "1-1-a", clean=True)],
+        policy=policy,
+    )
+    summary = engine.run()
+
+    assert summary.paused and summary.escalated == 1 and summary.deferred == 0
+    assert [s.role for s in adapter.sessions] == ["dev", "review"]  # no fix session
+    task = engine.state.tasks["1-1-a"]
+    assert task.phase == Phase.ESCALATED and task.attempt == 1 and task.review_cycle == 1
+    assert "environment probe rc=9" in engine.state.paused_reason
+    entries = engine.journal.entries()
+    (failed,) = [e for e in entries if e["kind"] == "env-probe-failed"]
+    assert failed["site"] == "verify:review" and failed["rc"] == 9
+    # the dev gate's pass ran its command; the review gate's never did
+    stages = [e["verification_stage"] for e in entries if e["kind"] == "verify-command-result"]
+    assert stages == ["dev"]
+    review_failed = [e for e in entries if e["kind"] == "review-verify-failed"][-1]
+    assert review_failed["env_fault"] is True
+
+
+def test_declared_env_fault_rc_pauses_dev_without_burning_budget(project):
+    """`[verify] env_fault_rc`: a command exiting with the declared code pauses
+    the run like rc 127 does, and the pause text names the declared code rather
+    than the shell's convention."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    policy = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        verify=VerifyPolicy(commands=("exit 75",), env_fault_rc=75),
+    )
+    engine, adapter = make_engine(project, [dev_effect(project, "1-1-a")], policy=policy)
+    summary = engine.run()
+
+    assert summary.paused and summary.escalated == 1 and summary.deferred == 0
+    assert [s.role for s in adapter.sessions] == ["dev"]
+    task = engine.state.tasks["1-1-a"]
+    assert task.phase == Phase.ESCALATED and task.attempt == 1
+    assert "rc=75, [verify] env_fault_rc" in engine.state.paused_reason
+    assert "configured environment-fault code" in engine.state.paused_reason
     decision = [e for e in engine.journal.entries() if e["kind"] == "dev-decision"][-1]
     assert decision["env_fault"] is True
 

@@ -1350,8 +1350,9 @@ class VerifyOutcome:
     # fixable failures carry concrete evidence (failing command output) that a
     # feedback-driven repair session can act on; non-fixable retries start over
     fixable: bool = False
-    # the failure is the run environment's, not the story's (verify command
-    # not found / not executable): no repair session can fix it and every
+    # the failure is the run environment's, not the story's (a probe failed, a
+    # verify command could not run or declared one — `env_fault_cause` says
+    # which): no repair session can fix it and every
     # story shares the same commands, so it must never charge attempt budgets
     env_fault: bool = False
     # a session deliberately contradicted a state the orchestrator had already
@@ -1435,6 +1436,13 @@ class VerifyOutcome:
     # (`bundle-artifact-only-accepted`'s `count`). `None` whenever no receipt was
     # accepted, including on every non-bundle leg.
     artifact_only_residue: int | None = None
+    # WHY an `env_fault` outcome is one (DW-523), so the pause text can name the
+    # cause instead of guessing it. "" whenever `env_fault` is False. Vocabulary:
+    # "probe" (an [environment] probe failed, no [verify] command ran),
+    # "declared-rc" (a command exited with `[verify] env_fault_rc`), "shell-rc"
+    # (rc 126/127), "cmd" (win32 cmd.exe could not run the command), "spawn"
+    # (the command could not be started at all).
+    env_fault_cause: str = ""
 
     @classmethod
     def passed(
@@ -1466,6 +1474,7 @@ class VerifyOutcome:
         severity: str = "CRITICAL",
         env_fault: bool = False,
         contradiction: bool = False,
+        env_fault_cause: str = "",
     ) -> "VerifyOutcome":
         return cls(
             ok=False,
@@ -1473,6 +1482,7 @@ class VerifyOutcome:
             severity=severity,
             env_fault=env_fault,
             contradiction=contradiction,
+            env_fault_cause=env_fault_cause,
         )
 
     @property

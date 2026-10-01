@@ -1198,6 +1198,10 @@ JOURNAL_KINDS = frozenset(
         "deferred-close-skipped-out-of-tree",
         "deferred-close-unmatched",
         "dev-decision",
+        # DW-523. A failed `[environment]` probe pass, from
+        # `Engine._observe_environment_probes` (dev/fix verify, and the review
+        # gates through `_review_probe_sink`): `site` names the asking seam.
+        "env-probe-failed",
         "epic-boundary",
         "fix-decision",
         "fix-harvest-failed",
@@ -4376,6 +4380,88 @@ def test_verify_command_results_outcome_called_only_from_its_two_compositions():
         "repo_root (#695):\n"
         + "\n".join(f"  {rel}:{ln}: {txt.strip()}" for rel, ln, txt in offenders)
     )
+
+
+# DW-523: every composition that runs `[verify] commands` runs the environment
+# preflight first. `(file, class or None, function)` -> where it must call one of
+# `ENV_PREFLIGHT_CALLS`. A new composition is a decision to add a row here.
+ENV_PREFLIGHT_COMPOSITIONS = (
+    ("verify.py", None, "verify_commands_outcome"),
+    ("engine.py", "Engine", "_verify_commands_with_results"),
+    ("cli.py", None, "_reverify"),
+)
+ENV_PREFLIGHT_CALLS = frozenset({"run_environment_probes", "_run_environment_probes"})
+
+
+def _calls_env_preflight(tree: ast.Module, cls: str | None, name: str) -> bool | None:
+    """Whether ``cls.name`` (or module-level ``name``) calls a preflight runner;
+    None when the function is not found at all (a rename must not read as a pass)."""
+    scope: list[ast.stmt] = tree.body
+    if cls is not None:
+        owner = next((n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == cls), None)
+        if owner is None:
+            return None
+        scope = owner.body
+    fn = next(
+        (
+            n
+            for n in scope
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == name
+        ),
+        None,
+    )
+    if fn is None:
+        return None
+    for node in ast.walk(fn):
+        if isinstance(node, ast.Call):
+            callee = node.func
+            called = callee.id if isinstance(callee, ast.Name) else getattr(callee, "attr", None)
+            if called in ENV_PREFLIGHT_CALLS:
+                return True
+    return False
+
+
+def test_every_verify_composition_runs_the_environment_preflight():
+    """`verify_commands_outcome` (the three review gates), the engine's dev/fix
+    composition, and `cli._reverify` each run `[environment] probes` before any
+    `[verify]` command (DW-523). A composition that skipped it would run the
+    commands in an environment the operator declared a check for, and charge a
+    story for an outage. Ablation: delete the probe call from any of the three
+    and its row is named here."""
+    offenders = []
+    for rel, cls, name in ENV_PREFLIGHT_COMPOSITIONS:
+        tree = ast.parse((SRC / rel).read_text(encoding="utf-8"), filename=rel)
+        found = _calls_env_preflight(tree, cls, name)
+        if found is not True:
+            where = f"{cls}.{name}" if cls else name
+            offenders.append(f"{rel}:{where}: {'not found' if found is None else 'no preflight'}")
+    assert not offenders, (
+        "a [verify] composition no longer runs the environment preflight "
+        "(run_environment_probes / Engine._run_environment_probes):\n  " + "\n  ".join(offenders)
+    )
+
+
+def test_env_preflight_detector_sees_a_missing_call():
+    """The guard above asserts a PRESENCE per row; feed its detector the three
+    shapes it must tell apart, so a detector that always answered True (or never
+    found the function) cannot pass it."""
+    with_call = ast.parse(
+        "class Engine:\n"
+        "    def _verify_commands_with_results(self):\n"
+        "        self._run_environment_probes(task, site='x')\n"
+        "def _reverify():\n"
+        "    verify.run_environment_probes(pol, cwd)\n"
+    )
+    without = ast.parse(
+        "class Engine:\n"
+        "    def _verify_commands_with_results(self):\n"
+        "        verify.run_verify_commands(self.policy, root)\n"
+    )
+    assert _calls_env_preflight(with_call, "Engine", "_verify_commands_with_results") is True
+    assert _calls_env_preflight(with_call, None, "_reverify") is True
+    assert _calls_env_preflight(without, "Engine", "_verify_commands_with_results") is False
+    assert _calls_env_preflight(without, None, "_reverify") is None
+    assert _calls_env_preflight(without, "Missing", "_verify_commands_with_results") is None
 
 
 def test_spec_path_resolved_only_through_the_anchor():

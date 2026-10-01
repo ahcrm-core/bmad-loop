@@ -214,6 +214,29 @@ minimum = 0
 default_ref = "VerifyPolicy.stream_capture_kb"
 label = "verifier stream capture (KiB)"
 description = "per-stream cap on the verifier stdout/stderr retained under the run's verify/ directory (the tail is kept; the journal records the full size and a truncation flag) · 0 = capture nothing"
+[[section.field]]
+key = "env_fault_rc"
+kind = "int"
+minimum = 0
+maximum = 255
+default_ref = "VerifyPolicy.env_fault_rc"
+label = "environment-fault exit status"
+description = "exit status a verify command uses to declare an environment fault (pause, attempt not charged) instead of a code failure · 0 = disabled; 75 (EX_TEMPFAIL) is a good choice"
+
+[[section]]
+name = "environment"
+description = "environment health probes (run before verify, session launches, and charging a failed attempt)"
+[[section.field]]
+key = "probes"
+kind = "lines"
+description = "health-check commands run in the project root; a failing probe (nonzero exit, timeout, unrunnable) is an environment fault: the run pauses and the attempt is not charged"
+[[section.field]]
+key = "probe_timeout_s"
+kind = "int"
+minimum = 1
+default_ref = "EnvironmentPolicy.probe_timeout_s"
+label = "probe timeout (s)"
+description = "per-probe wall-clock bound; a probe running past it counts as failed"
 
 [[section]]
 name = "notify"

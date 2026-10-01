@@ -949,6 +949,12 @@ class Engine:
         # so a gate that fails before reaching its commands publishes "no pass
         # ran", never a previous gate's records.
         self._review_verify_records: VerifyCommandRecords = NO_VERIFY_COMMANDS
+        # Whether `[environment] probes` passed since the last session launch
+        # (DW-523). Transient on purpose — never persisted: a resumed process
+        # has not probed anything yet. Set by `_run_environment_probes` on a
+        # healthy pass, reset at the top of every `_run_session`, because a
+        # session may have changed the environment the pass vouched for.
+        self._env_probes_fresh = False
         # Per-unit worktree isolation + integration flow (issue #244 F-3/F-9a).
         # Built from narrow deps + engine callbacks; the same-name Engine._* worktree
         # methods below delegate to it. `emit` is late-bound (a lambda, not the bound
@@ -6029,13 +6035,66 @@ class Engine:
         "no pass ran" are different facts, and only the caller that never reaches
         here may publish the second one.
         """
+        if verify.preflight_required(self.policy):
+            # The environment preflight (DW-523): a failed probe is an env fault
+            # with cause "probe", returned BEFORE any command runs — so there are
+            # no command records, and the env fault rides the existing escalation
+            # path (`decide_dev` CRITICAL), which pauses without charging.
+            probe = self._run_environment_probes(task, site=f"verify:{verification_stage}")
+            if not probe.ok:
+                return verify.environment_preflight_outcome(probe), NO_VERIFY_COMMANDS
         results = tuple(verify.run_verify_commands(self.policy, self.workspace.root))
         sequence = self._journal_verify_command_results(task, verification_stage, results)
         self._stop_if_verify_interrupted(results)
-        outcome = verify.verify_command_results_outcome(list(results), self.workspace.root)
+        outcome = verify.verify_command_results_outcome(
+            list(results), self.workspace.root, env_fault_rc=self.policy.verify.env_fault_rc
+        )
         return outcome, VerifyCommandRecords(
             results=results, stage=verification_stage, sequence=sequence
         )
+
+    def _run_environment_probes(self, task: StoryTask, *, site: str) -> verify.ProbeOutcome:
+        """Run ``[environment] probes`` in the workspace root (where the verify
+        commands run) and record the result: a failed pass journals
+        ``env-probe-failed`` naming the ``site`` that asked; a healthy one marks
+        the probes fresh until the next session launch. An interrupted pass
+        stops the run (DW-353) before anything decides on it."""
+        probe = verify.run_environment_probes(self.policy, self.workspace.root)
+        self._observe_environment_probes(task, probe, site=site)
+        return probe
+
+    def _observe_environment_probes(
+        self, task: StoryTask, probe: verify.ProbeOutcome, *, site: str
+    ) -> None:
+        """The record-and-stop half of :meth:`_run_environment_probes`, shared
+        with the review gates' :meth:`_review_probe_sink` (whose pass core runs)."""
+        self._stop_if_verify_interrupted(probe.results)
+        failed = probe.failed
+        if failed is None:
+            self._env_probes_fresh = True
+            return
+        self._env_probes_fresh = False
+        # Two literal writes rather than a conditional `**` splat, so the journal
+        # field guard reads every name; `spawn_error` appears only when set.
+        if failed.spawn_error is None:
+            self.journal.append(
+                "env-probe-failed",
+                story_key=task.story_key,
+                site=site,
+                command=failed.command,
+                rc=failed.returncode,
+                output_tail=failed.output_tail,
+            )
+        else:
+            self.journal.append(
+                "env-probe-failed",
+                story_key=task.story_key,
+                site=site,
+                command=failed.command,
+                rc=failed.returncode,
+                output_tail=failed.output_tail,
+                spawn_error=failed.spawn_error,
+            )
 
     @staticmethod
     def _stop_if_verify_interrupted(results: Sequence[verify.CommandResult]) -> None:
@@ -6978,6 +7037,18 @@ class Engine:
 
         return sink
 
+    def _review_probe_sink(self, task: StoryTask) -> verify.ProbeSink:
+        """The sink a review gate hands its environment preflight to (DW-523):
+        the pass core ran in ``paths.repo_root`` is recorded exactly as
+        :meth:`_run_environment_probes` records the dev side's — a failure
+        journals ``env-probe-failed`` with site ``"verify:review"``, a hard stop
+        raises ``RunStopped``, a healthy pass marks the probes fresh."""
+
+        def sink(probe: verify.ProbeOutcome) -> None:
+            self._observe_environment_probes(task, probe, site="verify:review")
+
+        return sink
+
     def _review_verify_gate(
         self,
         task: StoryTask,
@@ -7028,6 +7099,7 @@ class Engine:
             sprint_reached_done=not self._dev_review_enabled(),
             operator_park=self._operator_park_enabled(),
             on_results=self._review_command_sink(task),
+            on_probes=self._review_probe_sink(task),
         )
         if outcome.ok:
             self._accept_review_artifact_source(task)
@@ -7280,6 +7352,9 @@ class Engine:
         preserve_dispatched_spec_snapshot: bool = False,
         prelaunch_validator: Callable[[], None] | None = None,
     ) -> SessionResult:
+        # A session may change the environment a probe pass vouched for, so no
+        # pass survives a launch (DW-523).
+        self._env_probes_fresh = False
         # ``label`` names a non-standard session (a plugin-provided workflow) so
         # its task_id stays distinct from the role's own dev/review attempts.
         task_id = _session_task_id(task.story_key, label if label else role, seq, task.generation)

@@ -13743,9 +13743,9 @@ def test_confirm_reverify_runs_the_commands_in_the_code_tree(
     classify_cwds: list[Path] = []
     real_env_fault = verify.env_fault_reason
 
-    def classify_in(result, cwd):
+    def classify_in(result, cwd, **kwargs):
         classify_cwds.append(cwd)
-        return real_env_fault(result, cwd)
+        return real_env_fault(result, cwd, **kwargs)
 
     monkeypatch.setattr(verify, "env_fault_reason", classify_in)
 
@@ -13926,6 +13926,37 @@ def test_reverify_walks_every_command_when_they_all_pass(tmp_path, capsys):
 
     assert sentinel.is_file()
     assert "verify commands passed" in capsys.readouterr().out
+
+
+def test_reverify_runs_probes_first_and_names_the_environment(tmp_path, capsys):
+    """A failed `[environment]` probe answers before any `[verify]` command runs
+    (DW-523), and the reason names the probe and the environment rather than the
+    story. Ablation: drop the probe block from `_reverify` and the sentinel
+    command runs (and the reason becomes None — the commands pass)."""
+    sentinel = tmp_path / "probed-ran"
+    command = _sentinel_writer_cmd(tmp_path, sentinel, rc=0, stem="probed")
+    _write_policy(
+        tmp_path,
+        f"[verify]\ncommands = {json.dumps([command])}\n" '[environment]\nprobes = ["exit 6"]\n',
+    )
+
+    reason = cli._reverify(tmp_path, tmp_path)
+
+    assert reason is not None
+    assert reason.startswith("environment probe 'exit 6' failed (rc=6)")
+    assert "the run environment, not the story" in reason
+    assert not sentinel.exists()
+    assert "re-running" not in capsys.readouterr().out
+
+
+def test_reverify_declared_env_fault_rc_reports_not_could_not_run(tmp_path):
+    """A command exiting with `[verify] env_fault_rc` RAN and declared the fault;
+    "could not run" would send the operator hunting for a missing binary."""
+    _write_policy(tmp_path, '[verify]\ncommands = ["exit 75"]\nenv_fault_rc = 75\n')
+
+    reason = cli._reverify(tmp_path, tmp_path)
+
+    assert reason == "'exit 75' reported an environment fault (rc=75, [verify] env_fault_rc)"
 
 
 def test_confirm_drops_a_record_path_replaced_by_a_directory(project, capsys, monkeypatch):
@@ -14533,9 +14564,9 @@ def test_a_resume_reverify_runs_the_commands_in_the_code_tree(
     classify_cwds: list[Path] = []
     real_env_fault = verify.env_fault_reason
 
-    def classify_in(result, cwd):
+    def classify_in(result, cwd, **kwargs):
         classify_cwds.append(cwd)
-        return real_env_fault(result, cwd)
+        return real_env_fault(result, cwd, **kwargs)
 
     monkeypatch.setattr(verify, "env_fault_reason", classify_in)
 

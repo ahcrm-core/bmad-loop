@@ -42,7 +42,7 @@ from conftest import (
 
 from bmad_loop import childrun, platform_util, verify
 from bmad_loop.model import StoryTask
-from bmad_loop.policy import Policy, ReviewPolicy, VerifyPolicy
+from bmad_loop.policy import EnvironmentPolicy, Policy, ReviewPolicy, VerifyPolicy
 
 
 def make_task(paths, story_key="1-1-a"):
@@ -2434,17 +2434,198 @@ def test_unusable_cwd_escalates_as_an_environment_fault(tmp_path):
     assert out.reason.count(spawn_exc) == 1
 
 
-def test_rc_env_fault_keeps_its_own_explanatory_clause(tmp_path):
-    """The complement, so the branch is pinned from both sides: rc 127 still says
-    "command not found / not executable" — that leg IS a claim about the command,
-    and branching must not have quietly rewritten it for everyone."""
+def test_shell_rc_env_fault_does_not_assert_the_cause(tmp_path):
+    """rc 127 is the shell's code for a missing command, but a command may also
+    exit 127 on purpose — before `[verify] env_fault_rc` it was the operator's only
+    "environment broken" escape (DW-523) — so the pause text names the convention
+    instead of asserting "command not found / not executable". The `rc=127` token
+    stays on the first line, and the spawn leg's clause stays off this one."""
     policy = Policy(verify=VerifyPolicy(commands=("exit 127",)))
 
     out = verify.verify_commands_outcome(policy, tmp_path)
 
-    assert not out.ok and out.env_fault
-    assert "command not found / not executable" in out.reason
+    assert not out.ok and out.env_fault and out.env_fault_cause == "shell-rc"
+    assert out.reason.startswith("verify environment fault (rc=127): exit 127\n")
+    assert "command not found / not executable" not in out.reason
+    assert "the shell exits 127 when it cannot find a command" in out.reason
+    assert "may also exit with it deliberately" in out.reason
     assert "could not be started" not in out.reason
+
+
+def test_declared_env_fault_rc_escalates_with_declared_wording(tmp_path):
+    """A command exiting with `[verify] env_fault_rc` is an environment fault —
+    pause, attempt not charged — and the text says the operator's code fired."""
+    policy = Policy(verify=VerifyPolicy(commands=("exit 75",), env_fault_rc=75))
+
+    out = verify.verify_commands_outcome(policy, tmp_path)
+
+    assert not out.ok and out.env_fault and not out.retryable and not out.fixable
+    assert out.env_fault_cause == "declared-rc"
+    assert out.reason.startswith("verify environment fault (rc=75, [verify] env_fault_rc): exit 75")
+    assert "exited with the configured environment-fault code" in out.reason
+    assert "the shell exits 127" not in out.reason
+
+
+def test_env_fault_rc_disabled_by_default_is_an_ordinary_failure(tmp_path):
+    """Unset (0), the same exit is an ordinary fixable retry — the default stays
+    byte-identical to the behavior before the knob existed. Ablation: classify
+    with `env_fault_rc=75` hard-wired in `verify_commands_outcome` and this
+    escalates instead."""
+    policy = Policy(verify=VerifyPolicy(commands=("exit 75",)))
+
+    out = verify.verify_commands_outcome(policy, tmp_path)
+
+    assert not out.ok and out.retryable and out.fixable and not out.env_fault
+    assert out.env_fault_cause == ""
+    assert out.reason.startswith("verify command failed (rc=75): exit 75")
+
+
+def test_declared_env_fault_rc_outranks_earlier_ordinary_failure(tmp_path):
+    """Same rule as 126/127: an env fault anywhere in the pass wins over an
+    earlier ordinary failure, because a repair session for the first would still
+    run in the broken environment."""
+    policy = Policy(verify=VerifyPolicy(commands=(_FAIL, "exit 75"), env_fault_rc=75))
+
+    out = verify.verify_commands_outcome(policy, tmp_path)
+
+    assert out.env_fault and out.env_fault_cause == "declared-rc"
+    assert "exit 75" in out.reason.splitlines()[0]
+
+
+def _marker_cmd(marker: Path) -> str:
+    """A command that leaves `marker` behind when it runs, under sh and cmd."""
+    return f"\"{sys.executable}\" -c \"open(r'{marker}', 'w').close()\""
+
+
+def test_run_environment_probes_none_configured_spawns_nothing(tmp_path, monkeypatch):
+    """The default (`probes = []`) spawns nothing and reads as healthy."""
+    spawned: list[str] = []
+    monkeypatch.setattr(
+        verify, "_run_shell_command", lambda command, cwd, timeout: spawned.append(command)
+    )
+
+    probe = verify.run_environment_probes(Policy(), tmp_path)
+
+    assert probe.ok and probe.results == () and probe.failed is None and probe.reason == ""
+    assert spawned == []
+    assert not verify.preflight_required(Policy(verify=VerifyPolicy(commands=(_OK,))))
+
+
+def test_run_environment_probes_stop_at_first_failure(tmp_path):
+    """Fail-fast: the probe after the first failure never spawns."""
+    marker = tmp_path / "third-ran"
+    policy = Policy(environment=EnvironmentPolicy(probes=(_OK, "exit 3", _marker_cmd(marker))))
+
+    probe = verify.run_environment_probes(policy, tmp_path)
+
+    assert not probe.ok and not probe.interrupted
+    assert [r.command for r in probe.results] == [_OK, "exit 3"]
+    assert probe.failed is not None and probe.failed.command == "exit 3"
+    assert probe.reason == "rc=3"
+    assert not marker.exists()
+
+
+def test_probe_timeout_is_a_failure(tmp_path):
+    """A probe that hangs past `probe_timeout_s` is a failed probe, not a pass and
+    not a crash; the reason names the bound."""
+    sleeper = tmp_path / "sleeper.py"
+    sleeper.write_text("import time\ntime.sleep(30)\n", encoding="utf-8")
+    hangs = f'"{sys.executable}" "{sleeper}"'
+    policy = Policy(environment=EnvironmentPolicy(probes=(hangs,), probe_timeout_s=1))
+
+    probe = verify.run_environment_probes(policy, tmp_path)
+
+    assert not probe.ok and probe.failed is not None
+    assert probe.failed.returncode == -1 and probe.failed.output_tail == "timed out"
+    assert probe.reason == "timed out after 1s"
+
+
+def test_probe_spawn_fault_is_a_failure(tmp_path):
+    """A probe that cannot even be started (unusable cwd) fails the pass."""
+    policy = Policy(environment=EnvironmentPolicy(probes=(_OK,)))
+
+    probe = verify.run_environment_probes(policy, tmp_path / "nowhere")
+
+    assert not probe.ok and probe.failed is not None
+    assert probe.failed.spawn_error is not None
+    assert probe.reason.startswith("could not be started: child not started")
+
+
+def test_win32_unrunnable_probe_counts_as_failure(tmp_path, monkeypatch):
+    """rc 0 is not proof on win32: cmd exits 0 for a file it cannot execute
+    (#302), so a probe the shell classifier calls unrunnable fails even though it
+    "passed". Faked through `env_fault_reason` so the wiring is pinned on every
+    platform; the cmd classifier itself is pinned by the WIN32_ONLY rows above.
+    Ablation: drop the `env_fault_reason` arm from `_probe_failed` and this
+    reads as healthy."""
+    monkeypatch.setattr(
+        verify,
+        "env_fault_reason",
+        lambda result, cwd, **_: "check.sh is not executable by cmd (extension not in PATHEXT)",
+    )
+    policy = Policy(environment=EnvironmentPolicy(probes=(_OK,)))
+
+    probe = verify.run_environment_probes(policy, tmp_path)
+
+    assert not probe.ok and probe.failed is not None and probe.failed.returncode == 0
+    assert probe.reason == "check.sh is not executable by cmd (extension not in PATHEXT)"
+
+
+def test_preflight_failure_skips_verify_commands(tmp_path):
+    """A failed probe escalates as an env fault with cause "probe" and runs NO
+    `[verify]` command; `on_results` is not called (nothing ran to record), and
+    `on_probes` sees the failed pass. Ablation: remove the `return
+    environment_preflight_outcome(probe)` in `verify_commands_outcome` and the
+    marker command runs."""
+    marker = tmp_path / "verify-ran"
+    policy = Policy(
+        verify=VerifyPolicy(commands=(_marker_cmd(marker),)),
+        environment=EnvironmentPolicy(probes=("exit 4",)),
+    )
+    seen_results: list[object] = []
+    seen_probes: list[verify.ProbeOutcome] = []
+
+    out = verify.verify_commands_outcome(
+        policy, tmp_path, on_results=seen_results.append, on_probes=seen_probes.append
+    )
+
+    assert not out.ok and out.env_fault and not out.retryable
+    assert out.env_fault_cause == "probe"
+    assert out.reason.startswith("verify environment fault (environment probe rc=4): exit 4\n")
+    assert "an [environment] probe failed, so no [verify] command was run" in out.reason
+    assert not marker.exists()
+    assert seen_results == []
+    assert len(seen_probes) == 1 and not seen_probes[0].ok
+
+
+def test_preflight_passes_then_runs_verify_commands(tmp_path):
+    """The complement: a healthy probe pass is observed and the commands run."""
+    marker = tmp_path / "verify-ran"
+    policy = Policy(
+        verify=VerifyPolicy(commands=(_marker_cmd(marker),)),
+        environment=EnvironmentPolicy(probes=(_OK,)),
+    )
+    seen_probes: list[verify.ProbeOutcome] = []
+
+    out = verify.verify_commands_outcome(policy, tmp_path, on_probes=seen_probes.append)
+
+    assert out.ok and marker.exists()
+    assert len(seen_probes) == 1 and seen_probes[0].ok
+
+
+def test_preflight_skipped_without_verify_commands(tmp_path):
+    """No `[verify]` commands, no preflight: probes guard command runs, so a
+    pass that runs nothing spawns nothing extra. Ablation: make
+    `preflight_required` ignore `verify.commands` and the probe marker appears."""
+    marker = tmp_path / "probe-ran"
+    policy = Policy(environment=EnvironmentPolicy(probes=(_marker_cmd(marker),)))
+    seen_probes: list[verify.ProbeOutcome] = []
+
+    out = verify.verify_commands_outcome(policy, tmp_path, on_probes=seen_probes.append)
+
+    assert out.ok
+    assert not marker.exists() and seen_probes == []
+    assert not verify.preflight_required(policy)
 
 
 def test_spawn_fault_rc_cannot_collide_with_a_real_return_code():
@@ -4256,9 +4437,9 @@ def test_verify_review_gates_classify_against_the_root_they_run_in(
         seen["run"] = cwd
         return real_run(policy, cwd)
 
-    def spy_classify(results, cwd):
+    def spy_classify(results, cwd, **kwargs):
         seen["classify"] = cwd
-        return real_classify(results, cwd)
+        return real_classify(results, cwd, **kwargs)
 
     monkeypatch.setattr(verify, "run_verify_commands", spy_run)
     monkeypatch.setattr(verify, "verify_command_results_outcome", spy_classify)
@@ -4268,6 +4449,33 @@ def test_verify_review_gates_classify_against_the_root_they_run_in(
     # both hops, not just execution: the classifier decides escalate-vs-retry
     assert seen["run"] == repo_root
     assert seen["classify"] == repo_root
+
+
+@pytest.mark.parametrize("mode", ["review", "review_stories", "review_bundle"])
+def test_review_preflight_runs_in_repo_root(project, tmp_path, mode):
+    """The review gates' environment preflight runs where their commands run —
+    `paths.repo_root` (#695) — and `on_probes` reaches it through all three gates.
+    Two-direction probe as in the row above: the repo-root marker passes, the
+    project marker fails the preflight (cause "probe") before any command runs."""
+    repo_root = tmp_path / "code-root"
+    repo_root.mkdir()
+    plant_root_markers(repo_root=repo_root, project=project.project)
+    paths = dataclasses.replace(project, repo_root=repo_root)
+    task, gate = _review_gate_at_done(project, mode)
+    seen: list[verify.ProbeOutcome] = []
+
+    def policy_with(probe: str) -> Policy:
+        return Policy(
+            verify=VerifyPolicy(commands=(_OK,)),
+            environment=EnvironmentPolicy(probes=(probe,)),
+        )
+
+    assert gate(task, paths, policy_with(REPO_ROOT_MARKER_CMD), on_probes=seen.append).ok
+    assert len(seen) == 1 and seen[0].ok
+
+    out = gate(task, paths, policy_with(PROJECT_MARKER_CMD), on_probes=seen.append)
+    assert not out.ok and out.env_fault and out.env_fault_cause == "probe"
+    assert len(seen) == 2 and not seen[1].ok
 
 
 def _break_the_check_before_the_commands(project, task, mode) -> None:

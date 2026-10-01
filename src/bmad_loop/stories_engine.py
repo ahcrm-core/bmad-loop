@@ -605,6 +605,7 @@ class StoriesEngine(Engine):
             self.workspace.paths,
             self.policy,
             on_results=self._review_command_sink(task),
+            on_probes=self._review_probe_sink(task),
         )
 
     def _sprint_board_instruction(self) -> str:

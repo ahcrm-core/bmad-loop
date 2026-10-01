@@ -678,6 +678,8 @@ def test_limits_integer_fields_reject_non_integer(key, bad):
     ("section", "key"),
     [
         ("verify", "stream_capture_kb"),
+        ("verify", "env_fault_rc"),
+        ("environment", "probe_timeout_s"),
         ("sweep", "max_bundles"),
         ("sweep", "max_triage_attempts"),
         ("sweep", "max_migration_attempts"),
@@ -740,6 +742,7 @@ def test_usage_grace_s_accepts_a_toml_integer(table):
     ("table", "key"),
     [
         ("verify", "commands"),
+        ("environment", "probes"),
         ("adapter", "extra_args"),
         ("adapter.dev", "extra_args"),
     ],
@@ -1354,6 +1357,61 @@ def test_verify_stream_capture_kb(tmp_path):
     p.write_text("[verify]\nstream_capture_kb = -1\n")
     with pytest.raises(policy.PolicyError, match=r"verify\.stream_capture_kb"):
         policy.load(p)
+
+
+def test_environment_policy_parses_and_defaults():
+    """`[environment]` (DW-523): absent, nothing is probed and the timeout is 60s;
+    present, the probes keep their order (they run fail-fast in sequence)."""
+    default = policy.loads("")
+    assert default.environment == policy.EnvironmentPolicy()
+    assert default.environment.probes == () and default.environment.probe_timeout_s == 60
+    assert default.verify.env_fault_rc == 0
+
+    parsed = policy.loads(
+        '[environment]\nprobes = ["pg_isready", "curl -fsS http://x"]\nprobe_timeout_s = 5\n'
+    )
+    assert parsed.environment.probes == ("pg_isready", "curl -fsS http://x")
+    assert parsed.environment.probe_timeout_s == 5
+    # a partial table keeps the other default
+    assert policy.loads("[environment]\nprobe_timeout_s = 9\n").environment.probes == ()
+
+
+@pytest.mark.parametrize("bad", [0, -1])
+def test_environment_probe_timeout_must_be_positive(bad):
+    """A 0s bound would fail every probe before it could answer. Ablation: drop
+    the `probe_timeout_s < 1` check and both rows parse."""
+    with pytest.raises(policy.PolicyError, match=r"environment\.probe_timeout_s must be >= 1"):
+        policy.loads(f"[environment]\nprobe_timeout_s = {bad}\n")
+
+
+@pytest.mark.parametrize("bad", ['[""]', '["   "]', '["pg_isready", "\\t"]'])
+def test_environment_probes_reject_blank_entries(bad):
+    """A blank probe is `sh -c ""`, which exits 0 — a check of nothing that reads
+    as a healthy environment. Ablation: drop the blank-entry check and every row
+    parses."""
+    with pytest.raises(policy.PolicyError, match=r"environment\.probes entries must be non-blank"):
+        policy.loads(f"[environment]\nprobes = {bad}\n")
+
+
+@pytest.mark.parametrize("value", [0, 75, 255])
+def test_verify_env_fault_rc_bounds_accept(value):
+    assert policy.loads(f"[verify]\nenv_fault_rc = {value}\n").verify.env_fault_rc == value
+
+
+@pytest.mark.parametrize(
+    ("bad", "match"),
+    [
+        ("-1", r"verify\.env_fault_rc must be 0 \(disabled\) or an exit status 1-255: got -1"),
+        ("256", r"verify\.env_fault_rc must be 0 \(disabled\) or an exit status 1-255: got 256"),
+        ("true", r"verify\.env_fault_rc must be an integer"),
+    ],
+)
+def test_verify_env_fault_rc_bounds(bad, match):
+    """0 disables; an exit status is 1-255, so anything else could never match a
+    real exit and would read as configured while doing nothing. Ablation: drop the
+    range check and the -1/256 rows parse."""
+    with pytest.raises(policy.PolicyError, match=match):
+        policy.loads(f"[verify]\nenv_fault_rc = {bad}\n")
 
 
 def test_scm_invalid_values(tmp_path):

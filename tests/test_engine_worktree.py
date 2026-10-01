@@ -365,9 +365,9 @@ def test_isolated_verify_commands_execute_and_classify_in_the_unit_worktree(proj
     classified: list[Path] = []
     real_classify = verify.verify_command_results_outcome
 
-    def spy_classify(results, cwd):
+    def spy_classify(results, cwd, **kwargs):
         classified.append(cwd.resolve())
-        return real_classify(results, cwd)
+        return real_classify(results, cwd, **kwargs)
 
     monkeypatch.setattr(verify, "verify_command_results_outcome", spy_classify)
     policy = replace(
