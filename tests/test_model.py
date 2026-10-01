@@ -562,6 +562,7 @@ def test_env_fault_sites_vocabulary():
         "probe:claim:dev",
         "probe:claim:fix",
         "probe:claim:review",
+        "probe:claim:workflow",
         "probe:dispatch:dev",
         "probe:dispatch:review",
     }
@@ -607,9 +608,8 @@ def _dev_record(status: str) -> SessionRecord:
         ("verify:review", None, True),
         ("probe:decision:review", None, True),
         ("probe:decision:workflow", None, True),
-        ("probe:claim:dev", None, True),
-        ("probe:claim:fix", None, True),
         ("probe:claim:review", None, True),
+        ("probe:claim:workflow", None, True),
         ("probe:dispatch:dev", "completed", False),
         ("probe:dispatch:review", "completed", False),
         ("probe:decision:dev", "completed", True),
@@ -617,12 +617,17 @@ def _dev_record(status: str) -> SessionRecord:
         ("probe:decision:dev", None, False),
         ("probe:decision:fix", "completed", True),
         ("probe:decision:fix", "timeout", False),
+        ("probe:claim:dev", "completed", True),
+        ("probe:claim:dev", "crashed", False),
+        ("probe:claim:dev", None, False),
+        ("probe:claim:fix", "completed", True),
+        ("probe:claim:fix", "timeout", False),
     ],
 )
 def test_env_fault_site_reverifiable_matrix(site, latest_dev_status, expected):
-    """Dispatch sites fired before any session ran, and a decision-site fault after a
-    crashed/timed-out dev (or fix — recorded under the dev role) session left no
-    product: neither is reverifiable. Every other site in the closed vocabulary is.
+    """Dispatch sites fired before any session ran, and a decision- or claim-site
+    fault after a crashed/timed-out dev (or fix — recorded under the dev role)
+    session left no product: neither is reverifiable. Every other site in the closed vocabulary is.
 
     Ablation, performed: drop the latest-record status check and the `crashed` /
     `timeout` / no-record rows redden; drop the dispatch-prefix check and both

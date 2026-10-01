@@ -14306,6 +14306,46 @@ def test_review_loop_dispatch_pause_replays_completed_pass(project, tmp_path):
     assert not _rows(engine2, "resume-restart")
 
 
+def test_review_loop_dispatch_pause_does_not_double_spend_the_damping_grant(project, tmp_path):
+    """A finalized pass that recommends its own follow-up earns a damping grant; the
+    next cycle's dispatch gate then pauses. The spend must not persist with that
+    pause: the resume replays the recorded pass and re-derives it, so the follow-up
+    review the policy grants still runs (not a damped force-converge), and the grant
+    is spent exactly once.
+
+    Ablation, performed: spend the grant at the end of the cycle (before the gate)
+    and the paused counter reads 1, the replay damps, and no review session runs."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    rig = _env_rig(tmp_path)
+    engine, adapter = make_engine(
+        project,
+        [
+            dev_effect(project, "1-1-a"),
+            rig.dies_during(review_effect(project, "1-1-a", clean=False)),
+        ],
+        policy=_env_policy(rig, limits=LimitsPolicy(max_review_cycles=3, max_followup_reviews=1)),
+    )
+    engine.run()
+
+    assert [s.role for s in adapter.sessions] == ["dev", "review"]
+    task = _dispatch_paused(engine, "review")
+    assert task.phase == Phase.REVIEW_VERIFY and task.review_cycle == 1
+    assert task.followup_reviews_spent == 0  # not persisted with the pause
+
+    rig.up.write_text("up\n")
+    engine2, adapter2 = resume_engine(
+        project, engine, [review_effect(project, "1-1-a", clean=True)]
+    )
+    summary = engine2.run()
+
+    assert summary.done == 1
+    assert [s.role for s in adapter2.sessions] == ["review"]  # the granted follow-up
+    task = engine2.state.tasks["1-1-a"]
+    assert task.phase == Phase.DONE and task.review_cycle == 2
+    assert task.followup_reviews_spent == 1
+    assert not _rows(engine2, "review-followup-damped")
+
+
 def test_isolated_dispatch_pause_reopens_unit(project, tmp_path):
     """Under worktree isolation the gate fires inside the freshly mounted unit;
     the pause leaves it mounted, and resume REOPENS that same unit for the dev

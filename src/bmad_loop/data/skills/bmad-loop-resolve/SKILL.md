@@ -248,7 +248,7 @@ a verify command declared or hit an environment fault) at the site it names —
 `verify:<role>`, `probe:decision:<role>`, `probe:claim:<role>` or
 `probe:dispatch:<role>`. The attempt was **not** charged.
 
-A `probe:claim:<role>` site means the dev, fix or review session wrote an
+A `probe:claim:<role>` site means the dev, fix, review or workflow session wrote an
 `Environment fault: <what is broken>` line in its final `## Auto Run Result` and
 the orchestrator's own probe then failed. The line only triggered that probe — a
 claim the probes did not confirm never pauses the run, so the failed probe, not

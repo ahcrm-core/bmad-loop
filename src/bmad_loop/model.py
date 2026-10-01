@@ -90,6 +90,7 @@ ENV_FAULT_SITES = frozenset(
         "probe:claim:dev",
         "probe:claim:fix",
         "probe:claim:review",
+        "probe:claim:workflow",
         f"{ENV_FAULT_SITE_DISPATCH_PREFIX}dev",
         f"{ENV_FAULT_SITE_DISPATCH_PREFIX}review",
     }
@@ -1054,14 +1055,19 @@ class StoryTask:
 
 
 # Sites whose fault fired AFTER a session's own verdict: the decision seam re-probed a
-# failure the deciders were about to charge. Only a COMPLETED session left a product
+# failure the deciders were about to charge, or a session's claim was confirmed —
+# both reached for crashed and timed-out sessions too (a third-party adapter's
+# non-completed result can carry a claim). Only a COMPLETED session left a product
 # worth re-verifying there; a crashed or timed-out one did not, so its escalation
-# needs a plain re-arm (a dev re-drive), not a replay. Both map to the `dev` record
-# role: `Engine._fix_phase` dispatches its repair sessions under the dev adapter, so a
-# fix session is recorded as `role="dev"` like the attempt it repairs.
+# needs a plain re-arm (a dev re-drive), not a replay over an earlier record. All map
+# to the `dev` record role: `Engine._fix_phase` dispatches its repair sessions under
+# the dev adapter, so a fix session is recorded as `role="dev"` like the attempt it
+# repairs.
 _REVERIFY_DECISION_SITE_ROLES = {
     "probe:decision:dev": "dev",
     "probe:decision:fix": "dev",
+    "probe:claim:dev": "dev",
+    "probe:claim:fix": "dev",
 }
 
 
@@ -1071,9 +1077,10 @@ def env_fault_site_reverifiable(task: StoryTask) -> bool:
 
     True for every site in `ENV_FAULT_SITES` except the dispatch sites
     (`probe:dispatch:*`): those fired before a session ran, so there is nothing to
-    re-verify. `probe:decision:dev` / `probe:decision:fix` additionally require the
-    role's LATEST session record to be `completed` — the seam re-probes crashed and
-    timed-out sessions too, and those produced no verifiable attempt. False for no
+    re-verify. `probe:decision:dev` / `probe:decision:fix` and `probe:claim:dev` /
+    `probe:claim:fix` additionally require the role's LATEST session record to be
+    `completed` — the seam re-probes crashed and timed-out sessions too, and those
+    produced no verifiable attempt. False for no
     site, and for any value outside the closed vocabulary (fail closed)."""
     site = task.env_fault_site
     if site is None or site not in ENV_FAULT_SITES:

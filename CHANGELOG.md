@@ -20,8 +20,9 @@ breaking changes may land in a minor release.
   session with no rollback (DW-523).
 - Treat an `Environment fault: <text>` line in a session's Auto Run Result as a
   probe trigger: the run pauses only when a probe confirms it (DW-523).
-- Add `bmad-loop resolve <run> --reverify`: replay `[verify]` on a DEFERRED or
-  environment-fault escalated story's kept work — HEAD in place, or the kept
+- Add `bmad-loop resolve <run> --reverify`: replay `[verify]` on a DEFERRED
+  story's kept work, or an environment-fault escalated one's when the fault left
+  finished work to verify — HEAD in place, or the kept
   worktree unit — then review per policy and commit or merge, with no dev
   session and no resolve agent; a worktree unit is accepted under any pause
   when `--story` names it, and sweep runs are refused (DW-522).

@@ -6419,12 +6419,21 @@ def _rearm_for_reverify_locked(
         # worktree, which `reverify_refusal` already found holding it.
         if not task.worktree_path and not spec_path.is_file():
             stash = deferred_stash_path(run_dir, key, spec_path.name)
-            atomic_write_bytes_confined(
-                spec_path,
-                stash.read_bytes(),
-                confine_root=live_spec_root(task, state, live_project),
-                root_identity=live_spec_root_identity(task, state, live_project),
-            )
+            try:
+                atomic_write_bytes_confined(
+                    spec_path,
+                    stash.read_bytes(),
+                    confine_root=live_spec_root(task, state, live_project),
+                    root_identity=live_spec_root_identity(task, state, live_project),
+                )
+            except OSError as e:
+                # Nothing persisted yet (the state write below never ran): the run is
+                # as the refusal check found it.
+                raise RearmError(
+                    f"cannot restore story {key}'s spec from {stash} to {spec_path} "
+                    f"({e.__class__.__name__}: {e}) — put the spec back there by hand, "
+                    "then re-run resolve --reverify"
+                ) from e
             restored = True
         save_state(run_dir, state)
     except BaseException:

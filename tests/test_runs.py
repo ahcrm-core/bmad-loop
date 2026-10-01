@@ -9419,6 +9419,32 @@ def test_rearm_for_reverify_keeps_an_operator_restored_spec(tmp_path):
     assert _reverify_rows(run_dir)[0]["spec_restored"] is False
 
 
+def test_rearm_for_reverify_spec_restore_fault_is_a_rearm_error(tmp_path, monkeypatch):
+    """A spec-restore I/O fault (stash unreadable, disk full, an unconfined write)
+    surfaces as an actionable RearmError the CLI reports, not a bare OSError for
+    `main()`'s backstop; nothing is persisted.
+
+    Ablation, performed: drop the `except OSError` wrap in
+    `_rearm_for_reverify_locked` and this reddens on the bare OSError."""
+    from bmad_loop.journal import STATE_FILE
+
+    run_dir, spec_path = _reverify_run(tmp_path, spec="stashed")
+    state_before = (run_dir / STATE_FILE).read_bytes()
+
+    def disk_full(*_args, **_kwargs):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(runs, "atomic_write_bytes_confined", disk_full)
+
+    with pytest.raises(runs.RearmError, match="re-run resolve --reverify") as exc:
+        runs.rearm_for_reverify(run_dir, project_root=spec_path.parents[2])
+
+    assert isinstance(exc.value.__cause__, OSError)
+    assert not spec_path.exists()
+    assert (run_dir / STATE_FILE).read_bytes() == state_before
+    assert _reverify_rows(run_dir) == []
+
+
 def test_rearm_for_reverify_rolls_back_the_restored_spec_when_save_fails(tmp_path, monkeypatch):
     """An interrupt before the commit point leaves the tree as the re-arm found it:
     the spec copy this call created is removed again, the stash and state untouched.

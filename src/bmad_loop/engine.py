@@ -3559,6 +3559,10 @@ class Engine:
         # follow-up wording (issue #160). None until a pass reaches the parse below
         # (a crash/stall that DEFERs never gets there).
         last_status: str | None = None
+        # A damping grant a completed pass earned, not yet spent: applied only past
+        # the next cycle's dispatch gate (or at loop exit), so a dispatch pause
+        # never persists a spend the completed-pass replay re-derives (DW-523).
+        spend_pending = False
         # A resumed result must enter the loop even when the crash landed in the
         # post-session window of the *final* allowed cycle (review_cycle already
         # == max_review_cycles): its recorded pass was already counted, and the
@@ -3570,6 +3574,9 @@ class Engine:
                 # DW-523: probe before the cycle is charged; a pause here resumes
                 # through the DEV_VERIFY or completed-pass replay arms.
                 self._gate_dispatch(task, "review")
+                if spend_pending:
+                    task.followup_reviews_spent += 1
+                    spend_pending = False
                 # a resumed result replays the cycle it was recorded under: the
                 # counter must not advance, or the replay burns a review-budget
                 # slot and mislabels its journal/session ids.
@@ -3816,17 +3823,21 @@ class Engine:
             if refileable_followup:
                 # Spend one damping grant for honoring this pass's own follow-up
                 # recommendation. Deliberately AFTER the
-                # _run_workflows("post_review_result") gate: the increment is
+                # _run_workflows("post_review_result") gate, and applied only past
+                # the next cycle's dispatch gate (`spend_pending`): the increment is
                 # persisted only by the NEXT cycle's _save(), by which point
                 # _resumable_session can no longer replay this result — so a
-                # crash-replay re-derives the spend exactly once instead of
-                # double-counting it. (A non-terminal status or a non-followup
-                # done — the two other ways to reach here — never sets
-                # refileable_followup, so neither spends the cap.)
-                task.followup_reviews_spent += 1
+                # crash-replay or a dispatch-pause replay re-derives the spend
+                # exactly once instead of double-counting it. (A non-terminal status
+                # or a non-followup done — the two other ways to reach here — never
+                # sets refileable_followup, so neither spends the cap.)
+                spend_pending = True
             # still recommends a follow-up (or a non-terminal status): loop runs a
             # fresh review pass on the newly-patched tree, bounded by max_review_cycles
 
+        if spend_pending:
+            # the loop exhausted its cycles with the last pass's grant unspent
+            task.followup_reviews_spent += 1
         if not clean:
             # Budget exhausted. Before discarding work, distinguish two modes:
             #   (a) the last *completed* pass left the story finalized + verify-green

@@ -2525,15 +2525,22 @@ def test_run_environment_probes_stop_at_first_failure(tmp_path):
     assert not marker.exists()
 
 
-def test_probe_timeout_is_a_failure(tmp_path):
+def test_probe_timeout_is_a_failure(tmp_path, monkeypatch):
     """A probe that hangs past `probe_timeout_s` is a failed probe, not a pass and
-    not a crash; the reason names the bound."""
-    sleeper = tmp_path / "sleeper.py"
-    sleeper.write_text("import time\ntime.sleep(30)\n", encoding="utf-8")
-    hangs = f'"{sys.executable}" "{sleeper}"'
-    policy = Policy(environment=EnvironmentPolicy(probes=(hangs,), probe_timeout_s=1))
+    not a crash; the reason names the bound. The runner is faked with its timeout
+    leg (`rc=-1`, `"timed out"`) — no test sleeps toward a deadline (docs/testing.md)."""
+    timeouts: list[float] = []
+
+    def timed_out(command, cwd, timeout):
+        timeouts.append(timeout)
+        return verify.CommandResult(command, -1, "timed out")
+
+    monkeypatch.setattr(verify, "_run_shell_command", timed_out)
+    policy = Policy(environment=EnvironmentPolicy(probes=("hangs",), probe_timeout_s=1))
 
     probe = verify.run_environment_probes(policy, tmp_path)
+
+    assert timeouts == [1]  # the probe bound reaches the runner
 
     assert not probe.ok and probe.failed is not None
     assert probe.failed.returncode == -1 and probe.failed.output_tail == "timed out"
