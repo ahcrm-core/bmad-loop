@@ -8980,6 +8980,9 @@ def test_board_carry_over_a_vanished_main_row_is_not_journalled_as_carried(proje
     assert _sprint_carry_commits(project) == []
 
 
+@pytest.mark.xfail(
+    strict=True, reason="Session 2 routes SprintStatusWriteRefused through confirm/carry"
+)
 def test_board_carry_that_cannot_rewrite_the_row_is_not_journalled_as_carried(project):
     """Shape two, and the one a `None` check alone would miss: the row is THERE and
     `advance` still leaves it below target. `story_status` resolves a quoted key

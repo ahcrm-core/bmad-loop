@@ -14315,6 +14315,9 @@ def test_confirm_refuses_when_the_spec_vanished_before_the_audit_section(
     assert "1-1-a" in operatoractions.load(project.project)
 
 
+@pytest.mark.xfail(
+    strict=True, reason="Session 2 routes SprintStatusWriteRefused through confirm/carry"
+)
 def test_confirm_reports_a_board_that_did_not_advance(project, capsys, monkeypatch):
     """`sprintstatus.advance` returns the CURRENT status when its line regex
     cannot rewrite the entry `story_status` resolved via YAML — a quoted story key

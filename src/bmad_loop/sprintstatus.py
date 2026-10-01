@@ -27,6 +27,14 @@ without acquiring at all (#736), because such a call publishes nothing and so ha
 no bytes for the hold to protect. Readers stay lock-free: the publish is an
 atomic replace, so a reader sees either the old board entire or the new one.
 
+Refusal is loud (#842): the writer is a line edit, not a YAML round-trip, so some
+shapes the parser reads it will not rewrite. An existing row :func:`advance` has
+decided to move and cannot rewrite raises :class:`SprintStatusWriteRefused`
+(board, row, current, target, a stable reason) and publishes nothing, rather than
+echoing the unchanged status a caller would read as "the session never got there".
+An absent row, a missing board, and a row already at or past target still answer
+by return value.
+
 Retro action items (DW-388): ``bmad-retrospective`` appends the items a retro
 commits to a top-level ``action_items:`` list, each with a stable ``id`` and a
 ``ref`` back to the retro document. :func:`load_action_items` reads that list on
@@ -89,6 +97,72 @@ ACTIONABLE_STATUSES = {"backlog", "ready-for-dev"}
 
 class SprintStatusError(Exception):
     pass
+
+
+# Why the writer declined an existing row, as a stable token a caller may journal
+# or branch on. Only :func:`_set_mapping_value`'s refusals and the one row
+# :func:`_advance_locked` cannot find an entry for are named; message text is for
+# operators and may change.
+RefusalReason = Literal[
+    "key-not-plain",  # the key is quoted, flow-style, or not where its line says
+    "value-not-scalar",  # a nested mapping or sequence
+    "value-is-alias",  # `*anchor`: the value's text is authored on another row
+    "multiline-value",  # runs past the key line in a shape the collapse cannot read
+    "unreadable-value",  # one line, but neither value arm accounts for all of it
+    "row-not-in-mapping",  # the reader resolves the key only through a `<<` merge
+]
+
+_REFUSAL_TEXT: dict[RefusalReason, str] = {
+    "key-not-plain": "its key is not a plain `key:` at the start of its line",
+    "value-not-scalar": "its value is a nested mapping or sequence",
+    "value-is-alias": "its value is an alias to a node authored elsewhere",
+    "multiline-value": "its value runs past the key line in a shape the writer cannot collapse",
+    "unreadable-value": "the text after its key is not a value the writer can read whole",
+    "row-not-in-mapping": "development_status reaches it only through a `<<` merge",
+}
+
+
+class SprintStatusWriteRefused(SprintStatusError):
+    """An existing story row had to move, and the line-edit writer would not rewrite it.
+
+    Raised by :func:`advance` (and :func:`advanced_bytes`) only after the locked,
+    authoritative read found the row and the call's own decision was to write it
+    — below ``target``, or an allowlisted regression — so it never stands for an
+    absent row, a missing board, or a row already at or past ``target``. Nothing
+    has been written when it is raised: not the row, not an epic lift, not
+    ``last_updated``.
+
+    ``path`` is the board, or None when the refusal came from
+    :func:`advanced_bytes`, which works on bytes and never names a file.
+    ``current`` is the row's status as :func:`story_status` reads it; ``reason``
+    is a stable :data:`RefusalReason` token."""
+
+    path: Path | None
+    story_key: str
+    current: str
+    target: str
+    reason: RefusalReason
+
+    def __init__(
+        self,
+        path: Path | None,
+        story_key: str,
+        current: str,
+        target: str,
+        reason: RefusalReason,
+    ) -> None:
+        self.path = path
+        self.story_key = story_key
+        self.current = current
+        self.target = target
+        self.reason = reason
+        board = str(path) if path is not None else "the sprint-status board"
+        super().__init__(
+            f"sprint status row {story_key!r} in {board} is {current!r} and could not be"
+            f" rewritten to {target!r}: {_REFUSAL_TEXT[reason]} ({reason}). The board was"
+            f" left unchanged; rewrite the row as a plain one-line `{story_key}: <status>`"
+            " entry, then retry."
+        )
 
 
 @dataclass(frozen=True)
@@ -377,7 +451,7 @@ class _RowSpan:
     value: str
 
 
-def _locate_row(lines: list[str], key: str, scope: _Scope) -> _RowSpan | None:
+def _locate_row(lines: list[str], key: str, scope: _Scope) -> _RowSpan | RefusalReason | None:
     """Find the entry :func:`load` would read for ``key`` in ``scope``, by source mark.
 
     Composes the board with ``yaml.SafeLoader`` — the parser :func:`load` uses —
@@ -390,11 +464,14 @@ def _locate_row(lines: list[str], key: str, scope: _Scope) -> _RowSpan | None:
     constructor's dict assignment does, so the row found here is the row
     :func:`story_status` read.
 
-    Returns None when there is no such scalar-valued entry: the key is absent,
-    only reachable through a ``<<`` merge, or its value is a collection or an
-    alias to a node authored elsewhere. Raises :class:`SprintStatusError` when
-    the lines do not parse — the caller parsed this board before editing it, so
-    that can only be an edit gone wrong, and it must not be published."""
+    Returns None when the mapping has no such entry: the key is absent or only
+    reachable through a ``<<`` merge. An entry whose value is a collection, or an
+    alias to a node authored elsewhere, IS the row, so it comes back as the
+    :data:`RefusalReason` the writer must decline it with rather than as None —
+    "not here" and "here, but not editable" are different answers. Raises
+    :class:`SprintStatusError` when the lines do not parse — the caller parsed
+    this board before editing it, so that can only be an edit gone wrong, and it
+    must not be published."""
     text = "".join(lines)
     try:
         root = yaml.compose(text, Loader=yaml.SafeLoader)
@@ -409,9 +486,9 @@ def _locate_row(lines: list[str], key: str, scope: _Scope) -> _RowSpan | None:
         return None
     key_node, value_node = entry
     if not isinstance(value_node, yaml.ScalarNode):
-        return None
+        return "value-not-scalar"
     if value_node.start_mark.index < key_node.end_mark.index:
-        return None  # an alias: its marks belong to the anchor, not to this row
+        return "value-is-alias"  # its marks belong to the anchor, not to this row
 
     starts: list[int] = []
     offset = 0
@@ -447,11 +524,23 @@ def _last_entry(mapping: object, key: str) -> tuple[yaml.Node, yaml.Node] | None
     return None
 
 
-def _set_mapping_value(lines: list[str], key: str, new_value: str, *, scope: _Scope) -> bool:
+@dataclass(frozen=True)
+class _Refused:
+    """:func:`_set_mapping_value`'s answer for a row it found and would not rewrite."""
+
+    reason: RefusalReason
+
+
+# What one row edit did. The three plain answers and a refusal are distinct values,
+# so no caller has to read "False" as whichever of them it happens to need.
+_Edit = Literal["changed", "equal", "absent"] | _Refused
+
+
+def _set_mapping_value(lines: list[str], key: str, new_value: str, *, scope: _Scope) -> _Edit:
     """In-place replace the value of the ``key`` entry in ``scope``, preserving
-    indentation and any trailing ` # comment`. Returns True on a real change. A
-    minimal line edit (not a YAML round-trip) so the file's comments and
-    structure — STATUS DEFINITIONS, WORKFLOW NOTES — survive verbatim.
+    indentation and any trailing ` # comment`. A minimal line edit (not a YAML
+    round-trip) so the file's comments and structure — STATUS DEFINITIONS,
+    WORKFLOW NOTES — survive verbatim.
 
     Which line is edited is decided by the parser, not by a text search:
     :func:`_locate_row` names the key line and the value's exact source span in
@@ -475,11 +564,17 @@ def _set_mapping_value(lines: list[str], key: str, new_value: str, *, scope: _Sc
     reaches it: the writer replaces such a value with a bare token on the next
     advance.
 
-    A row the line edit cannot rewrite exactly — a key authored in quotes or
-    flow style, a remainder neither arm can read — is left alone, exactly like
-    an absent key: `advance` reports the unchanged status rather than claiming a
-    write it did not make. Each line's terminator is excluded from the scalar
-    match and then reattached exactly as authored (#576).
+    Returns ``"changed"`` after a real edit, ``"equal"`` when the value is already
+    ``new_value`` (idempotent, nothing edited), ``"absent"`` when ``scope`` holds no
+    ``key`` entry, and :class:`_Refused` when the entry is there but the line edit
+    cannot rewrite it exactly — a key authored in quotes or flow style, a value
+    that is a collection or an alias, a remainder neither arm can read, a
+    multi-line shape below. ``lines`` is untouched on every answer but
+    ``"changed"``. Refused is deliberately not folded into absent: whether a
+    declined row is an error is the caller's decision (:func:`_advance_locked`
+    raises for the story row), and it can only make it on an answer that says
+    which happened. Each line's terminator is excluded from the scalar match and
+    then reattached exactly as authored (#576).
 
     A value may also run past the key line. The one such shape this reads is the
     FOLDED plain row a width-limited dump (ruamel wraps at 80) emits for a long
@@ -496,41 +591,41 @@ def _set_mapping_value(lines: list[str], key: str, new_value: str, *, scope: _Sc
     it into invalid YAML."""
     row = _locate_row(lines, key, scope)
     if row is None:
-        return False
+        return "absent"
+    if not isinstance(row, _RowSpan):
+        return _Refused(row)
     line = lines[row.key_line]
     stripped = line.rstrip("\r\n")
+    km = re.match(rf"^(?P<indent>\s*){re.escape(key)}:", stripped)
+    if km is None or len(km.group("indent")) != row.key_col:
+        return _Refused("key-not-plain")
+    indent, remainder = km.group("indent"), stripped[km.end() :]
     if row.value_first_line > row.key_line:
-        em = re.match(rf"^(?P<indent>\s*){re.escape(key)}:[ \t]*$", stripped)
-        if (
-            em is None
-            or len(em.group("indent")) != row.key_col
-            or not _folded_span_is_plain(lines, row)
-        ):
-            return False  # not a shape this can read whole — leave it as authored
+        if remainder.strip(" \t") or not _folded_span_is_plain(lines, row):
+            return _Refused("multiline-value")  # not a shape this can read whole
         if row.value == new_value:
-            return False  # already at target — idempotent no-op
+            return "equal"  # already at target — idempotent no-op
         last = lines[row.value_last_line]
         nl = last[len(last.rstrip("\r\n")) :]
-        lines[row.key_line : row.value_last_line + 1] = [
-            f"{em.group('indent')}{key}: {new_value}" + nl
-        ]
-        return True
+        lines[row.key_line : row.value_last_line + 1] = [f"{indent}{key}: {new_value}" + nl]
+        return "changed"
     if row.value_last_line != row.key_line:
-        return False  # the value runs onto later lines — a one-line edit would orphan them
-    m = re.match(rf"^(?P<indent>\s*){re.escape(key)}:(?P<gap>[ \t]+)(?P<body>\S.*)$", stripped)
-    if m is None or len(m.group("indent")) != row.key_col:
-        return False
+        # the value runs onto later lines — a one-line edit would orphan them
+        return _Refused("multiline-value")
+    m = re.match(r"^(?P<gap>[ \t]+)(?P<body>\S.*)$", remainder)
+    if m is None:
+        return _Refused("unreadable-value")
     body = m.group("body")
     value_pat = _QUOTED_VALUE_RE if body[0] in "'\"" else _UNQUOTED_VALUE_RE
     vm = value_pat.match(body)
     if not vm:
-        return False  # unreadable remainder — leave the line as authored
+        return _Refused("unreadable-value")  # leave the line as authored
     if vm.group("val") == new_value:
-        return False  # already at target — idempotent no-op
+        return "equal"  # already at target — idempotent no-op
     rest = vm.groupdict().get("rest") or ""
     nl = line[len(stripped) :]
-    lines[row.key_line] = f"{m.group('indent')}{key}:{m.group('gap')}{new_value}{rest}" + nl
-    return True
+    lines[row.key_line] = f"{indent}{key}:{m.group('gap')}{new_value}{rest}" + nl
+    return "changed"
 
 
 # Characters that cannot open a line of the folded row this writer accepts:
@@ -626,6 +721,13 @@ def advance(
     via line edits. Returns the story's status after the call (== `target` on a
     write), or None when nothing was eligible.
 
+    Raises :class:`SprintStatusWriteRefused` when the row exists, the call has
+    decided to move it (below `target`, or an allowlisted regression), and the
+    line edit cannot rewrite its shape — a quoted key, an alias, a block scalar.
+    Nothing is written then, not even the epic lift or `last_updated`. This used
+    to return the unchanged status, which a caller cannot tell from a story that
+    never got there; the raise names the board, the row, and why (#842).
+
     The rewrite is atomic and symlink-following (#379), and every existing CRLF,
     LF, bare CR, or mixed per-line terminator is preserved (#576). The board is
     read as raw UTF-8 bytes, each edited line carries its own terminator, and
@@ -685,7 +787,8 @@ def advance(
     raised while probing — falls through to the locked path, which re-reads,
     re-decides authoritatively and raises on the channel it always did. So the
     probe can neither authorize a write nor add a failure mode the hold lacks: a
-    malformed board still raises :class:`SprintStatusError` from under the lock.
+    malformed board still raises :class:`SprintStatusError` from under the lock,
+    and a write refusal is decided there too, never by the probe.
     ``now`` needs no handling here, because both no-op arms of
     :func:`_advance_locked` return before the ``last_updated`` write; a
     probe-satisfied early-out is write-equivalent to the locked answer.
@@ -748,7 +851,16 @@ def _advance_locked(
 
     ``allow_regression`` is :func:`advance`'s opt-in: the authoritative
     allowlist check for a regressing pair happens here, under the hold, and a
-    refused pair raises before any byte is written."""
+    refused pair raises before any byte is written.
+
+    So does the write refusal: :class:`SprintStatusWriteRefused` is decided here
+    and only here, from this hold's own reread, once that read has put the row
+    below ``target`` (or on an allowlisted regression) and the story edit then
+    comes back refused — or absent, when the reader resolved the key through a
+    ``<<`` merge no entry of ``development_status`` holds. It raises before the
+    epic lift and ``last_updated`` are touched and before the write, so a refused
+    call publishes nothing. :func:`advance`'s pre-lock probe cannot reach it: the
+    probe only ever answers "nothing to write", and swallows whatever it meets."""
     if not path.is_file():
         return None
     current = story_status(path, story_key)
@@ -763,14 +875,18 @@ def _advance_locked(
     lines = text.splitlines(keepends=True)
     # story_status() resolves keys via a full YAML parse, but _set_mapping_value
     # rewrites via a line edit that can't touch every shape it finds (quoted or
-    # block-scalar keys). If the story line itself wasn't rewritten, report the
-    # unchanged status rather than falsely claiming we advanced to target. Each
-    # call below re-locates its row in the lines as edited so far, so an earlier
-    # collapse never leaves a later edit aiming at a stale line number.
-    story_changed = _set_mapping_value(lines, story_key, target, scope="development_status")
-    if not story_changed:
-        return current
-    changed = story_changed
+    # block-scalar keys). A story row this call has decided to move and cannot
+    # rewrite raises rather than echoing its unchanged status: a caller reading
+    # that echo sees only "not at target" and blames whoever was supposed to get
+    # it there. Each call below re-locates its row in the lines as edited so far,
+    # so an earlier collapse never leaves a later edit aiming at a stale line.
+    story_edit = _set_mapping_value(lines, story_key, target, scope="development_status")
+    if isinstance(story_edit, _Refused):
+        raise SprintStatusWriteRefused(path, story_key, current, target, story_edit.reason)
+    if story_edit == "absent":
+        raise SprintStatusWriteRefused(path, story_key, current, target, "row-not-in-mapping")
+    if story_edit == "equal":
+        return current  # an off-order value already spelled as `target` — nothing to write
 
     if target == "in-progress":
         m = STORY_RE.match(story_key)
@@ -778,16 +894,13 @@ def _advance_locked(
             epic_key = f"epic-{int(m.group(1))}"
             ss = load(path)
             if ss.epics.get(int(m.group(1))) == "backlog":
-                changed = (
-                    _set_mapping_value(lines, epic_key, "in-progress", scope="development_status")
-                    or changed
-                )
+                # best effort, as before: an epic row the writer declines stays put
+                _set_mapping_value(lines, epic_key, "in-progress", scope="development_status")
 
     if now is not None:
-        changed = _set_mapping_value(lines, "last_updated", now, scope="root") or changed
+        _set_mapping_value(lines, "last_updated", now, scope="root")  # best effort, likewise
 
-    if changed:
-        atomic_write_bytes(path, "".join(lines).encode("utf-8"), require_writable_target=True)
+    atomic_write_bytes(path, "".join(lines).encode("utf-8"), require_writable_target=True)
     return target
 
 
@@ -813,11 +926,18 @@ def advanced_bytes(source: bytes, story_key: str, target: str) -> bytes | None:
     copy. There is then no intended content to compare against, and a caller must not
     read "I could not compute it" as "the tree is mine".
 
-    Declining to WRITE is a different answer, and it comes back as bytes: a row already
-    at or past ``target``, and a row whose line ``_set_mapping_value`` will not rewrite,
-    both report the unchanged status and hand ``source`` back byte-identical. A caller
-    comparing against that is right to accept an untouched board, because for those rows
-    an untouched board IS this run's advance."""
+    A row already at or past ``target`` is the one decline that comes back as bytes:
+    ``advance`` writes nothing for it, so ``source`` byte-identical IS this run's
+    advance, and a caller is right to accept an untouched board.
+
+    A row below ``target`` whose line ``_set_mapping_value`` will not rewrite is not
+    that case, and raises :class:`SprintStatusWriteRefused` (with ``path`` None — the
+    shadow is no board anyone can repair). ``advance`` raises there too, so no board
+    on disk holds that advance; returning ``source`` would let a caller match an
+    untouched — or someone else's — board against an advance that never happened and
+    claim it. A caller computing ownership must treat the raise as "not mine", as it
+    does None. A board that does not parse raises :class:`SprintStatusError`, as
+    ``advance`` does."""
     with tempfile.TemporaryDirectory() as tmp:
         shadow = Path(tmp) / "sprint-status.yaml"
         shadow.write_bytes(source)
@@ -829,8 +949,11 @@ def advanced_bytes(source: bytes, story_key: str, target: str) -> bytes | None:
         # `file_lock` never removes a sidecar and the TemporaryDirectory removes
         # only the shadow, so every ownership computation would strand another
         # dead lock file under `<state root>/locks` (#286).
-        if _advance_locked(shadow, story_key, target) is None:
-            return None
+        try:
+            if _advance_locked(shadow, story_key, target) is None:
+                return None
+        except SprintStatusWriteRefused as e:
+            raise SprintStatusWriteRefused(None, e.story_key, e.current, e.target, e.reason) from e
         return shadow.read_bytes()
 
 
