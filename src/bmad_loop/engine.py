@@ -2803,6 +2803,19 @@ class Engine:
                     self._escalate_decision(task, gated)
                 self._defer(task, reason)
                 return True
+            if wf.blocking:
+                # A completed blocking workflow's "Environment fault:" claim still
+                # forces a probe (DW-523) — at `pre_commit_gate` nothing else may
+                # probe before the commit. A PROCEED carrying no claim returns
+                # unchanged without spawning anything.
+                gated = self._env_gate_decision(
+                    task,
+                    Decision(Action.PROCEED, ""),
+                    role="workflow",
+                    result_json=result.result_json,
+                )
+                if gated.action == Action.PAUSE:
+                    self._escalate_decision(task, gated)
         return False
 
     def _run_story(self, task: StoryTask) -> None:

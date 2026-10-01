@@ -13506,6 +13506,59 @@ def test_blocking_workflow_failure_reclassified(project, tmp_path):
     assert engine.state.paused_reason.startswith("environment fault: workflow defer withheld")
 
 
+@pytest.mark.parametrize("env_up", [False, True])
+def test_completed_blocking_workflow_claim_is_probed(project, tmp_path, env_up):
+    """A COMPLETED blocking workflow's "Environment fault:" claim forces a probe
+    too (DW-523): at `pre_commit_gate` nothing else probes before the commit. A
+    failing probe escalates at `probe:claim:workflow` instead of committing; a
+    passing one journals the claim and the story commits as before.
+
+    Ablation, performed: drop the completed-workflow gate in `_run_workflows` and
+    the dead-environment case commits with no `env-fault-claim` row."""
+    from bmad_loop.plugins import PluginRegistry
+    from bmad_loop.plugins.model import LoadedPlugin, PluginManifest, WorkflowSpec
+
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    rig = _env_rig(tmp_path)
+    manifest = PluginManifest(
+        name="wf",
+        api_version=1,
+        workflows=(
+            WorkflowSpec(
+                name="gate",
+                stage="pre_commit_gate",
+                role="review",
+                prompt="/gate {story_key}",
+                blocking=True,
+            ),
+        ),
+    )
+    workflow = _claiming(SessionResult(status="completed", result_json={}))
+    engine, adapter = make_engine(
+        project,
+        [
+            dev_effect(project, "1-1-a", followup_review=False),
+            workflow if env_up else rig.dies_during(workflow),
+        ],
+        policy=_env_policy(rig, review=ReviewPolicy(enabled=False)),
+        registry=PluginRegistry([LoadedPlugin(manifest=manifest)]),
+    )
+    summary = engine.run()
+
+    assert len(adapter.sessions) == 2
+    task = engine.state.tasks["1-1-a"]
+    (claim,) = _claim_rows(engine)
+    assert claim["role"] == "workflow"
+    if env_up:
+        assert summary.done == 1 and claim["probe_outcome"] == "passed"
+        assert task.env_fault_site is None
+    else:
+        assert summary.paused and summary.escalated == 1 and summary.done == 0
+        assert claim["probe_outcome"] == "failed"
+        assert task.phase == Phase.ESCALATED
+        assert task.env_fault_site == "probe:claim:workflow"
+
+
 def test_rescue_gate_env_fault_escalates_not_defers(project):
     """Bug fix (DW-523): an env fault at the review-budget rescue gate fell
     through to the "did not converge" defer — filing verify-green work as
