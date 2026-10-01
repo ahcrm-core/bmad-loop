@@ -14,6 +14,7 @@ non-zero could arise — including a bug in the fixture.
 from __future__ import annotations
 
 import json
+import shutil
 import sys
 from pathlib import Path
 
@@ -116,3 +117,29 @@ def test_parse_canonical_agrees_with_read_canonical():
 
 def test_parse_canonical_is_none_without_a_version():
     assert sync_version.parse_canonical('"""no version here."""\n') is None
+
+
+# --- stamp() writes LF on every platform (DW-517) --------------------------- #
+def test_stamp_writes_lf_under_windows_newline_translation(
+    tmp_path, monkeypatch, emulate_windows_newlines
+):
+    """A Windows release cut must not rewrite the stamped LF files as CRLF —
+    `.gitattributes` has no `text=auto` rule to normalize them back."""
+    stamped = {}
+    for name in ("INIT", "PYPROJECT", "CANONICAL_MODULE_YAML", "MARKETPLACE"):
+        src = getattr(sync_version, name)
+        dst = tmp_path / f"{name.lower()}{src.suffix}"
+        shutil.copyfile(src, dst)
+        monkeypatch.setattr(sync_version, name, dst)
+        stamped[name] = dst
+    monkeypatch.setattr(sync_version, "ROOT_MODULE_YAML", tmp_path / "root-module.yaml")
+    monkeypatch.setattr(sync_version, "_relock", lambda: None)
+    emulate_windows_newlines()
+
+    sync_version.stamp("99.0.0")
+
+    for name, path in stamped.items():
+        data = path.read_bytes()
+        # Control: the file was actually rewritten, so "no CRLF" is not vacuous.
+        assert b"99.0.0" in data, name
+        assert b"\r\n" not in data, name

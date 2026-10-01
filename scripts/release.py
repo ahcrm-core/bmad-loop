@@ -84,7 +84,9 @@ def _run(
 ) -> subprocess.CompletedProcess:
     if not capture:
         sys.stdout.flush()  # keep our prints ahead of the child's direct fd writes
-    return subprocess.run(cmd, cwd=REPO, check=check, text=True, capture_output=capture)
+    return subprocess.run(
+        cmd, cwd=REPO, check=check, text=True, encoding="utf-8", capture_output=capture
+    )
 
 
 def _git_out(*args: str) -> str:
@@ -608,7 +610,9 @@ def cmd_prepare(args: argparse.Namespace) -> int:
 
     # --- mutate ------------------------------------------------------------ #
     CHANGELOG.write_text(
-        ensure_link_ref(CHANGELOG.read_text(encoding="utf-8"), version, url), encoding="utf-8"
+        ensure_link_ref(CHANGELOG.read_text(encoding="utf-8"), version, url),
+        encoding="utf-8",
+        newline="\n",
     )
 
     print(f"stamping version via {SYNC_VERSION.name} ...")
@@ -715,6 +719,7 @@ def cmd_publish(args: argparse.Namespace) -> int:
             cwd=REPO,
             check=False,
             text=True,
+            encoding="utf-8",
             input=notes,
             capture_output=True,
         )
@@ -740,6 +745,7 @@ def cmd_publish(args: argparse.Namespace) -> int:
         cwd=REPO,
         check=False,
         text=True,
+        encoding="utf-8",
         input=notes,
         capture_output=True,
     )

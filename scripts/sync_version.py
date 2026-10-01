@@ -89,6 +89,7 @@ def stamp(version: str) -> None:
     INIT.write_text(
         _sub_once(_INIT_PAT, rf"\g<1>{version}\g<2>", INIT.read_text(encoding="utf-8"), INIT),
         encoding="utf-8",
+        newline="\n",
     )
     PYPROJECT.write_text(
         _sub_once(
@@ -98,6 +99,7 @@ def stamp(version: str) -> None:
             PYPROJECT,
         ),
         encoding="utf-8",
+        newline="\n",
     )
     CANONICAL_MODULE_YAML.write_text(
         _sub_once(
@@ -107,13 +109,14 @@ def stamp(version: str) -> None:
             CANONICAL_MODULE_YAML,
         ),
         encoding="utf-8",
+        newline="\n",
     )
 
     market_text = MARKETPLACE.read_text(encoding="utf-8")
     market_new, n = _MARKET_PAT.subn(rf"\g<1>{version}\g<2>", market_text)
     if n == 0:
         sys.exit(f"error: found no version field in {MARKETPLACE}")
-    MARKETPLACE.write_text(market_new, encoding="utf-8")
+    MARKETPLACE.write_text(market_new, encoding="utf-8", newline="\n")
 
     # Regenerate the installer-discoverable repo-root mirror from the canonical copy.
     shutil.copyfile(CANONICAL_MODULE_YAML, ROOT_MODULE_YAML)

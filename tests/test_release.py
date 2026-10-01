@@ -326,6 +326,7 @@ def _publish_with_gh(
     gh_available=True,
     dry_run=False,
     changelog=SAMPLE,
+    call_kwargs=None,
 ):
     cl = tmp_path / "CHANGELOG.md"
     cl.write_text(changelog)
@@ -353,6 +354,8 @@ def _publish_with_gh(
             gh_calls.append(cmd)
         if seen is not None:
             seen.update(kw)
+        if call_kwargs is not None:
+            call_kwargs.append((cmd, kw))
         if cmd[:3] == ["gh", "release", "view"]:
             return SimpleNamespace(
                 returncode=release_view_rc, stdout="", stderr=release_view_stderr
@@ -745,6 +748,52 @@ def test_publish_passes_check_false_so_the_swallow_inspects_the_rc(monkeypatch, 
     assert seen["check"] is False
 
 
+# --- release.py's subprocess text is UTF-8 on every platform (DW-518) ------- #
+# `text=True` with no `encoding=` uses the locale's code page — the ANSI one on
+# Windows — so a manual Windows publish would mis-encode the notes' em dashes.
+def test_run_decodes_child_output_as_utf8(monkeypatch):
+    seen: dict[str, object] = {}
+
+    def fake_run(*a, **kw):
+        seen.update(kw)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(release.subprocess, "run", fake_run)
+    release._run(["git", "status"], capture=True)
+    assert seen["text"] is True
+    assert seen["encoding"] == "utf-8"
+
+
+@pytest.mark.parametrize(
+    "path_kwargs",
+    [
+        pytest.param({}, id="fresh-tag"),
+        pytest.param(
+            {
+                "tag_exists_locally": True,
+                "remote_target": EXISTING_TARGET,
+                "release_view_rc": 1,
+                "release_view_stderr": RELEASE_NOT_FOUND,
+            },
+            id="existing-tag",
+        ),
+    ],
+)
+def test_publish_sends_the_notes_to_gh_as_utf8(monkeypatch, tmp_path, path_kwargs):
+    # Per-call kwargs, not the merged `seen`: on the existing-tag path `_run` also
+    # carries encoding=, which would mask a create call that lacks it.
+    calls: list = []
+    changelog = SAMPLE.replace("It no longer breaks.", "It no longer breaks — anywhere.")
+    rc = _publish_with_gh(
+        monkeypatch, tmp_path, call_kwargs=calls, changelog=changelog, **path_kwargs
+    )
+    assert rc == 0
+    creates = [kw for cmd, kw in calls if cmd[:3] == ["gh", "release", "create"]]
+    assert len(creates) == 1
+    assert "—" in str(creates[0]["input"])  # the em dash the encoding protects
+    assert creates[0]["encoding"] == "utf-8"
+
+
 # --- publish bounds the release body -------------------------------------- #
 # GitHub rejects a body over 125,000 chars with HTTP 422 *after* `gh` has created the
 # tag, which strands a tag with no release (v0.12.0's first publish). The body is a
@@ -970,3 +1019,40 @@ def test_check_flags_a_missing_section_for_the_canonical_version(monkeypatch, ca
 )
 def test_already_exists_matches_only_the_duplicate_tag_error(stderr, lost):
     assert release._already_exists(stderr) is lost
+
+
+# --- prepare writes the CHANGELOG as LF on every platform (DW-517) ----------- #
+def test_prepare_writes_the_changelog_as_lf_under_windows_newline_translation(
+    monkeypatch, tmp_path, emulate_windows_newlines
+):
+    """A Windows release cut must not rewrite CHANGELOG.md as CRLF —
+    `.gitattributes` has no `text=auto` rule to normalize it back."""
+    # Drop the version's link ref so prepare's write visibly changes the file.
+    link_ref = f"[0.5.0]: {REPO_URL}/releases/tag/v0.5.0\n"
+    assert link_ref in PROMOTED
+    cl = tmp_path / "CHANGELOG.md"
+    cl.write_bytes(PROMOTED.replace(link_ref, "").encode("utf-8"))
+    monkeypatch.setattr(release, "CHANGELOG", cl)
+    monkeypatch.setattr(release.sync_version, "read_canonical", lambda: "0.4.3")
+    monkeypatch.setattr(release, "repo_url", lambda: REPO_URL)
+    monkeypatch.setattr(release, "current_branch", lambda: "chore/release-0.5.0")
+    monkeypatch.setattr(release, "last_release_tag", lambda: "v0.4.3")
+    monkeypatch.setattr(release, "tag_exists", lambda tag: False)
+    monkeypatch.setattr(release, "dirty_paths", lambda: ["CHANGELOG.md"])
+    monkeypatch.setattr(release, "_reseed_skills", lambda dry_run: None)
+    monkeypatch.setattr(release, "_run_trunk_fmt", lambda dry_run: None)
+    ran: list = []
+    monkeypatch.setattr(release, "_run", lambda cmd, **kw: ran.append(cmd))
+    emulate_windows_newlines()
+
+    rc = release.cmd_prepare(
+        SimpleNamespace(
+            version="0.5.0", dry_run=False, force_assets=False, no_assets=True, allow_dirty=False
+        )
+    )
+
+    assert rc == 0
+    assert ran[-1][:2] == ["git", "commit"]  # reached the end of the mutate phase
+    data = cl.read_bytes()
+    assert link_ref.encode("utf-8") in data  # control: the write happened
+    assert b"\r\n" not in data

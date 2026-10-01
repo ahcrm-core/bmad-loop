@@ -361,6 +361,25 @@ def opencode_runs() -> bool:
 
 
 @pytest.fixture
+def emulate_windows_newlines(monkeypatch):
+    """Return an activator that makes `Path.write_text` translate newlines like Windows.
+
+    With ``newline=None`` a text write maps ``\n`` to ``\r\n`` there. The translation
+    is compiled into `io.TextIOWrapper`, so patching `os.linesep` cannot reproduce it;
+    without this, a "no CRLF" assertion passes on Linux whether or not the fix is in.
+    Call the activator after test setup so the fixture's own writes stay untranslated.
+    """
+    real = Path.write_text
+
+    def write_text(self, data, encoding=None, errors=None, newline=None):
+        if newline is None:
+            data, newline = data.replace("\n", "\r\n"), ""
+        return real(self, data, encoding=encoding, errors=errors, newline=newline)
+
+    return lambda: monkeypatch.setattr(Path, "write_text", write_text)
+
+
+@pytest.fixture
 def force_tmux_backend(monkeypatch):
     """Pin the tmux transport backend by name, regardless of host platform.
 
