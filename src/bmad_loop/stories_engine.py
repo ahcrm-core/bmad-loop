@@ -421,6 +421,11 @@ class StoriesEngine(Engine):
         The folder is always project-relative (kills the absolute-path concern;
         the contract allows an absolute one but we never emit it). ``invoke_dev_with``
         is appended verbatim — the single planner→dev channel, never interpreted."""
+        # The environment-claim clause (DW-523) ends the invocation line on both
+        # legs — "" without probes, so the default prompt is unchanged. This
+        # engine has no park clause to keep last.
+        env_claim = self._environment_claim_instruction()
+        env_sentence = f" {env_claim}" if env_claim else ""
         if feedback is not None:
             # Deterministic-verify repair: re-open the id-keyed story spec and
             # resume on it in place. Identical to the base generic repair leg (an
@@ -434,7 +439,7 @@ class StoriesEngine(Engine):
                 f"verification; repair the working tree so verification passes without "
                 f"changing the spec's frozen intent contract. Verification evidence is "
                 f"in `{feedback}`."
-            )
+            ) + env_sentence
         entry = self._entry_for(task)
         prompt = (
             f"/{self._dev_skill()} Spec folder: {self._spec_folder_rel}. "
@@ -442,6 +447,7 @@ class StoriesEngine(Engine):
         )
         if self._plan_halt_leg(task, entry):
             prompt += " Halt after planning."
+        prompt += env_sentence
         if entry is not None and entry.invoke_dev_with:
             prompt += "\n" + entry.invoke_dev_with
         # A retry after a rolled-back attempt names its verified parked work (#777),

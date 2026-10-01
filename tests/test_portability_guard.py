@@ -709,6 +709,10 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         "origin",
         "original",
         "owed_after_implement",
+        # DW-523: what the orchestrator's probe made of a session's environment-
+        # fault claim on `env-fault-claim` — the closed set passed / failed /
+        # not-configured, never authored text.
+        "probe_outcome",
         # Parked-session diagnosis (DW-348/DW-350) on `dev-decision`, `session-end`,
         # `workflow-end`, `migrate-decision` and `triage-decision`: whether the
         # adapter withheld the stall nudge because the CLI was waiting on a human
@@ -1233,6 +1237,10 @@ JOURNAL_KINDS = frozenset(
         # `Engine._finish_inflight` and `SweepEngine._recover_inflight_bundle`).
         "env-fault-cleared",
         "resume-env-dispatch",
+        # DW-523. A session's "Environment fault:" claim and what the
+        # orchestrator's own probe made of it (`probe_outcome`), from
+        # `Engine._env_gate_claim` — journaled for every claim, confirmed or not.
+        "env-fault-claim",
         "epic-boundary",
         "fix-decision",
         "fix-harvest-failed",

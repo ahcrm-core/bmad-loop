@@ -85,6 +85,10 @@ directory name.
     `devcontract` when synthesizing the dev result from the spec).
   - sweep triage / migrate → `"deferred-sweep-triage"` / `"deferred-sweep-migrate"`
     (checked in `sweep.py`).
+- An `Environment fault: <text>` line in a session's last `## Auto Run Result`
+  becomes `env_fault_claim` in the synthesized dev result (DW-523). It is a claim
+  contract, not a verdict: it only triggers the orchestrator's own
+  `[environment] probes`, and never pauses or passes a story on its own.
 
 Validate after changes (from the repo root):
 

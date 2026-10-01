@@ -248,6 +248,13 @@ a verify command declared or hit an environment fault) at the site it names —
 `verify:<role>`, `probe:decision:<role>`, `probe:claim:<role>` or
 `probe:dispatch:<role>`. The attempt was **not** charged.
 
+A `probe:claim:<role>` site means the dev, fix or review session wrote an
+`Environment fault: <what is broken>` line in its final `## Auto Run Result` and
+the orchestrator's own probe then failed. The line only triggered that probe — a
+claim the probes did not confirm never pauses the run, so the failed probe, not
+the session's prose, is the evidence. `paused_reason` quotes the claim on its
+`session claim:` line.
+
 - **No spec change is needed.** Do not clarify the intent or reinterpret the
   story to explain the failure; `paused_reason` names the probe or command that
   failed and its output tail.
@@ -259,7 +266,10 @@ a verify command declared or hit an environment fault) at the site it names —
   kept, the human can instead exit this session and run
   `bmad-loop resolve <run> --reverify`: it keeps the tree at HEAD (in place, or
   the story's kept worktree unit), replays verification on it and, when that
-  passes, reviews and commits it (a unit merges) with no dev session.
+  passes, reviews and commits it (a unit merges) with no dev session. A
+  `probe:dispatch:<role>` pause is not an escalation at all — no session ran, so
+  the human fixes the environment and runs `bmad-loop resume <run>` (the probes
+  re-run first); `resolve` refuses that pause.
 
 ## What you MUST NOT do
 

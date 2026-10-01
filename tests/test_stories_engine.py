@@ -862,6 +862,34 @@ def test_review_prompt_carries_no_sprint_board_clause(project):
     assert prompt.endswith("the orchestrator owns their status and resolution.")
 
 
+def test_env_claim_clause_rides_stories_dev_prompts_only_with_probes(project, tmp_path):
+    """DW-523: the environment-claim clause ends the invocation line on both
+    stories legs (after `Halt after planning.`, before `invoke_dev_with`) while
+    probes are configured, and is absent — the prompt byte-identical — without.
+    Ablation: drop `env_sentence` from `_stories_dev_prompt` and the probed
+    prompts lose the clause."""
+    setup_stories(project, [entry("1", invoke_dev_with="Use Redis.")])
+    plain, _ = make_engine(project, [])
+    probed, _ = make_engine(
+        project, [], policy=Policy(environment=EnvironmentPolicy(probes=("exit 0",)))
+    )
+    clause = probed._environment_claim_instruction()
+    assert clause
+    task = StoryTask(story_key="1", epic=0)
+    fresh = probed._dev_prompt(task, None)
+    assert fresh == plain._dev_prompt(task, None).replace(
+        "Story id: 1.\n", f"Story id: 1. {clause}\n", 1
+    )
+    task.spec_file = str(story_spec(project, "1"))
+    story_spec(project, "1").parent.mkdir(parents=True, exist_ok=True)
+    write_spec(story_spec(project, "1"), "done", "abc")
+    feedback = tmp_path / "fb.md"
+    feedback.write_text("boom")
+    before = plain._dev_prompt(task, feedback)
+    assert clause not in before
+    assert probed._dev_prompt(task, feedback) == f"{before} {clause}"
+
+
 def test_dev_prompt_repair_leg_is_explicit_spec_resume(project, tmp_path):
     """A Stories repair remains its pre-sprint-routing explicit-spec invocation.
 

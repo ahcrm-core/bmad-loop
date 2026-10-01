@@ -463,9 +463,26 @@ def test_exhausted_decisions_carry_budget_exhausted():
     assert decide_dev(_task(attempt=2), COMPLETED, critical, POLICY).budget_exhausted is False
 
 
-def test_env_fault_claim_is_total_and_none_until_the_contract_reports_one():
-    for document in (None, {}, [], "Environment fault: db down", 7, {"env_fault_claim": "x"}):
+def test_env_fault_claim_reader_is_total():
+    """Only a mapping's non-blank ``env_fault_claim`` string is a claim —
+    stripped and bounded; anything else (a non-mapping document, a missing,
+    non-string or blank value) reads as no claim and never raises."""
+    for document in (
+        None,
+        {},
+        [],
+        "Environment fault: db down",
+        7,
+        {"env_fault_claim": None},
+        {"env_fault_claim": 7},
+        {"env_fault_claim": ["db down"]},
+        {"env_fault_claim": ""},
+        {"env_fault_claim": " \n\t "},
+    ):
         assert escalation.env_fault_claim(document) is None
+    assert escalation.env_fault_claim({"env_fault_claim": "  db down \n"}) == "db down"
+    bounded = escalation.env_fault_claim({"env_fault_claim": "x" * 2000})
+    assert bounded == "x" * escalation.ENV_FAULT_CLAIM_LIMIT
 
 
 # ------------------------------- review.on_timeout routing (#271)

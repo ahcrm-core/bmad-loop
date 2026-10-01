@@ -8655,6 +8655,11 @@ class SweepEngine(Engine):
             "conflicting main-checkout changes pause publication and retain source "
             "artifacts for recovery. Accepting the receipt alone does not publish files."
         )
+        # The environment-claim clause (DW-523) closes each leg's invocation
+        # sentence, ahead of the artifact-only paragraph — "" without probes, so
+        # the default prompt is unchanged. This engine has no park clause.
+        env_claim = self._environment_claim_instruction()
+        env_sentence = f" {env_claim}" if env_claim else ""
         if feedback is None:
             if task.restore_patch and task.spec_file:
                 return (
@@ -8663,7 +8668,7 @@ class SweepEngine(Engine):
                     f"The attempted change was restored onto the working tree after "
                     f"an intent-gap resolution; review it against the amended spec. "
                     f"Do NOT edit the deferred-work ledger; the orchestrator records "
-                    f"resolution.{artifact_only_guidance}"
+                    f"resolution.{env_sentence}{artifact_only_guidance}"
                 )
             # A retry after a rolled-back attempt names its verified parked work
             # (#777); a superseded bundle's ref is suppressed by the shared builder.
@@ -8672,7 +8677,7 @@ class SweepEngine(Engine):
                 f"/{self._dev_skill()} Implement the deferred-work bundle described in "
                 f"`{bundle_ref}` — it carries the intent and the verbatim ledger "
                 f"entries to resolve. Do NOT edit the deferred-work ledger; the "
-                f"orchestrator records resolution.{artifact_only_guidance}"
+                f"orchestrator records resolution.{env_sentence}{artifact_only_guidance}"
             ) + (f"\n\n{preserved}" if preserved else "")
         self._reset_spec_for_repair(task)
         spec_ref = task.spec_file or bundle_ref
@@ -8682,7 +8687,7 @@ class SweepEngine(Engine):
             f"previous session's work failed deterministic verification; repair the "
             f"working tree so verification passes without changing the frozen intent "
             f"contract or editing the deferred-work ledger. Verification evidence is "
-            f"in `{feedback}`.{artifact_only_guidance}"
+            f"in `{feedback}`.{env_sentence}{artifact_only_guidance}"
         )
 
     def _post_dev_state_sync(self, task: StoryTask, result_json: dict | None) -> None:

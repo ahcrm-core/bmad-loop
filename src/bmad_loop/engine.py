@@ -6352,14 +6352,22 @@ class Engine:
         Nothing runs when no probes are configured, when ``already_env_fault``
         says the failure was classified as an environment fault already (it
         pauses without charging on its own), or when the decision charges nothing
-        (PROCEED, a non-exhausted PAUSE, SALVAGE)."""
-        if already_env_fault or not self.policy.environment.probes:
+        (PROCEED, a non-exhausted PAUSE, SALVAGE).
+
+        A session's "Environment fault:" claim (``result_json``) is handled by
+        :meth:`_env_gate_claim` instead, whatever the decision: it forces a probe
+        but never decides on its own."""
+        if already_env_fault:
+            return decision
+        claim = env_fault_claim(result_json)
+        if claim is not None:
+            return self._env_gate_claim(task, decision, claim, role=role)
+        if not self.policy.environment.probes:
             return decision
         charges = decision.action in (Action.RETRY, Action.DEFER) or decision.budget_exhausted
-        claim = env_fault_claim(result_json)
-        if not charges and claim is None:
+        if not charges:
             return decision
-        site = f"probe:{'decision' if charges else 'claim'}:{role}"
+        site = f"probe:decision:{role}"
         probe = self._run_environment_probes(task, site=site)
         if probe.ok:
             return decision
@@ -6372,6 +6380,82 @@ class Engine:
             reason=reason,
         )
         return Decision(Action.PAUSE, reason, env_site=site)
+
+    def _env_gate_claim(
+        self, task: StoryTask, decision: Decision, claim: str, *, role: str
+    ) -> Decision:
+        """Check a session's "Environment fault:" claim against the probes (DW-523).
+
+        The claim is prose, so it decides nothing: it only makes the
+        orchestrator run its own ``[environment] probes`` (site
+        ``probe:claim:<role>``), whatever ``decision`` is — a PROCEED included.
+        A failed probe is the evidence that pauses: ``decision`` is replaced by a
+        PAUSE carrying that site. A passing probe, or no probes configured,
+        returns ``decision`` unchanged. Every claim journals one
+        ``env-fault-claim`` row naming the probe outcome and the action taken."""
+        if not self.policy.environment.probes:
+            self.journal.append(
+                "env-fault-claim",
+                story_key=task.story_key,
+                role=role,
+                reason=claim,
+                probe_outcome="not-configured",
+                action=str(decision.action),
+            )
+            return decision
+        site = f"probe:claim:{role}"
+        probe = self._run_environment_probes(task, site=site)
+        if probe.ok:
+            self.journal.append(
+                "env-fault-claim",
+                story_key=task.story_key,
+                role=role,
+                reason=claim,
+                probe_outcome="passed",
+                action=str(decision.action),
+            )
+            return decision
+        reason = self._env_claim_reason(decision, probe, claim, role=role)
+        self.journal.append(
+            "env-fault-claim",
+            story_key=task.story_key,
+            role=role,
+            reason=claim,
+            probe_outcome="failed",
+            action=str(Action.PAUSE),
+        )
+        self.journal.append(
+            "env-fault-reclassified",
+            story_key=task.story_key,
+            site=site,
+            action=str(decision.action),
+            reason=reason,
+        )
+        return Decision(Action.PAUSE, reason, env_site=site)
+
+    @staticmethod
+    def _env_claim_reason(
+        decision: Decision, probe: verify.ProbeOutcome, claim: str, *, role: str
+    ) -> str:
+        """The escalation reason for a claim a failed probe confirmed: the probe
+        that failed and why, the session's claim, the remedy, the withheld
+        decision (bounded), and the probe's output tail."""
+        failed = probe.failed
+        assert failed is not None  # only a failed pass confirms a claim
+        lines = [
+            f"environment fault: {role} session reported an environment fault and a probe "
+            f"confirmed it — probe failed ({probe.reason}): {failed.command}",
+            f"session claim: {claim}",
+            "the attempt is not charged: the orchestrator's own [environment] probe failed, "
+            "so the environment, not the story, is the likelier cause — fix the environment, "
+            "then re-arm the escalation (the attempt budget resets on re-arm), or keep the "
+            "attempt's work with `bmad-loop resolve <run> --reverify`",
+        ]
+        if decision.reason:
+            lines.append(f"withheld {decision.action}: {decision.reason[:500]}")
+        if failed.output_tail:
+            lines.append(failed.output_tail)
+        return "\n".join(lines)
 
     @staticmethod
     def _env_decision_reason(decision: Decision, probe: verify.ProbeOutcome, *, role: str) -> str:
@@ -7518,10 +7602,17 @@ class Engine:
         # "park"` (DW-383) — the one mode in which a review's `awaiting-operator`
         # finalization is accepted. It goes LAST, after the board clauses, the same
         # board-before-park order the dev seam keeps. Default prompt unchanged.
+        # The environment-claim clause (DW-523, only while probes are configured)
+        # sits just before it, as on the dev seam.
         park = self._operator_park_instruction() if self._review_demotion_parks() else ""
         clauses = [
             c
-            for c in (self._sprint_board_instruction(), self._board_handback_redirect(), park)
+            for c in (
+                self._sprint_board_instruction(),
+                self._board_handback_redirect(),
+                self._environment_claim_instruction(),
+                park,
+            )
             if c
         ]
         tail = " ".join(clauses)
@@ -8279,9 +8370,10 @@ class Engine:
         check, which would otherwise HALT `blocked` on the very diff
         `_restore_patch` just laid onto the tree. A bare story key takes the
         freeform/epic path instead, where that dirty-tree check runs first."""
-        # Both injected clauses ride every leg, in this order — the park clause
+        # The injected clauses ride every leg, in this order (the environment-claim
+        # clause only while probes are configured, DW-523) — the park clause
         # stays LAST because its docstring's backtick argument depends on nothing
-        # following it. Both are bare sentences, so this seam owns every separator:
+        # following it. All are bare sentences, so this seam owns every separator:
         # an em dash after the bare story key (the one leg whose text carries no
         # terminal punctuation), a plain space after a sentence. A full stop
         # followed by an em dash is punctuation noise and must never be assembled.
@@ -8291,7 +8383,13 @@ class Engine:
         # `_dev_prompt`), unlike the live guard on the review seam. Kept for
         # symmetry and pinned with a monkeypatch.
         clauses = [
-            c for c in (self._sprint_board_instruction(), self._operator_park_instruction()) if c
+            c
+            for c in (
+                self._sprint_board_instruction(),
+                self._environment_claim_instruction(),
+                self._operator_park_instruction(),
+            )
+            if c
         ]
         tail = " ".join(clauses)
         after_sentence = f" {tail}" if tail else ""
@@ -8449,6 +8547,34 @@ class Engine:
             "If the story cannot be finished without a human decision, finalize the "
             "spec to status: blocked and say why. That is the hand-back channel; "
             "the board is not."
+        )
+
+    def _environment_claim_instruction(self) -> str:
+        """The environment-fault claim contract (DW-523), injected while
+        ``[environment] probes`` is configured; "" otherwise, so a run without
+        probes keeps every prompt byte-identical.
+
+        It invites a session to name a broken run environment in its final Auto
+        Run Result. The line is a TRIGGER, not a verdict: ``devcontract`` reads it
+        into ``env_fault_claim`` and the engine answers it by running its own
+        probes (:meth:`_env_gate_claim`) — only a failed probe pauses, and a
+        passing one leaves the session's outcome to decide as usual. So the
+        clause also says the line changes nothing on its own, steering the
+        session away from reporting blocked for an outage the probes may not see.
+
+        Backtick-free and a bare sentence with no leading separator, for the
+        reasons :meth:`_operator_park_instruction` gives; every caller places it
+        BEFORE that clause, which stays last."""
+        if not self.policy.environment.probes:
+            return ""
+        return (
+            "If something outside the code blocks your work or its verification "
+            "(a database, container, or service the tests need is down or "
+            "unreachable), add one line reading Environment fault: followed by a "
+            "short description of what is broken to the final Auto Run Result. "
+            "The orchestrator answers that line by running its own environment "
+            "probes, and only their result counts: the line alone changes nothing, "
+            "so still report the story's real status."
         )
 
     def _operator_park_instruction(self) -> str:
@@ -8790,6 +8916,15 @@ class Engine:
                 # dev budget and pause for a human instead
                 self._escalate_outcome(task, outcome, role="fix")
             if ok:
+                # A green repair charges nothing, but a session claiming an
+                # environment fault still forces a probe (DW-523) — ahead of the
+                # acceptance below, as on the dev leg, so a confirmed claim
+                # pauses without accepting the repair.
+                claimed = self._env_gate_decision(
+                    task, Decision(Action.PROCEED), role="fix", result_json=result.result_json
+                )
+                if claimed.action == Action.PAUSE:
+                    self._escalate_decision(task, claimed)
                 # A verify-green repair supersedes the original accepted dev
                 # record as the owner of the tree now parked at DEV_VERIFY. Make
                 # that receipt durable in the same save as the fix decision so a

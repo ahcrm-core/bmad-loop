@@ -43,6 +43,7 @@ from typing import Any
 from . import deferredwork
 from .fences import fenced as _fenced
 from .frontmatter import _edit_frontmatter_block, auto_dev_baseline_of, status_of
+from .model import ENV_FAULT_CLAIM_LIMIT
 from .platform_util import atomic_write_bytes, atomic_write_bytes_confined, require_root_pinned
 from .verify import DEV_WORKFLOW, operator_actions_of, read_frontmatter
 
@@ -99,6 +100,36 @@ def _artifact_only_asserted(detail: str) -> bool:
     A match inside a fenced block is documentation, not an assertion — the same
     reading `_section_headings` gives a fenced heading."""
     return any(not _fenced(detail, m.start()) for m in ARTIFACT_ONLY_LINE_RE.finditer(detail))
+
+
+# The session's environment-fault claim (DW-523): an `Environment fault: <text>`
+# line (`environment_fault` / `Environment-fault` spell it too) in the last
+# `## Auto Run Result`, with the same bulleted/bolded label shapes and the same
+# one-line rule as `ARTIFACT_ONLY_LINE_RE` — the text is captured up to the end
+# of the line and never borrowed from the next one (`text` excludes every
+# `splitlines` boundary). A claim decides nothing: the engine only treats it as
+# a reason to run the operator's own `[environment] probes`, whose answer alone
+# can pause. Read through `_env_fault_claim_of`, which skips fenced matches and
+# blank text.
+ENV_FAULT_LINE_RE = re.compile(
+    rf"^{_HORIZONTAL_WS_RE}*(?:[-*]{_HORIZONTAL_WS_RE}*)?"
+    rf"(?:\*\*)?environment[ _-]+fault(?:\*\*)?{_HORIZONTAL_WS_RE}*:"
+    r"(?P<text>[^\r\n\x0b\x0c\x1c-\x1e\x85\u2028\u2029]*)",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def _env_fault_claim_of(detail: str) -> str | None:
+    """The first genuine (non-fenced, non-blank) environment-fault claim in the
+    marker body, bold markers and surrounding whitespace stripped, bounded to
+    `ENV_FAULT_CLAIM_LIMIT` characters; ``None`` when the body carries none."""
+    for m in ENV_FAULT_LINE_RE.finditer(detail):
+        if _fenced(detail, m.start()):
+            continue
+        text = m.group("text").strip().strip("*").strip()
+        if text:
+            return text[:ENV_FAULT_CLAIM_LIMIT]
+    return None
 
 
 # Terminal frontmatter statuses the skill can leave behind.
@@ -528,6 +559,14 @@ def synthesize_result(
     }
     if dw_ids:
         result["dw_ids"] = list(dw_ids)
+    # The session's environment-fault claim (DW-523), carried only when the last
+    # genuine marker states one — never from a repaired marker or frontmatter.
+    # Unlike the two mints above it needs no authorship proof: the claim decides
+    # nothing, it only makes the engine run its own probes.
+    if arr.present and ORCHESTRATOR_SYNTH_NOTE not in arr.detail:
+        claim = _env_fault_claim_of(arr.detail)
+        if claim is not None:
+            result["env_fault_claim"] = claim
     # bmad-build-auto (BMAD-METHOD PR #2505) self-reviews inline and, on a `done`
     # exit, sets `followup_review_recommended: true` when its review-driven
     # changes warrant an independent second-opinion pass. The skill never sets it

@@ -13632,6 +13632,197 @@ def test_no_probes_configured_journals_no_env_kinds(project, monkeypatch):
     assert engine.state.tasks["1-1-a"].env_fault_site is None
 
 
+_CLAIM = "postgres container is down"
+
+
+def _claiming(entry, claim: str = _CLAIM):
+    """A session script entry whose result carries an "Environment fault:" claim
+    (DW-523) — the key ``devcontract.synthesize_result`` mints from the line."""
+
+    def run(spec):
+        result = entry(spec) if callable(entry) else entry
+        return dataclasses.replace(
+            result, result_json={**(result.result_json or {}), "env_fault_claim": claim}
+        )
+
+    return run
+
+
+def _claim_rows(engine) -> list[dict]:
+    return [e for e in engine.journal.entries() if e["kind"] == "env-fault-claim"]
+
+
+def _claim_case(role: str, project, rig: _EnvRig):
+    """(script, policy, sessions) for a claim on ``role`` whose session leaves the
+    environment dead behind a decision that would otherwise PROCEED. The fix leg
+    kills it inside its own (green) verify command: the fix verify's preflight
+    probe has to pass for the repair to reach the claim at all."""
+    if role == "dev":
+        script = [rig.dies_during(_claiming(dev_effect(project, "1-1-a")))]
+        return script, _env_policy(rig), ["dev"]
+    if role == "review":
+        script = [
+            dev_effect(project, "1-1-a"),
+            rig.dies_during(_claiming(review_effect(project, "1-1-a", clean=True))),
+        ]
+        return script, _env_policy(rig), ["dev", "review"]
+    script = [
+        dev_effect(project, "1-1-a"),
+        review_effect(project, "1-1-a", clean=True),
+        _claiming(_fix_session_effect),
+    ]
+    policy = _env_policy(rig, rig.verify([0, 1, 0], kill_from=3))
+    return script, policy, ["dev", "review", "dev"]
+
+
+@pytest.mark.parametrize("role", ["dev", "review", "fix"])
+def test_claim_with_failing_probe_pauses_as_env_fault(project, tmp_path, role):
+    """A session claims an environment fault and the orchestrator's own probe
+    confirms it: the decision (a PROCEED on every leg here) is replaced by a PAUSE
+    at ``probe:claim:<role>``; the reason leads with the confirmation and quotes
+    the claim. Ablation: drop the `_env_gate_claim` call in `_env_gate_decision`
+    (or, for the fix leg, the PROCEED gate in `_fix_phase`) and the story is
+    committed."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    rig = _env_rig(tmp_path)
+    script, policy, sessions = _claim_case(role, project, rig)
+    engine, adapter = make_engine(project, script, policy=policy)
+    summary = engine.run()
+
+    assert summary.paused and summary.escalated == 1 and summary.done == 0
+    assert [s.role for s in adapter.sessions] == sessions
+    task = engine.state.tasks["1-1-a"]
+    site = f"probe:claim:{role}"
+    assert task.phase == Phase.ESCALATED and task.env_fault_site == site
+    assert engine.state.paused_stage == PAUSE_ESCALATION
+    reason = engine.state.paused_reason
+    assert reason.startswith(
+        f"environment fault: {role} session reported an environment fault and a probe "
+        "confirmed it — probe failed (rc=3)"
+    )
+    assert f"session claim: {_CLAIM}" in reason
+    assert "the attempt is not charged" in reason
+    (claim,) = _claim_rows(engine)
+    assert claim == {
+        **claim,
+        "story_key": "1-1-a",
+        "role": role,
+        "reason": _CLAIM,
+        "probe_outcome": "failed",
+        "action": "pause",
+    }
+    (reclassified,) = _reclassified(engine)
+    assert reclassified["site"] == site and reclassified["action"] == "proceed"
+    failed = [e for e in engine.journal.entries() if e["kind"] == "env-probe-failed"]
+    assert [e["site"] for e in failed] == [site]
+
+
+def test_claim_with_passing_probe_is_journaled_and_ignored(project, tmp_path, monkeypatch):
+    """The claim is prose, never a verdict: with the environment healthy the probe
+    passes, the claim is journaled with ``probe_outcome="passed"`` and the
+    session's own decision stands — the story commits. Ablation: make
+    `_env_gate_claim` return a PAUSE without probing (the claim pausing alone)
+    and the story escalates."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    rig = _env_rig(tmp_path)
+    engine, adapter = make_engine(
+        project,
+        [_claiming(dev_effect(project, "1-1-a")), review_effect(project, "1-1-a", clean=True)],
+        policy=_env_policy(rig),
+    )
+    sites: list[str] = []
+    real = engine._run_environment_probes
+
+    def spy(task, *, site):
+        sites.append(site)
+        return real(task, site=site)
+
+    monkeypatch.setattr(engine, "_run_environment_probes", spy)
+    summary = engine.run()
+
+    assert summary.done == 1 and summary.escalated == 0 and not summary.paused
+    assert [s.role for s in adapter.sessions] == ["dev", "review"]
+    task = engine.state.tasks["1-1-a"]
+    assert task.phase == Phase.DONE and task.env_fault_site is None
+    assert "probe:claim:dev" in sites
+    (claim,) = _claim_rows(engine)
+    assert claim["role"] == "dev" and claim["reason"] == _CLAIM
+    assert claim["probe_outcome"] == "passed" and claim["action"] == "proceed"
+    assert not _reclassified(engine)
+    decision = [e for e in engine.journal.entries() if e["kind"] == "dev-decision"][-1]
+    assert decision["action"] == "proceed" and "env_fault_site" not in decision
+
+
+def test_claim_without_probes_is_journaled_only(project, monkeypatch):
+    """No `[environment] probes`: the claim has nothing to trigger. It is journaled
+    (``probe_outcome="not-configured"``), nothing spawns, and the story commits.
+    Ablation: drop the not-configured journal row and the row assertion fails."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    called: list[object] = []
+    real = verify.run_environment_probes
+
+    def spy(policy, cwd):
+        called.append(cwd)
+        return real(policy, cwd)
+
+    monkeypatch.setattr(verify, "run_environment_probes", spy)
+    engine, adapter = make_engine(
+        project,
+        [_claiming(dev_effect(project, "1-1-a")), review_effect(project, "1-1-a", clean=True)],
+        policy=Policy(gates=GatesPolicy(mode="none"), notify=QUIET),
+    )
+    summary = engine.run()
+
+    assert summary.done == 1 and not summary.paused
+    assert called == []
+    (claim,) = _claim_rows(engine)
+    assert claim["probe_outcome"] == "not-configured" and claim["action"] == "proceed"
+    assert not _reclassified(engine)
+    assert engine.state.tasks["1-1-a"].env_fault_site is None
+
+
+def test_env_claim_prompt_clause_only_when_probes_configured(project, tmp_path):
+    """The claim contract rides the dev legs and the review prompt only while
+    `[environment] probes` is set; without probes every prompt is byte-identical
+    to the pre-DW-523 one. With probes the clause is the only difference, sits
+    BEFORE the park clause (which stays last), and is backtick-free.
+    Ablation: return the clause unconditionally and the no-probe prompts change."""
+    rig = _env_rig(tmp_path)
+    plain, _ = make_engine(project, [], policy=_park_policy())
+    probed, _ = make_engine(
+        project,
+        [],
+        policy=_park_policy(environment=EnvironmentPolicy(probes=(rig.probe,))),
+    )
+    clause = probed._environment_claim_instruction()
+    assert plain._environment_claim_instruction() == ""
+    assert clause.startswith("If something outside the code blocks your work")
+    assert "Environment fault:" in clause
+    assert "`" not in clause and "append" not in clause.lower()
+
+    spec = str(spec_path(project, "1-1-a"))
+    feedback = project.implementation_artifacts / "feedback.md"
+    legs = [
+        (_prompt_task(), None),
+        (_prompt_task(spec_file=spec, dispatched_spec_file=spec), None),
+        (_prompt_task(spec_file=spec, restore_patch="/run/attempt.patch"), None),
+        (_prompt_task(), feedback),
+    ]
+    park = plain._operator_park_instruction()
+    assert park  # else the ordering check is vacuous
+    for task, fb in legs:
+        before = plain._generic_dev_prompt(task, fb)
+        after = probed._generic_dev_prompt(task, fb)
+        assert clause not in before
+        assert after.replace(f" {clause}", "", 1) == before
+        assert after.index(clause) < after.index(park)
+    task = _prompt_task(spec_file=spec)
+    before = plain._review_prompt(task)
+    after = probed._review_prompt(task)
+    assert clause not in before
+    assert after == f"{before} {clause}"
+
+
 def _spawn_error_names(message: str, path: Path) -> bool:
     """Whether a spawn-error record names ``path``.
 

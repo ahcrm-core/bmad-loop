@@ -7933,6 +7933,46 @@ def test_generic_bundle_prompt_restore_branch_points_at_spec(project):
     assert "Resume review of the in-review spec" not in fresh_prompt
 
 
+def test_env_claim_clause_rides_bundle_prompts_only_with_probes(project, tmp_path):
+    """DW-523: every bundle leg closes its invocation sentence with the
+    environment-claim clause, ahead of the artifact-only paragraph, while probes
+    are configured; without probes each leg is byte-identical. Ablation: drop
+    `env_sentence` from a leg in `_generic_bundle_prompt` and that leg fails."""
+    plain, _ = make_sweep(project, [])
+    probed, _ = make_sweep(
+        project, [], policy=Policy(environment=EnvironmentPolicy(probes=("exit 0",)))
+    )
+    clause = probed._environment_claim_instruction()
+    assert clause
+    spec = project.implementation_artifacts / "spec-dw-fix.md"
+    write_spec(spec, "done", "abc")
+    feedback = tmp_path / "fb.md"
+    feedback.write_text("boom")
+    legs = [
+        (StoryTask(story_key="dw-fix", epic=0, bundle_file="/b/intent.md"), None),
+        (
+            StoryTask(
+                story_key="dw-fix",
+                epic=0,
+                bundle_file="/b/intent.md",
+                spec_file=str(spec),
+                restore_patch="/run/attempt.patch",
+            ),
+            None,
+        ),
+        (
+            StoryTask(story_key="dw-fix", epic=0, bundle_file="/b/intent.md", spec_file=str(spec)),
+            feedback,
+        ),
+    ]
+    for task, fb in legs:
+        before = plain._dev_prompt(task, fb)
+        after = probed._dev_prompt(task, fb)
+        assert clause not in before
+        assert after.replace(f" {clause}", "", 1) == before
+        assert after.index(clause) < after.index("Artifact-only receipt:")
+
+
 def test_bundle_dev_prompt_has_no_board_clause_but_the_review_prompt_does(project):
     """A bundle has no sprint-status row, so the board-ownership clause the story dev
     prompt carries is not appended here — `SweepEngine` overrides `_dev_prompt`, and

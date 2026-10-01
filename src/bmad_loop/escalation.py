@@ -13,7 +13,7 @@ from typing import Any
 
 from .adapters.base import SessionResult
 from .gates import NOTICE_FULL_DETAIL_SOURCE, NOTICE_TRUNCATION_MARKER, notice_line
-from .model import PAUSE_ESCALATION, RunState, StoryTask, VerifyOutcome
+from .model import ENV_FAULT_CLAIM_LIMIT, PAUSE_ESCALATION, RunState, StoryTask, VerifyOutcome
 from .policy import Policy
 
 SEVERITY_CRITICAL = "CRITICAL"
@@ -452,9 +452,16 @@ def env_fault_claim(result_json: Any) -> str | None:
     """The agent's "Environment fault:" claim in a session result, or ``None``.
 
     A claim never decides anything on its own — it only makes the engine run
-    the operator's ``[environment] probes`` (DW-523). Total on any input. A stub
-    until the dev contract learns to synthesize the claim: it answers ``None``
-    for every document today.
+    the operator's ``[environment] probes`` (DW-523). Total on any input: only a
+    mapping's ``env_fault_claim`` string counts (``devcontract.synthesize_result``
+    writes it from the session's last genuine ``## Auto Run Result``), stripped
+    and bounded to ``ENV_FAULT_CLAIM_LIMIT`` characters; a missing, non-string,
+    or blank value — or a document that is not a mapping at all — is no claim.
     """
-    del result_json
-    return None
+    if not isinstance(result_json, dict):
+        return None
+    claim = result_json.get("env_fault_claim")
+    if not isinstance(claim, str):
+        return None
+    claim = claim.strip()
+    return claim[:ENV_FAULT_CLAIM_LIMIT] if claim else None

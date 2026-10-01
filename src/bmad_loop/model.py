@@ -95,6 +95,11 @@ ENV_FAULT_SITES = frozenset(
     }
 )
 
+# The bound on a session's "Environment fault:" claim (DW-523): synthesized under
+# it by `devcontract` and re-applied by `escalation.env_fault_claim`, because a
+# third-party adapter's result document is not bound by the first-party writer.
+ENV_FAULT_CLAIM_LIMIT = 500
+
 # Reasons recorded in RunState.sweeps_refused (trigger -> reason). A CLOSED
 # vocabulary of short slugs, deliberately not a formatted exception: `bmad-loop
 # diagnose` renders run state through `sanitize.guard`, which *raises*
