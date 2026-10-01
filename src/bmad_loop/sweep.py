@@ -2595,6 +2595,13 @@ class SweepEngine(Engine):
                 phase=str(task.phase),
                 rearmed=task.rearmed,  # read before the recovery clears the latch
             )
+            if task.reverify_from:
+                # DW-522: `runs.reverify_refusal` refuses sweep runs, so a latch here
+                # was not set by `resolve --reverify`. Fail closed rather than let the
+                # restart arm roll the kept work back under it; the latch is spent
+                # first so the escalation's save persists it cleared.
+                task.reverify_from = ""
+                self._escalate(task, "resolve --reverify is not supported for sweep runs")
             if self._recover_inflight_bundle(task):
                 continue
             self._ensure_bundle_intent(task)  # every refusal raises RunPaused

@@ -3945,7 +3945,11 @@ def cmd_resolve(args: argparse.Namespace) -> int:
         )
         return 1
     state = load_state(run_dir)
-    if state.paused_stage != PAUSE_ESCALATION:
+    # DW-522: `--reverify --story <key>` may name a worktree unit under ANY pause
+    # stage (an isolated defer never pauses the run); `reverify_refusal` decides
+    # whether the named story qualifies. Everything else needs the escalation pause.
+    reverify_named = bool(getattr(args, "reverify", False) and args.story)
+    if not _resolve_pause_admits(state.paused_stage, reverify_named=reverify_named):
         print(
             f"run {args.run_id} is not paused at an escalation "
             f"(stage: {state.paused_stage or 'none'})",
@@ -4456,6 +4460,18 @@ def _resolve_adopt(
     return _resume_paused_run(project, run_dir)
 
 
+def _resolve_pause_admits(paused_stage: str | None, *, reverify_named: bool) -> bool:
+    """Whether `resolve` may act on a run paused at ``paused_stage``: the escalation
+    pause always; any pause for `--reverify --story <key>` (DW-522), whose
+    `runs.reverify_refusal` then admits only a worktree unit off the escalation pause.
+    One rule for `cmd_resolve`'s entry gate and `_resolve_reverify`'s locked re-check."""
+    from .model import PAUSE_ESCALATION
+
+    if reverify_named:
+        return paused_stage is not None
+    return paused_stage == PAUSE_ESCALATION
+
+
 def _resolve_reverify(
     args: argparse.Namespace,
     project: Path,
@@ -4467,32 +4483,52 @@ def _resolve_reverify(
     """`resolve --reverify` (DW-522): re-verify a DEFERRED or environment-fault
     ESCALATED story's kept attempt instead of re-driving it.
 
-    `cmd_resolve` has already run the shared gates (alias, paused-at-escalation,
-    liveness, deferred-or-escalated story, sweep ledger). This adds the kept-work
+    `cmd_resolve` has already run the shared gates (alias, paused-at-escalation — or
+    paused at all for a named `--story`, `_resolve_pause_admits` — liveness,
+    deferred-or-escalated story, sweep ledger). This adds the kept-work
     preconditions (`runs.reverify_refusal`), states what the replay will claim,
     confirms, re-checks everything under the run lock and hands the state
     transaction to `runs.rearm_for_reverify`; the resumed engine's reverify arm then
     replays verify on the tree and reviews and commits it on a pass. No dev session
     and no resolve agent run. The code root is deliberately NOT re-stamped: a moved
     root means the kept attempt lives in the other tree, which the refusal names."""
-    from .model import PAUSE_ESCALATION, Phase
+    from .model import Phase
 
-    refusal = runs.reverify_refusal(state, task, story_key, run_dir=run_dir, project_root=project)
+    explicit_story = bool(args.story)
+    refusal = runs.reverify_refusal(
+        state,
+        task,
+        story_key,
+        run_dir=run_dir,
+        project_root=project,
+        explicit_story=explicit_story,
+    )
     if refusal is not None:
         print(f"error: {refusal}", file=sys.stderr)
         return 1
-    root = Path(state.code_root)
+    mounted = bool(task.worktree_path)
+    root = Path(task.worktree_path) if mounted else Path(state.code_root)
     try:
         head = verify.rev_parse_head(root)
     except verify.GitError as e:
         print(f"error: cannot read HEAD of {root} ({e})", file=sys.stderr)
         return 1
+    where = (
+        f"in its kept worktree: the attempt is branch {task.branch} at {root}"
+        if mounted
+        else f"in place: the attempt is the tree at {root}"
+    )
+    lands = (
+        "the unit merges into the target branch on a pass"
+        if mounted
+        else "the story commits on a pass"
+    )
     print(
-        f"re-verifying {story_key} in place: the attempt is the tree at {root} — HEAD "
+        f"re-verifying {story_key} {where} — HEAD "
         f"{head[:12]} above baseline {(task.baseline_commit or '')[:12]}, plus any "
         "uncommitted changes. Commits/changes made since the pause are included in the "
         "story's squashed commit. No dev session and no resolve agent run: the [verify] "
-        "commands are replayed, then review follows policy and the story commits on a pass",
+        f"commands are replayed, then review follows policy and {lands}",
         file=sys.stderr,
     )
     if args.resume is None and not _confirm(
@@ -4507,7 +4543,7 @@ def _resolve_reverify(
             # Same mutation-boundary re-check as the re-arm path: the checks above
             # ran lock-free, so repeat them against the state left by the last writer.
             fresh_state = load_state(run_dir)
-            if fresh_state.paused_stage != PAUSE_ESCALATION:
+            if not _resolve_pause_admits(fresh_state.paused_stage, reverify_named=explicit_story):
                 print(
                     f"run {args.run_id} is not paused at an escalation "
                     f"(stage: {fresh_state.paused_stage or 'none'})",
@@ -4543,7 +4579,9 @@ def _resolve_reverify(
                     file=sys.stderr,
                 )
                 return 1
-            outcome = runs.rearm_for_reverify(run_dir, story_key, project_root=project)
+            outcome = runs.rearm_for_reverify(
+                run_dir, story_key, project_root=project, explicit_story=explicit_story
+            )
     except runs.RearmError as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
@@ -6502,10 +6540,12 @@ def main(argv: list[str] | None = None) -> int:
         "--reverify",
         action="store_true",
         help="keep a DEFERRED (or environment-fault escalated) story's attempt as it "
-        "stands at HEAD, plus any uncommitted changes, and resume by replaying its "
-        "verification: the [verify] commands re-run on that work and, when they pass, "
-        "it is reviewed per policy and committed — no dev session and no resolve "
-        "agent. Fix the environment first (in-place runs only; not for sweep runs)",
+        "stands at HEAD — in place, or in its kept worktree unit — plus any uncommitted "
+        "changes, and resume by replaying its verification: the [verify] commands "
+        "re-run on that work and, when they pass, it is reviewed per policy and "
+        "committed (a unit merged) — no dev session and no resolve agent. Fix the "
+        "environment first. With --story, a worktree unit is accepted under any pause "
+        "(not for sweep runs)",
     )
     resolve_p.add_argument(
         "--resume",

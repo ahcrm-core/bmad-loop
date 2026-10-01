@@ -18379,3 +18379,91 @@ def test_resolve_reverify_never_launches_the_resolve_agent(tmp_path, monkeypatch
     monkeypatch.setattr(cli, "_resume_paused_run", lambda *_a: 0)
 
     assert _resolve_reverify(project, "--resume") == 0
+
+
+def _off_escalation_pause(run_dir) -> None:
+    """Re-pause the run at a non-escalation stage on another story — the shape a
+    worktree run is in when an isolated defer let it move on."""
+    from bmad_loop.journal import load_state, save_state
+
+    state = load_state(run_dir)
+    state.paused_stage = "story-gate"
+    state.paused_story_key = "1-1-b"
+    save_state(run_dir, state)
+
+
+def _mount_reverify_task(run_dir, project) -> Path:
+    """Move `_reverify_run`'s attempt into a kept worktree unit: a registered
+    worktree on the unit branch, holding a committed change above the baseline and
+    the spec, recorded on the task as `isolation = "worktree"` records it."""
+    from bmad_loop.journal import load_state, save_state
+
+    state = load_state(run_dir)
+    task = state.tasks[_REVERIFY_KEY]
+    branch = f"bmad-loop/r1/{_REVERIFY_KEY}"
+    wt = project / ".bmad-loop" / "worktrees" / "r1" / _REVERIFY_KEY
+    git(project, "worktree", "add", "-q", "-b", branch, str(wt), task.baseline_commit)
+    (wt / "unit.py").write_text("print('unit attempt')\n", encoding="utf-8")
+    git(wt, "add", "unit.py")
+    git(wt, "commit", "-q", "-m", "unit attempt")
+    spec = wt / (task.spec_file or "")
+    spec.parent.mkdir(parents=True, exist_ok=True)
+    spec.write_bytes((project / (task.spec_file or "")).read_bytes())
+    task.worktree_path = str(wt)
+    task.branch = branch
+    save_state(run_dir, state)
+    return wt
+
+
+def test_resolve_reverify_story_accepts_any_pause_for_a_mounted_task(tmp_path, monkeypatch, capsys):
+    """DW-522: an isolated defer does not pause the run, so a deferred worktree unit
+    is re-verified under whatever pause the run reached — when `--story` names it.
+    Unnamed, resolve still requires the escalation pause.
+
+    Ablation: make `_resolve_pause_admits` ignore `reverify_named` and the named
+    resolve is refused at the entry gate."""
+    from bmad_loop.journal import load_state
+    from bmad_loop.model import Phase
+
+    run_dir, project = _reverify_project(tmp_path)
+    wt = _mount_reverify_task(run_dir, project)
+    _off_escalation_pause(run_dir)
+    monkeypatch.setattr(
+        cli, "_resume_paused_run", lambda *_a: pytest.fail("--no-resume must not resume")
+    )
+
+    before = _state_bytes(run_dir)
+    assert _resolve_reverify(project, "--no-resume") == 1
+    assert "not paused at an escalation (stage: story-gate)" in capsys.readouterr().err
+    assert _state_bytes(run_dir) == before
+
+    rc = _resolve_reverify(project, "--story", _REVERIFY_KEY, "--no-resume")
+
+    out = capsys.readouterr()
+    assert rc == 0, out.err
+    assert f"in its kept worktree: the attempt is branch bmad-loop/r1/{_REVERIFY_KEY}" in out.err
+    assert "the unit merges into the target branch on a pass" in out.err
+    saved = load_state(run_dir)
+    assert saved.paused_stage == "story-gate"  # the pause is the resume's to clear
+    task = saved.tasks[_REVERIFY_KEY]
+    assert task.phase == Phase.DEV_VERIFY and task.reverify_from == "deferred"
+    assert task.worktree_path == str(wt)
+
+
+def test_resolve_reverify_in_place_still_requires_the_escalation_pause(tmp_path, capsys):
+    """DW-522: naming an IN-PLACE story does not lift the pause rule — its replay
+    claims the whole code tree, which is only the story's attempt when the run
+    stopped on it. The CLI admits the named story; `reverify_refusal` refuses it.
+
+    Ablation: drop the pause-stage check in `runs.reverify_refusal` and the
+    re-arm goes through."""
+    run_dir, project = _reverify_project(tmp_path)
+    _off_escalation_pause(run_dir)
+    before = _state_bytes(run_dir)
+
+    rc = _resolve_reverify(project, "--story", _REVERIFY_KEY, "--no-resume")
+
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "an in-place replay re-verifies only the story the run stopped on" in err
+    assert _state_bytes(run_dir) == before

@@ -23844,6 +23844,39 @@ def test_interrupted_bundle_redrives_by_identity_after_triage_loss(project):
     assert ledger_entries(project)["DW-1"].status.startswith("done")
 
 
+def test_sweep_inflight_bundle_with_reverify_latch_escalates(project):
+    """DW-522: `resolve --reverify` refuses sweep runs, so a bundle carrying the
+    `reverify_from` latch is not one the gesture armed. The sweep recovery fails
+    closed: the bundle ESCALATES with the latch spent — no session, no restart
+    rollback of the kept work.
+
+    Ablation: drop the `task.reverify_from` guard in
+    `SweepEngine._finish_inflight_bundles` and the restart arm re-drives the bundle."""
+    engine = _run_to_dev_escalation(project)
+    state = load_state(engine.run_dir)
+    task = state.tasks["dw-fix"]
+    task.phase = Phase.DEV_VERIFY
+    task.reverify_from = "deferred"
+    save_state(engine.run_dir, state)
+
+    resumed, adapter = resume_sweep(project, engine, _redrive_script(project))
+    summary = resumed.run()
+
+    assert adapter.sessions == []
+    assert summary.paused and resumed.state.paused_stage == PAUSE_ESCALATION
+    assert resumed.state.paused_story_key == "dw-fix"
+    saved = load_state(engine.run_dir).tasks["dw-fix"]
+    assert saved.phase == Phase.ESCALATED and saved.reverify_from == ""
+    [escalated] = [
+        e
+        for e in resumed.journal.entries()
+        if e["kind"] == "story-escalated" and e["reason"].startswith("resolve --reverify")
+    ]
+    assert escalated["reason"] == "resolve --reverify is not supported for sweep runs"
+    journal = journal_text(resumed)
+    assert "resume-restart" not in journal and "rollback-auto" not in journal
+
+
 def test_resume_committing_bundle_finishes_commit(project):
     """#115, sweep flavor: a bundle whose host died in the commit window
     (COMMITTING persisted, DONE save never landed) is finished on resume —

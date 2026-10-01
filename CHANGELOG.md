@@ -22,9 +22,11 @@ probes` are set, every retry, defer or budget-exhausted decision (dev, fix,
   run as an environment fault instead — the attempt is not charged and the
   story's `env_fault_site` records where it was detected (DW-523).
 - Add `bmad-loop resolve <run> --reverify`: re-verify a DEFERRED (or
-  environment-fault escalated) in-place story's kept work at HEAD — the
-  `[verify]` commands are replayed, then review follows policy and the story
-  commits on a pass, with no dev session and no resolve agent (DW-522).
+  environment-fault escalated) story's kept work — HEAD in place, or the kept
+  worktree unit under isolation — the `[verify]` commands are replayed, then
+  review follows policy and the story commits (a unit merges) on a pass, with no
+  dev session and no resolve agent. A worktree unit is accepted under any pause
+  when `--story` names it; sweep runs are refused (DW-522).
 
 ### Changed
 

@@ -257,9 +257,9 @@ a verify command declared or hit an environment fault) at the site it names —
   environment was repaired); the attempt budget resets on re-arm. A plain re-arm
   re-drives a dev session from the baseline. When the attempt's work should be
   kept, the human can instead exit this session and run
-  `bmad-loop resolve <run> --reverify` (in-place runs): it keeps the tree at HEAD,
-  replays verification on it and, when that passes, reviews and commits it with
-  no dev session.
+  `bmad-loop resolve <run> --reverify`: it keeps the tree at HEAD (in place, or
+  the story's kept worktree unit), replays verification on it and, when that
+  passes, reviews and commits it (a unit merges) with no dev session.
 
 ## What you MUST NOT do
 

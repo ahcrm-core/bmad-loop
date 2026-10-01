@@ -34,6 +34,7 @@ from conftest import (
     fault_read_text,
     git,
     ignore_before_commit,
+    install_bmad_config,
     install_build_auto_skill,
     nested_repo_root_paths,
     refuse_to_resolve,
@@ -11280,3 +11281,258 @@ def test_profile_without_workspace_trust_never_touches_home(project, tmp_path, m
     assert list(home.iterdir()) == []
     kinds = journal_kinds(engine)
     assert "worktree-trust-seeded" not in kinds and "worktree-trust-unseeded" not in kinds
+
+
+# ------------------------------------------------- resolve --reverify (DW-522)
+
+
+def _wt_reverify_policy(verify_cmd: str, *, env_fault_rc: int = 0, **scm) -> Policy:
+    """Worktree isolation, one dev attempt, and a `[verify]` command standing in for
+    an e2e suite whose container may be down."""
+    return replace(
+        wt_policy(limits=LimitsPolicy(max_dev_attempts=1, max_followup_reviews=99), **scm),
+        verify=VerifyPolicy(commands=(verify_cmd,), env_fault_rc=env_fault_rc),
+    )
+
+
+def _deferred_unit_then_escalation(
+    project, tmp_path, *, a_script=None, escalate_b=True, env_up=False, **scm
+):
+    """Story A's unit DEFERS with its worktree kept — by default because the e2e
+    verify fails (the marker, outside the repo, is missing); with ``env_up`` the
+    verify passes and ``a_script`` supplies the defer — and an isolated defer does
+    not pause the run; then story B escalates, so the run is paused on B. Returns
+    (engine, marker)."""
+    install_bmad_config(project)  # `reverify_refusal` locates the code root through it
+    stories = {"1-1-a": "ready-for-dev"}
+    if escalate_b:
+        stories["1-1-b"] = "ready-for-dev"
+    commit_sprint(project, stories)
+    marker = tmp_path / "container-up"
+    if env_up:
+        marker.write_text("up\n")
+    script = list(a_script or [wt_dev_effect(project, "1-1-a", followup_review=False)])
+    if escalate_b:
+        script.append(_wt_escalating_dev(project, "1-1-b"))
+    engine, adapter = make_engine(
+        project, script, policy=_wt_reverify_policy(_file_exists_cmd(marker), **scm)
+    )
+    engine.run()
+    a = engine.state.tasks["1-1-a"]
+    assert a.phase == Phase.DEFERRED and a.worktree_path
+    assert adapter.script == []  # every scripted session ran
+    if escalate_b:
+        assert engine.state.paused_stage == PAUSE_ESCALATION
+        assert engine.state.paused_story_key == "1-1-b"
+        assert engine.state.tasks["1-1-b"].phase == Phase.ESCALATED
+    return engine, marker
+
+
+def _state_bytes(run_dir: Path) -> bytes:
+    return (run_dir / "state.json").read_bytes()
+
+
+def test_reverify_kept_deferred_unit_merges_without_a_dev_session(project, tmp_path):
+    """DW-522, worktree: a deferred unit whose kept work is green once the environment
+    is back is re-verified in its worktree and MERGED with no dev session, while the
+    escalated story the run is paused on stays escalated."""
+    engine, marker = _deferred_unit_then_escalation(project, tmp_path)
+    assert "change for 1-1-a" not in (project.project / "src.txt").read_text()
+
+    marker.write_text("up\n")  # the operator restarts the container
+    runs.rearm_for_reverify(
+        engine.run_dir, "1-1-a", project_root=project.project, explicit_story=True
+    )
+    armed = load_state(engine.run_dir).tasks["1-1-a"]
+    assert armed.phase == Phase.DEV_VERIFY and armed.reverify_from == "deferred"
+    [row] = [e for e in Journal(engine.run_dir).entries() if e["kind"] == "story-reverify-armed"]
+    assert row["branch"] == armed.branch and row["worktree"] == armed.worktree_path
+
+    resumed, adapter = resume_engine(project, engine)
+    summary = resumed.run()
+
+    assert adapter.sessions == []
+    assert summary.paused and not summary.crashed
+    saved = load_state(engine.run_dir)
+    assert saved.paused_stage == PAUSE_ESCALATION and saved.paused_story_key == "1-1-b"
+    a = saved.tasks["1-1-a"]
+    assert a.phase == Phase.DONE and a.reverify_from == "" and a.commit_sha
+    assert saved.tasks["1-1-b"].phase == Phase.ESCALATED
+    assert "change for 1-1-a" in (project.project / "src.txt").read_text()
+    assert sprintstatus.story_status(project.sprint_status, "1-1-a") == "done"
+    kinds = journal_kinds(resumed)
+    assert "resume-reverify" in kinds and "unit-merged" in kinds
+    assert "resume-restart" not in kinds
+    [decision] = _rows(resumed, "reverify-decision")
+    assert decision["action"] == "proceed" and decision["origin"] == "deferred"
+
+
+def test_reverify_failed_replay_re_defers_and_keeps_the_worktree(project, tmp_path):
+    """DW-522, worktree: replaying before the environment is back re-defers the unit
+    (no retry, no session) and closes it the way the first defer did — the worktree
+    and branch are kept, nothing reaches the main checkout."""
+    engine, _marker = _deferred_unit_then_escalation(project, tmp_path)
+    runs.rearm_for_reverify(
+        engine.run_dir, "1-1-a", project_root=project.project, explicit_story=True
+    )
+
+    resumed, adapter = resume_engine(project, engine)
+    summary = resumed.run()
+
+    assert adapter.sessions == []
+    assert summary.paused and not summary.crashed
+    a = load_state(engine.run_dir).tasks["1-1-a"]
+    assert a.phase == Phase.DEFERRED and a.reverify_from == ""
+    assert Path(a.worktree_path).is_dir() and current_branch(Path(a.worktree_path)) == a.branch
+    assert branch_exists(project.project, a.branch)
+    assert "change for 1-1-a" not in (project.project / "src.txt").read_text()
+    [decision] = _rows(resumed, "reverify-decision")
+    assert decision["action"] == "defer" and decision["reason"].startswith("reverify failed: ")
+    kinds = journal_kinds(resumed)
+    assert "unit-closed" in kinds and "unit-merged" not in kinds
+    # still re-verifiable: the kept unit is the attempt it was
+    assert (
+        runs.reverify_refusal(
+            load_state(engine.run_dir),
+            a,
+            "1-1-a",
+            run_dir=engine.run_dir,
+            project_root=project.project,
+            explicit_story=True,
+        )
+        is None
+    )
+
+
+def test_reverify_carries_harvested_deferrals_once(project, tmp_path):
+    """DW-522, worktree: a unit's harvested findings are carried into the main ledger
+    when it DEFERS (here: its reviews never converge); a reverify that later merges
+    it carries again through the merge path, which must dedupe against the defer's
+    rows — one ledger row, not two."""
+    script = [wt_dev_effect(project, "1-1-a", deferred=[_HARVEST_CARRY])] + [
+        wt_review_effect(project, "1-1-a", clean=False, patched=1) for _ in range(3)
+    ]
+    engine, _ = _deferred_unit_then_escalation(project, tmp_path, a_script=script, env_up=True)
+    assert [e.title for e in _main_harvest_entries(project)] == [_HARVEST_CARRY["summary"]]
+    assert len(_harvest_carry_events(engine)) == 1
+
+    runs.rearm_for_reverify(
+        engine.run_dir, "1-1-a", project_root=project.project, explicit_story=True
+    )
+    resumed, adapter = resume_engine(
+        project, engine, [wt_review_effect(project, "1-1-a", clean=True)]
+    )
+    resumed.run()
+
+    assert [s.role for s in adapter.sessions] == ["review"]
+    a = load_state(engine.run_dir).tasks["1-1-a"]
+    assert a.phase == Phase.DONE and a.isolated_ledger_carried
+    assert "unit-merged" in journal_kinds(resumed)
+    assert [e.title for e in _main_harvest_entries(project)] == [_HARVEST_CARRY["summary"]]
+
+
+def test_reverify_of_an_escalated_worktree_env_fault_merges(project, tmp_path):
+    """DW-522 + DW-523, worktree: a unit whose verify exits the declared env-fault rc
+    escalates at `verify:dev` with its mount kept; once the environment is back, a
+    plain `rearm_for_reverify` (the pause names the story — no `--story` needed)
+    merges the kept unit with no dev session and the run finishes."""
+    install_bmad_config(project)
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    marker = tmp_path / "container-up"
+    e2e = tmp_path / "e2e.py"
+    e2e.write_text(
+        f"import os, sys\nsys.exit(0 if os.path.exists(r'{marker}') else 75)\n", encoding="utf-8"
+    )
+    policy = _wt_reverify_policy(f'"{sys.executable}" "{e2e}"', env_fault_rc=75)
+    engine, _ = make_engine(
+        project, [wt_dev_effect(project, "1-1-a", followup_review=False)], policy=policy
+    )
+    summary = engine.run()
+    task = engine.state.tasks["1-1-a"]
+    assert summary.paused and engine.state.paused_story_key == "1-1-a"
+    assert task.phase == Phase.ESCALATED and task.env_fault_site == "verify:dev"
+    assert task.worktree_path and Path(task.worktree_path).is_dir()
+
+    marker.write_text("up\n")
+    runs.rearm_for_reverify(engine.run_dir, project_root=project.project)
+    resumed, adapter = resume_engine(project, engine)
+    summary = resumed.run()
+
+    assert adapter.sessions == []
+    assert not summary.paused and not summary.crashed
+    saved = load_state(engine.run_dir)
+    assert saved.finished
+    a = saved.tasks["1-1-a"]
+    assert a.phase == Phase.DONE and a.env_fault_site is None
+    assert "change for 1-1-a" in (project.project / "src.txt").read_text()
+    [decision] = _rows(resumed, "reverify-decision")
+    assert decision["origin"] == "escalated" and decision["action"] == "proceed"
+    assert "unit-merged" in journal_kinds(resumed)
+
+
+def _refused_reverify(engine, *, explicit_story: bool, match: str) -> None:
+    before = _state_bytes(engine.run_dir)
+    with pytest.raises(runs.RearmError, match=match):
+        runs.rearm_for_reverify(
+            engine.run_dir,
+            "1-1-a",
+            project_root=engine.paths.project,
+            explicit_story=explicit_story,
+        )
+    assert _state_bytes(engine.run_dir) == before
+
+
+def test_reverify_refuses_a_torn_down_unit_and_names_its_patch(project, tmp_path):
+    """keep_failed off tears the deferred unit's worktree down: nothing to re-verify,
+    and the refusal points at the diff the teardown saved.
+
+    Ablation: drop the `wt.is_dir()` check in `_mounted_reverify_refusal` and the
+    refusal no longer names the patch (it falls to the registration check)."""
+    engine, _ = _deferred_unit_then_escalation(project, tmp_path, keep_failed=False)
+    assert not Path(engine.state.tasks["1-1-a"].worktree_path).exists()
+    patch = engine.run_dir / "failed" / "1-1-a" / "changes.patch"
+    assert patch.is_file()
+    _refused_reverify(engine, explicit_story=True, match=r"is gone.*changes\.patch")
+
+
+def test_reverify_refuses_a_detached_kept_unit(project, tmp_path):
+    """`branch_per = "run"` detaches a kept deferred unit's HEAD; the engine's reopen
+    demands the unit branch, so the re-arm refuses up front.
+
+    Ablation: drop the `current_branch` check in `_mounted_reverify_refusal` and the
+    re-arm succeeds."""
+    engine, _ = _deferred_unit_then_escalation(project, tmp_path, branch_per="run")
+    assert current_branch(Path(engine.state.tasks["1-1-a"].worktree_path)) == "HEAD"
+    _refused_reverify(engine, explicit_story=True, match="detached HEAD")
+
+
+def test_reverify_of_a_mounted_unit_needs_the_story_named_off_its_own_pause(project, tmp_path):
+    """A mounted story is accepted under ANY pause stage only when the operator named
+    it; unnamed, the in-place rule (the escalation pause naming this story) applies.
+
+    Ablation: drop the pause-stage check in `reverify_refusal` and the unnamed
+    re-arm succeeds."""
+    engine, _ = _deferred_unit_then_escalation(project, tmp_path)
+    state = load_state(engine.run_dir)
+    state.paused_stage = "story-gate"  # a non-escalation pause
+    save_state(engine.run_dir, state)
+
+    _refused_reverify(engine, explicit_story=False, match="--story 1-1-a")
+
+    # the named re-arm is admitted under the same pause
+    outcome = runs.rearm_for_reverify(
+        engine.run_dir, "1-1-a", project_root=project.project, explicit_story=True
+    )
+    assert outcome.story_key == "1-1-a"
+
+
+def test_reverify_refuses_a_finished_run(project, tmp_path):
+    """An isolated defer does not pause the run, so a run with nothing else to stop
+    on FINISHES with the unit deferred — there is no resume to replay on, named
+    story or not.
+
+    Ablation: drop the not-paused check in `reverify_refusal` and the named re-arm
+    succeeds."""
+    engine, _ = _deferred_unit_then_escalation(project, tmp_path, escalate_b=False)
+    assert load_state(engine.run_dir).finished
+    _refused_reverify(engine, explicit_story=True, match="is not paused")

@@ -9543,7 +9543,8 @@ _REVERIFY_REFUSALS = [
         "code root in the BMAD config has changed",
     ),
     ("baseline_not_ancestor_of_head", "deferred", None, _baseline_off_head, "is not an ancestor"),
-    ("mounted_task_for_now", "deferred", None, _mounted, "worktree reverify is not yet supported"),
+    # a mount directory that is not (or no longer) a registered worktree of the code root
+    ("unregistered_mount", "deferred", None, _mounted, "is no longer a worktree of"),
 ]
 
 
