@@ -1838,6 +1838,9 @@ class Engine:
         attempt's to remove", and the same one `sweep`'s migration refusal already uses.
         """
         discard_worktree(self.paths.repo_root, task.worktree_path, "", run_dir=self.run_dir)
+        # A probe pass vouched for the discarded tree, not the replacement a later
+        # mount may open at the same path (DW-523).
+        self._env_probes_fresh_root = None
         # before the clears below: the relativization is measured against this field's
         # mount project (DW-379)
         task.release_mount_owned_state(self._mount_project(task))

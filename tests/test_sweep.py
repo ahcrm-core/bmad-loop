@@ -25063,6 +25063,53 @@ def test_hard_stop_between_bundles_takes_hard_arm(project, monkeypatch):
     assert entries["DW-1"].status.startswith("done") and entries["DW-2"].open
 
 
+def test_isolated_bundle_dispatch_pause_reprobes_the_replacement_unit(project, tmp_path):
+    """DW-523, isolated sweep: the resume re-probe runs in the kept unit, which the
+    sweep then discards for a fresh one (`_run_story` always mounts anew). That
+    pass vouched for the discarded tree, so the replacement's own dispatch gate
+    must probe again before the dev session launches — even at the same path.
+
+    Ablation, performed: drop the freshness reset in `_discard_unit_for_restart`
+    and the dev session launches after the resume re-probe alone (1, not 2)."""
+    write_ledger(project, {"DW-1": "open"})
+    rig = tmp_path / "env-rig"  # outside the repo: no rollback or commit touches it
+    rig.mkdir()
+    marker = rig / "up"
+    log = rig / "probes"
+    script = rig / "probe.py"
+    script.write_text(
+        "import os, sys\n"
+        f"open(r'{log}', 'a', encoding='utf-8').write(os.getcwd() + '\\n')\n"
+        f"sys.exit(0 if os.path.exists(r'{marker}') else 3)\n",
+        encoding="utf-8",
+    )
+    policy = isolated_seeded_policy(project)
+    policy = replace(
+        policy, environment=EnvironmentPolicy(probes=(f'"{sys.executable}" "{script}"',))
+    )
+    engine, _ = make_sweep(project, [triage_effect(bundle_plan())], policy=policy)
+    assert engine.run().paused and engine.state.paused_stage == PAUSE_ENVIRONMENT
+    paused_unit = Path(engine.state.tasks["dw-fix"].worktree_path).resolve()
+    before = len(log.read_text(encoding="utf-8").splitlines())
+
+    seen_at_launch: list[list[str]] = []
+    dev = wt_bundle_dev(project)
+
+    def dev_after_probes(spec):
+        seen_at_launch.append(log.read_text(encoding="utf-8").splitlines()[before:])
+        return dev(spec)
+
+    marker.write_text("up\n", encoding="utf-8")
+    resumed, adapter = resume_sweep(project, engine, [dev_after_probes, wt_bundle_review(project)])
+    summary = resumed.run()
+
+    assert not summary.paused and not summary.crashed
+    assert resumed.state.tasks["dw-fix"].phase == Phase.DONE
+    (probed,) = seen_at_launch
+    assert len(probed) == 2  # the resume re-probe, then the replacement's gate
+    assert Path(probed[0]).resolve() == paused_unit
+
+
 def test_bundle_dispatch_does_not_pin_expected_spec(project, tmp_path):
     """A sweep bundle's fresh dispatch points at `intent.md`, never at a spec — the
     session is free to CREATE one, and #161 has it legitimately adopting a
