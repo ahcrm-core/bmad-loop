@@ -1,6 +1,7 @@
 """Unit tests for the dev/review retry-budget decisions — specifically the
 resolved-escalation guard that re-escalates instead of silently deferring."""
 
+import dataclasses
 import os
 
 import pytest
@@ -13,6 +14,7 @@ from bmad_loop.escalation import (
     critical_escalations,
     critical_session_reason,
     decide_dev,
+    decide_reverify,
     decide_review_session,
     display_critical_reason,
     display_pause_reason,
@@ -606,3 +608,77 @@ def test_display_pause_reason_shapes_the_recovery_trail():
 def test_display_pause_reason_keeps_a_plain_reason_unchanged(stage):
     reason = "CRITICAL escalation from dev session: needs a human — resolve it"
     assert display_pause_reason(_paused_state(reason, stage)) == reason
+
+
+# ---------------------------------------------------------- decide_reverify (DW-522)
+
+
+def _reverify_task(origin: str = "deferred", *, resolved_redrive: bool = False) -> StoryTask:
+    return StoryTask(
+        story_key="1-1-a", epic=1, reverify_from=origin, resolved_redrive=resolved_redrive
+    )
+
+
+def test_decide_reverify_proceeds_on_ok():
+    for origin in ("deferred", "escalated"):
+        decision = decide_reverify(_reverify_task(origin), VerifyOutcome.passed())
+        assert decision.action == Action.PROCEED
+        assert decision.reason == ""
+
+
+def test_decide_reverify_pauses_on_env_fault():
+    """A still-broken environment re-pauses even a deferred origin — deferring it
+    again would charge the story for the environment once more.
+
+    Ablation, performed: drop the `outcome.env_fault` conjunct in `decide_reverify`
+    and this reddens (the deferred origin DEFERs)."""
+    outcome = VerifyOutcome.escalate("verify environment fault (rc=75): e2e", env_fault=True)
+    # `escalate` carries a severity, which would PAUSE on its own; strip it so the
+    # env-fault conjunct is the only thing that can pause here
+    outcome = dataclasses.replace(outcome, severity="")
+    decision = decide_reverify(_reverify_task("deferred"), outcome)
+    assert decision.action == Action.PAUSE
+    assert decision.reason.startswith("reverify failed: verify environment fault")
+
+
+def test_decide_reverify_pauses_on_a_non_retryable_failure():
+    outcome = VerifyOutcome.escalate("contract violated")
+    decision = decide_reverify(_reverify_task("deferred"), outcome)
+    assert decision.action == Action.PAUSE
+
+
+def test_decide_reverify_defers_a_deferred_origin():
+    decision = decide_reverify(
+        _reverify_task("deferred"), VerifyOutcome.retry("e2e failed", fixable=True)
+    )
+    assert decision.action == Action.DEFER
+    assert decision.reason == "reverify failed: e2e failed"
+    assert decision.budget_exhausted is False  # nothing was charged
+
+
+def test_decide_reverify_reescalates_an_escalated_origin():
+    decision = decide_reverify(_reverify_task("escalated"), VerifyOutcome.retry("e2e failed"))
+    assert decision.action == Action.PAUSE
+    assert decision.reason == "reverify failed: e2e failed"
+
+
+def test_decide_reverify_reescalates_a_resolved_redrive():
+    """A resolved-escalation re-drive must never downgrade to deferred work, the
+    `_exhausted_action` rule.
+
+    Ablation, performed: drop the `not task.resolved_redrive` conjunct and this
+    reddens."""
+    decision = decide_reverify(
+        _reverify_task("deferred", resolved_redrive=True), VerifyOutcome.retry("e2e failed")
+    )
+    assert decision.action == Action.PAUSE
+
+
+def test_decide_reverify_never_retries():
+    for origin in ("deferred", "escalated", "unknown-future-value"):
+        for outcome in (
+            VerifyOutcome.retry("x"),
+            VerifyOutcome.retry("x", fixable=True),
+            VerifyOutcome.escalate("x"),
+        ):
+            assert decide_reverify(_reverify_task(origin), outcome).action != Action.RETRY

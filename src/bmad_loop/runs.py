@@ -41,7 +41,14 @@ from .adapters.multiplexer import (
 )
 from .frontmatter import auto_dev_baseline_of, parse_frontmatter, status_of
 from .journal import STATE_FILE, VERIFY_DIR, Journal, load_state, save_state, state_lock
-from .model import PAUSE_ESCALATION, Phase, RunState, StoryTask
+from .model import (
+    PAUSE_ESCALATION,
+    Phase,
+    RunState,
+    SessionRecord,
+    StoryTask,
+    env_fault_site_reverifiable,
+)
 from .mountpaths import project_offset
 from .platform_util import (
     MAX_SEGMENT,
@@ -6068,6 +6075,253 @@ def _rearm_escalation_locked(
         story_key=key,
         baseline=task.baseline_commit or "",
         restore=bool(restore_patch),
+    )
+    return RearmOutcome(key, tuple(journal.notices), journal.hold_resume, journal.hold_next_step)
+
+
+def deferred_stash_path(run_dir: Path, story_key: str, spec_name: str) -> Path:
+    """Where `Engine._stash_deferred_artifacts` keeps a deferred story's spec:
+    ``{run_dir}/deferred/<story_key>/<spec_name>``, the key made one safe path
+    segment. One definition for the writer and for `rearm_for_reverify`, which
+    restores the spec from there (DW-522), so the two cannot name different files."""
+    return run_dir / "deferred" / safe_segment(story_key) / spec_name
+
+
+def _latest_completed_dev_record(task: StoryTask) -> SessionRecord | None:
+    """The task's latest COMPLETED dev-role session record, or None. Fix sessions are
+    recorded under the dev role too, so a repaired attempt's verdict is the one read."""
+    return next(
+        (s for s in reversed(task.sessions) if s.role == "dev" and s.status == "completed"),
+        None,
+    )
+
+
+def reverify_refusal(
+    state: RunState,
+    task: StoryTask,
+    story_key: str,
+    *,
+    run_dir: Path,
+    project_root: Path,
+) -> str | None:
+    """Why `resolve --reverify` cannot re-arm this story for a verify replay, or None
+    when it can (DW-522).
+
+    Shared by the CLI's early exit and `rearm_for_reverify`'s locked re-check, the
+    `adopt_refusal` shape, so the two cannot drift. Every refusal leaves the run as
+    it was; the remedy each names is a gesture that exists today.
+
+    The replay keeps the code tree's HEAD plus its dirty tree as the attempt product
+    and runs no dev session, so the preconditions are the ones that make "the tree is
+    the story's attempt" true IN PLACE:
+
+    * the run is a story run (sweep bundles have their own recovery);
+    * the story is DEFERRED, or ESCALATED at an environment-fault site that left a
+      product (`model.env_fault_site_reverifiable`) — any other escalation needs the
+      plain re-arm, whose remedy is a spec decision, not a replay;
+    * the story is not mounted on a worktree (phase 5 lifts this);
+    * it has a spec, a completed dev session whose result the replay can read, and
+      no stories-mode plan review owed;
+    * the run is paused at the escalation stage naming THIS story, and the story is
+      the last one the run picked — any later story's commits would otherwise be
+      squashed into this one's;
+    * the code root is still the live repository root, the baseline is an ancestor
+      of HEAD, and something sits above it (commits or a dirty tree, measured as the
+      dev proof-of-work gate measures it);
+    * the spec is live, or stashed where `_stash_deferred_artifacts` put it.
+
+    Any git fault refuses: this decides whether a replay may claim the tree.
+    """
+    run_id = state.run_id
+    rearm_hint = f"`bmad-loop resolve {run_id}`"
+    if state.run_type == "sweep":
+        return (
+            f"--reverify is not supported for sweep runs ({story_key}); re-arm it with "
+            f"{rearm_hint} instead"
+        )
+    if task.phase == Phase.ESCALATED:
+        if not env_fault_site_reverifiable(task):
+            return (
+                f"story {story_key} is escalated for a reason a verify replay cannot clear "
+                f"(environment fault site: {task.env_fault_site or 'none'}); resolve it "
+                f"with {rearm_hint}"
+            )
+    elif task.phase != Phase.DEFERRED:
+        return (
+            f"story {story_key} is neither deferred nor escalated (phase: {task.phase}), "
+            "so there is nothing to re-verify"
+        )
+    if task.worktree_path:
+        return (
+            f"story {story_key} ran in a worktree, and worktree reverify is not yet "
+            f"supported; re-arm it with {rearm_hint}"
+        )
+    if not task.spec_file:
+        return f"story {story_key} has no story spec, so there is nothing to re-verify"
+    latest = _latest_completed_dev_record(task)
+    if latest is None or latest.result_json is None:
+        return (
+            f"story {story_key} has no completed dev session result to re-verify; "
+            f"re-arm it with {rearm_hint}"
+        )
+    if task.plan_review_owed or task.plan_checkpoint_pending:
+        return (
+            f"story {story_key} still owes a plan review, so its implementation cannot be "
+            "re-verified yet"
+        )
+    if state.paused_stage != PAUSE_ESCALATION or state.paused_story_key != story_key:
+        return (
+            f"run {run_id} is not paused on story {story_key} (stage: "
+            f"{state.paused_stage or 'none'}, story: {state.paused_story_key or 'none'}); "
+            "an in-place replay re-verifies only the story the run stopped on"
+        )
+    if list(state.tasks)[-1] != story_key:
+        return (
+            f"a later story was picked after {story_key}, so the tree is no longer its "
+            "attempt alone; an in-place replay would squash that work into this story"
+        )
+    try:
+        paths = bmadconfig.load_paths(project_root)
+    except bmadconfig.BmadConfigError as e:
+        return f"cannot read the BMAD config to locate the code root ({e})"
+    code_root = state.code_root
+    if str(paths.repo_root) != str(code_root):
+        return (
+            f"the code root in the BMAD config has changed since run {run_id} started; "
+            "the attempt this replay would verify lives in the previous tree — restore "
+            "the previous `repo_root` value first"
+        )
+    baseline = task.baseline_commit
+    if not baseline:
+        return f"story {story_key} has no recorded baseline, so its attempt cannot be located"
+    try:
+        verify.rev_parse_head(code_root)
+        if not verify.is_ancestor(code_root, baseline, "HEAD"):
+            return (
+                f"the story's baseline {baseline[:12]} is not an ancestor of HEAD — the "
+                "tree was reset or rewritten since the pause, so it is not the attempt"
+            )
+        spec_path = live_spec_path(task, state, project_root)
+        exclude = verify.verify_dev_exclude_relpaths(
+            paths, spec_path, task.restore_patch, root=paths.repo_root
+        )
+        has_product = bool(verify.commits_above(code_root, baseline)) or verify.attempt_dirty(
+            code_root, baseline, task.baseline_untracked, exclude=exclude
+        )
+    except verify.GitError as e:
+        return f"cannot inspect the code tree for story {story_key}'s attempt ({e})"
+    if not has_product:
+        parked = f" (it was parked at {task.preserve_ref})" if task.preserve_ref else ""
+        return (
+            f"the tree holds nothing above story {story_key}'s baseline — the attempt was "
+            f"rolled back{parked}; there is no product to re-verify, re-arm it with "
+            f"{rearm_hint}"
+        )
+    stash = deferred_stash_path(run_dir, story_key, spec_path.name)
+    if not spec_path.is_file() and not stash.is_file():
+        return (
+            f"story {story_key}'s spec is neither at {spec_path} nor stashed at {stash}; "
+            "restore it there, then re-run resolve"
+        )
+    return None
+
+
+def rearm_for_reverify(
+    run_dir: Path, story_key: str | None = None, *, project_root: Path | None = None
+) -> RearmOutcome:
+    """Re-arm a DEFERRED or environment-fault ESCALATED story for a deterministic
+    verify replay (`resolve --reverify`, DW-522), under the run lock."""
+    with state_lock(run_dir):
+        return _rearm_for_reverify_locked(run_dir, story_key, project_root=project_root)
+
+
+def _rearm_for_reverify_locked(
+    run_dir: Path, story_key: str | None = None, *, project_root: Path | None = None
+) -> RearmOutcome:
+    """Move the story to DEV_VERIFY with `reverify_from` latched, keeping the tree.
+
+    The next resume's `Engine._finish_inflight` reverify arm replays verify against
+    HEAD (+ the dirty tree) and routes through `escalation.decide_reverify` — no dev
+    session runs. Unlike `_rearm_escalation_locked` nothing here touches git or the
+    baseline: the attempt product IS the tree, so `baseline_commit`, `attempt`,
+    `sessions`, `resolved_redrive`, `board_advance_intended` and
+    `followup_review_recommended` are all kept. What is reset is what a replay must
+    not inherit: the review counters (a fresh review loop), any adoption / salvage /
+    re-arm latch, the deferral reason (the mounted defer-replay arm re-defers a task
+    still carrying one), and the environment fault the gesture vouches is fixed.
+    `generation` is bumped (#705) so any session the replay leads to mints fresh ids.
+
+    A deferred story's spec was moved to the run dir by
+    `Engine._stash_deferred_artifacts`; it is copied back (the stash kept) through a
+    confined atomic write, never creating a directory. That copy sits inside the
+    same BaseException transaction shape as `_rearm_escalation_locked`: if the
+    commit (`save_state`) did not land, the copy THIS call created is removed again,
+    so a failed re-arm leaves the tree as it found it. A spec the operator already
+    put back is used as-is and never touched.
+
+    Raises RearmError, state untouched, when `reverify_refusal` names a reason.
+    Does NOT clear the pause; the caller resumes."""
+    state = load_state(run_dir)
+    key = story_key or state.paused_story_key
+    if key is None:
+        raise RearmError(f"run {run_dir.name} has no paused story to re-verify")
+    task = state.tasks.get(key)
+    if task is None:
+        raise RearmError(f"run {run_dir.name} has no task for story {key}")
+    live_project = project_root if project_root is not None else Path(state.project)
+    refusal = reverify_refusal(state, task, key, run_dir=run_dir, project_root=live_project)
+    if refusal is not None:
+        raise RearmError(refusal)
+    origin = "deferred" if task.phase == Phase.DEFERRED else "escalated"
+
+    journal = _RearmJournal(run_dir)
+    # DW-446, as `_rearm_escalation_locked`: reconcile the mint-time root identities
+    # before the pinned spec write below; persisted by the `save_state` that commits.
+    reconcile_root_identities(state, run_dir, journal, live_project)
+    # Deliberate direct assignment, not a state-machine transition: DEFERRED and
+    # ESCALATED have no legal exit (mirrors `adopt_escalated_branch` and
+    # `_rearm_escalation_locked`), and DEV_VERIFY is the persisted "dev product on the
+    # tree, verify it" phase the engine's reverify arm replays.
+    task.phase = Phase.DEV_VERIFY
+    task.reverify_from = origin
+    # MANDATORY: a task still carrying a defer reason is re-deferred by the mounted
+    # defer-replay arm of `_finish_inflight` instead of being replayed.
+    task.defer_reason = None
+    task.generation += 1  # #705: no session id the earlier attempt minted is reused
+    task.review_cycle = 0
+    task.followup_reviews_spent = 0
+    task.salvage_refile_pending = False
+    task.adopt_pending = False
+    task.rearmed = False  # not a clean rebuild: the tree is kept
+    task.env_fault_site = None  # the operator vouches the environment is fixed (DW-523)
+
+    spec_path = live_spec_path(task, state, live_project)
+    restored = False
+    try:
+        if not spec_path.is_file():
+            stash = deferred_stash_path(run_dir, key, spec_path.name)
+            atomic_write_bytes_confined(
+                spec_path,
+                stash.read_bytes(),
+                confine_root=live_spec_root(task, state, live_project),
+                root_identity=live_spec_root_identity(task, state, live_project),
+            )
+            restored = True
+        save_state(run_dir, state)
+    except BaseException:
+        # Undo only the copy THIS call created, and only when the commit did not
+        # land (`_rearm_commit_landed` asks the disk, as the escalation re-arm's
+        # guard does). The undo is a repair write, so its own failure raises.
+        if restored and not _rearm_commit_landed(run_dir, key, task):
+            retrying_unlink(spec_path)
+        raise
+    journal.append(
+        "story-reverify-armed",
+        story_key=key,
+        origin=origin,
+        baseline=task.baseline_commit or "",
+        spec_file=str(spec_path),
+        spec_restored=restored,
     )
     return RearmOutcome(key, tuple(journal.notices), journal.hold_resume, journal.hold_next_step)
 

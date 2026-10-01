@@ -260,6 +260,7 @@ SAVE_STATE_CALLERS = {
     ("cli.py", "_prepare_resume_locked"),
     ("engine.py", "_save"),
     ("runs.py", "_rearm_escalation_locked"),
+    ("runs.py", "_rearm_for_reverify_locked"),
     ("runs.py", "adopt_escalated_branch"),
     ("runs.py", "restamp_code_root"),
     ("runs.py", "_stop_run_once"),
@@ -272,6 +273,7 @@ RUN_STATE_TRANSACTIONS = {
     ("cli.py", "_resolve_adopt"),
     ("journal.py", "save_state"),
     ("runs.py", "rearm_escalation"),
+    ("runs.py", "rearm_for_reverify"),
     ("runs.py", "adopt_escalated_branch"),
     ("runs.py", "restamp_code_root"),
     ("runs.py", "_stop_run_once"),
@@ -701,6 +703,9 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         # discriminated nothing; since DW-123 two lanes share the site, and since
         # DW-167 the re-apply walk is a third.
         "option_effect",
+        # DW-522: the phase a `story-reverify-armed` story was re-armed FROM — the
+        # closed pair `deferred` / `escalated`, never authored text.
+        "origin",
         "original",
         "owed_after_implement",
         # Parked-session diagnosis (DW-348/DW-350) on `dev-decision`, `session-end`,
@@ -799,6 +804,9 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         "site",
         "skip",
         "spec_folder",
+        # DW-522: whether `story-reverify-armed` copied the stashed spec back (a
+        # bare boolean).
+        "spec_restored",
         "stage",
         "state_kind",
         "status",
@@ -1210,6 +1218,9 @@ JOURNAL_KINDS = frozenset(
         # replaced by a PAUSE because a re-probe failed, from
         # `Engine._env_gate_decision`: `site` is the `env_fault_site` recorded.
         "env-fault-reclassified",
+        # DW-522. A DEFERRED or environment-fault ESCALATED story re-armed for a
+        # verify replay of its kept tree, from `runs._rearm_for_reverify_locked`.
+        "story-reverify-armed",
         "epic-boundary",
         "fix-decision",
         "fix-harvest-failed",

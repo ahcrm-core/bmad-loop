@@ -346,6 +346,35 @@ def decide_dev(
     return Decision(exhausted, _exhaust_reason(task, outcome.reason), budget_exhausted=True)
 
 
+REVERIFY_REASON_PREFIX = "reverify failed: "
+
+
+def decide_reverify(task: StoryTask, outcome: VerifyOutcome) -> Decision:
+    """After a `resolve --reverify` replay of verify against the kept attempt product
+    (DW-522). No session ran, so there is no session verdict to read and no budget to
+    charge: the decision is the outcome's alone, and it never RETRYs — a retry would
+    be a dev session, which is exactly what the operator chose to avoid.
+
+    * passed → PROCEED to review and commit.
+    * an environment fault, a non-retryable (severity-carrying) failure, or a
+      contradiction → PAUSE: the environment is still broken, or the failure is one
+      no further session may silently absorb.
+    * any other failure of a story re-armed from DEFERRED (`task.reverify_from ==
+      "deferred"`) → DEFER it again, as it was before the gesture — unless it is a
+      resolved-escalation re-drive (`resolved_redrive`), which must never downgrade
+      to deferred work (see `_exhausted_action`).
+    * any other failure → PAUSE: an escalated origin goes back to the operator.
+    """
+    if outcome.ok:
+        return Decision(Action.PROCEED)
+    reason = f"{REVERIFY_REASON_PREFIX}{outcome.reason}"
+    if outcome.env_fault or outcome.severity or outcome.contradiction:
+        return Decision(Action.PAUSE, reason)
+    if task.reverify_from == "deferred" and not task.resolved_redrive:
+        return Decision(Action.DEFER, reason)
+    return Decision(Action.PAUSE, reason)
+
+
 def decide_review_session(task: StoryTask, result: SessionResult, policy: Policy) -> Decision:
     """After a review session returns, before interpreting its done/followup status."""
     critical_reason = critical_session_reason("review", result.result_json)

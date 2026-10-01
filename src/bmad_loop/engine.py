@@ -90,6 +90,7 @@ from .runs import (
     StateRootError,
     clear_graceful_stop,
     consume_stop_request,
+    deferred_stash_path,
     events_dir_for,
     graceful_stop_requested,
     kill_session,
@@ -9944,9 +9945,9 @@ class Engine:
         spec_path = Path(task.spec_file)
         if not spec_path.is_file():
             return
-        dest = self.run_dir / "deferred" / safe_segment(task.story_key)
+        target = deferred_stash_path(self.run_dir, task.story_key, spec_path.name)
+        dest = target.parent
         dest.mkdir(parents=True, exist_ok=True)
-        target = dest / spec_path.name
         tmp = dest / (spec_path.name + ".tmp")
         shutil.copy2(spec_path, tmp)
         try:

@@ -609,6 +609,17 @@ class StoryTask:
     # Survives the resume serialization round-trip; deliberately absent from
     # `documents.py`'s `--json` projection (schema 1).
     adopt_pending: bool = False
+    # Latched by runs.rearm_for_reverify (`bmad-loop resolve --reverify`, DW-522): the
+    # operator fixed the environment and asked for the kept attempt product (HEAD plus
+    # the dirty tree) to be re-verified, so the task was moved straight to DEV_VERIFY
+    # without a dev session. The value names the phase the story was re-armed FROM —
+    # "deferred" or "escalated" — which `escalation.decide_reverify` reads to choose
+    # between DEFER and PAUSE on a failing replay. Any non-empty value means a replay
+    # is pending: an unknown value is kept raw rather than dropped, so a state.json
+    # from a newer version fails closed (replay, never a silent dev re-drive). ""
+    # = no reverify pending. Survives the resume serialization round-trip;
+    # deliberately absent from `documents.py`'s `--json` projection (schema 1).
+    reverify_from: str = ""
     # sweep bundles only: the deferred-work ids this task closes and the
     # rendered intent file handed to dev sessions
     dw_ids: list[str] = field(default_factory=list)
@@ -741,6 +752,7 @@ class StoryTask:
             "sentinel_kind": self.sentinel_kind,
             "restore_patch": self.restore_patch,
             "adopt_pending": self.adopt_pending,
+            "reverify_from": self.reverify_from,
             "dw_ids": self.dw_ids,
             "bundle_file": self.bundle_file,
             "worktree_path": self.worktree_path,
@@ -1021,6 +1033,7 @@ class StoryTask:
             sentinel_kind=str(d.get("sentinel_kind", "")),
             restore_patch=d.get("restore_patch"),
             adopt_pending=bool(d.get("adopt_pending", False)),
+            reverify_from=str(d.get("reverify_from", "") or ""),
             dw_ids=[str(i) for i in d.get("dw_ids", [])],
             bundle_file=d.get("bundle_file"),
             worktree_path=str(d.get("worktree_path", "")),
@@ -1030,6 +1043,40 @@ class StoryTask:
             tokens=TokenUsage.from_dict(d.get("tokens", {})),
             token_budget_warned=bool(d.get("token_budget_warned", False)),
         )
+
+
+# Sites whose fault fired AFTER a session's own verdict: the decision seam re-probed a
+# failure the deciders were about to charge. Only a COMPLETED session left a product
+# worth re-verifying there; a crashed or timed-out one did not, so its escalation
+# needs a plain re-arm (a dev re-drive), not a replay. Both map to the `dev` record
+# role: `Engine._fix_phase` dispatches its repair sessions under the dev adapter, so a
+# fix session is recorded as `role="dev"` like the attempt it repairs.
+_REVERIFY_DECISION_SITE_ROLES = {
+    "probe:decision:dev": "dev",
+    "probe:decision:fix": "dev",
+}
+
+
+def env_fault_site_reverifiable(task: StoryTask) -> bool:
+    """Whether an ESCALATED task's recorded environment fault leaves a product that
+    `resolve --reverify` can replay verify against (DW-522).
+
+    True for every site in `ENV_FAULT_SITES` except the dispatch sites
+    (`probe:dispatch:*`): those fired before a session ran, so there is nothing to
+    re-verify. `probe:decision:dev` / `probe:decision:fix` additionally require the
+    role's LATEST session record to be `completed` — the seam re-probes crashed and
+    timed-out sessions too, and those produced no verifiable attempt. False for no
+    site, and for any value outside the closed vocabulary (fail closed)."""
+    site = task.env_fault_site
+    if site is None or site not in ENV_FAULT_SITES:
+        return False
+    if site.startswith(ENV_FAULT_SITE_DISPATCH_PREFIX):
+        return False
+    role = _REVERIFY_DECISION_SITE_ROLES.get(site)
+    if role is None:
+        return True
+    latest = next((s for s in reversed(task.sessions) if s.role == role), None)
+    return latest is not None and latest.status == "completed"
 
 
 @dataclass
