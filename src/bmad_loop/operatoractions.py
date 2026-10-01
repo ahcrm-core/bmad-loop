@@ -349,8 +349,8 @@ class ParkedStory:
 
         `confirm` writes the audit section, then the spec status, then the board,
         then drops the entry. Stop it between the spec half and the board half —
-        a raising `sprintstatus.advance`, or one that returns unchanged because
-        the board line is in a shape its line regex cannot rewrite — and what is
+        a raising `sprintstatus.advance`, including the `SprintStatusWriteRefused`
+        it raises for a board row in a shape its line edit cannot rewrite — and what is
         left on disk is a signed-off spec at `done` with an entry still pointing
         at it. That reads to :meth:`drift` as a stale entry (arm 3, "its spec now
         says status: done"), so a re-run refuses the very state a re-run exists to

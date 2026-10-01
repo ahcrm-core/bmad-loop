@@ -8938,8 +8938,9 @@ def test_tracked_board_carry_is_a_no_op_that_still_reports_itself(project):
 # the row did not REACH the target, and these two rows are that answer's two shapes.
 # Both matter because the run tears down the worktree holding the advanced copy on the
 # strength of the carry's record: latched as carried, the advance is lost AND the
-# journal says it landed. Ablation for both: drop the `_at_or_past` guard and each row
+# journal says it landed. Ablation for the first: drop the `_at_or_past` guard and it
 # fails on the `board-advance-carried` assertion, the false success it exists to stop.
+# The second is a raised `SprintStatusWriteRefused` since #842; its rows name their own.
 
 
 def test_board_carry_over_a_vanished_main_row_is_not_journalled_as_carried(project):
@@ -8980,15 +8981,16 @@ def test_board_carry_over_a_vanished_main_row_is_not_journalled_as_carried(proje
     assert _sprint_carry_commits(project) == []
 
 
-@pytest.mark.xfail(
-    strict=True, reason="Session 2 routes SprintStatusWriteRefused through confirm/carry"
-)
 def test_board_carry_that_cannot_rewrite_the_row_is_not_journalled_as_carried(project):
     """Shape two, and the one a `None` check alone would miss: the row is THERE and
-    `advance` still leaves it below target. `story_status` resolves a quoted key
-    through a full YAML parse, `_set_mapping_value`'s line regex then declines it,
-    and `advance` returns the row's current status rather than falsely claiming the
-    target — a distinction this method has to carry through to its journal."""
+    `advance` cannot move it. `story_status` resolves a quoted key through a full
+    YAML parse and the line edit then refuses it, which `advance` raises as
+    `SprintStatusWriteRefused` (#842). The carry is best effort, so it journals the
+    failure with the row's status and the writer's reason token, commits nothing,
+    and the run finishes.
+
+    Ablation: drop the `except SprintStatusWriteRefused` arm in
+    `_carry_board_advance` and the refusal ends the run as a crash."""
     ignored_sprint(project, {"1-1-a": "ready-for-dev"})
     inner = wt_dev_effect(project, "1-1-a", followup_review=False)
 
@@ -9006,12 +9008,69 @@ def test_board_carry_that_cannot_rewrite_the_row_is_not_journalled_as_carried(pr
     assert summary.done == 1 and not summary.crashed
     assert _board_carry_events(engine) == []
     assert [
-        (e["target"], e["status"])
+        (e["target"], e["status"], e["refuse_cause"])
         for e in _board_carry_events(engine, "board-advance-carry-failed")
-    ] == [("done", "ready-for-dev")]
+    ] == [("done", "ready-for-dev", "key-not-plain")]
     # the premise, stated: the row is readable and still did not move
     assert sprintstatus.story_status(project.sprint_status, "1-1-a") == "ready-for-dev"
     assert _sprint_carry_commits(project) == []
+
+
+def test_replayed_board_carry_journals_a_refused_row_without_crashing_the_resume(project):
+    """The same refusal on the replay leg, where an escape is worst: the carry runs
+    from `_replay_unlatched_ledger_carries` before `_loop()`, so a raise there would
+    end every resume of the run. The main board's row is reformatted to a quoted key
+    while the host is down; the resume journals `board-advance-carry-failed` with the
+    reason token, files no success, commits nothing, and finishes.
+
+    Ablation: drop the `except SprintStatusWriteRefused` arm in
+    `_carry_board_advance` and the resume crashes on the replay."""
+    ignored_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(project, [wt_dev_effect(project, "1-1-a", followup_review=False)])
+    crash_at_merge_back(engine, after="merge")
+
+    assert engine.run().crashed
+    assert load_state(engine.run_dir).tasks["1-1-a"].board_advance_intended == "done"
+    board = project.sprint_status
+    board.write_text(
+        board.read_text(encoding="utf-8").replace("1-1-a:", "'1-1-a':"), encoding="utf-8"
+    )
+    before = board.read_bytes()
+
+    resumed, adapter = resume_engine(project, engine)
+    summary = resumed.run()
+
+    assert not summary.crashed and not summary.paused and summary.done == 1
+    assert adapter.sessions == []  # replayed, not re-driven
+    assert _board_carry_events(resumed) == []
+    assert [
+        (e["target"], e["status"], e["refuse_cause"])
+        for e in _board_carry_events(resumed, "board-advance-carry-failed")
+    ] == [("done", "ready-for-dev", "key-not-plain")]
+    assert board.read_bytes() == before
+    assert _sprint_carry_commits(project) == []
+
+
+def test_board_carry_ownership_proof_fails_closed_on_a_refused_head_row(project):
+    """`_board_carry_holds_only_this_advance` recomputes the intended board from
+    HEAD through `advanced_bytes`. For a HEAD row the writer refuses there is no
+    intended board: no `advance` can produce one. Before #842 `advanced_bytes`
+    handed HEAD's bytes back unchanged, and an untouched board compared equal —
+    ownership of an advance that never happened. The proof must answer False.
+
+    Ablations: (1) drop `SprintStatusError` from the method's `except` tuple and
+    the refusal escapes the probe; (2) make `advanced_bytes` return `source` on a
+    refusal, the pre-#842 echo, and the untouched board is accepted (True)."""
+    board = project.sprint_status
+    board.write_text(
+        "development_status:\n  epic-1: in-progress\n  '1-1-a': ready-for-dev\n",
+        encoding="utf-8",
+    )
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "sprint")
+    engine, _ = make_engine(project, [])
+
+    assert not engine._board_carry_holds_only_this_advance(board, "1-1-a", "done")
 
 
 def test_crashed_post_merge_board_advance_replays_from_its_record(project):

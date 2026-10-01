@@ -4710,12 +4710,29 @@ def _land_confirmation(
     Split out because it is exactly what an interrupted confirmation still owes.
     The spec half is already on disk in that case — audit section appended, status
     at `done` — and re-running it would append a second section for one event, so
-    the resume path enters here instead of at :func:`_apply_confirmation`."""
+    the resume path enters here instead of at :func:`_apply_confirmation`.
+
+    A board row the writer refuses (``SprintStatusWriteRefused``) and one that
+    otherwise did not reach ``done`` both exit 1 with the park entry kept, so a
+    re-run after the operator repairs the board resumes here."""
     # The sole write path to the board, and an ordinary FORWARD move:
     # `awaiting-operator` sits immediately below `done` in STATUS_ORDER, so
     # confirming needs no exception to never-regress. Idempotent at `done`, which
     # is what lets a resume run it after a human fixed the board by hand.
-    landed = sprintstatus.advance(paths.sprint_status, story.story_key, "done", now=today)
+    try:
+        landed = sprintstatus.advance(paths.sprint_status, story.story_key, "done", now=today)
+    except sprintstatus.SprintStatusWriteRefused as e:
+        # The row is there and the writer cannot rewrite its shape (#842): name the
+        # repair, and keep the park entry so the re-run below finishes the job.
+        print(
+            f"error: {spec} was updated but the board write was refused: {e}\n"
+            f"The spec is already correct and signed off, and the park entry has been "
+            f"left in place: after fixing that row, re-run "
+            f"`bmad-loop confirm {story.story_key}` to finish without acknowledging "
+            f"anything twice.",
+            file=sys.stderr,
+        )
+        return 1
     if landed != "done":
         print(
             f"error: {spec} was updated but {paths.sprint_status} did not advance "

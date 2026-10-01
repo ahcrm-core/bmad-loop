@@ -14315,18 +14315,18 @@ def test_confirm_refuses_when_the_spec_vanished_before_the_audit_section(
     assert "1-1-a" in operatoractions.load(project.project)
 
 
-@pytest.mark.xfail(
-    strict=True, reason="Session 2 routes SprintStatusWriteRefused through confirm/carry"
-)
-def test_confirm_reports_a_board_that_did_not_advance(project, capsys, monkeypatch):
-    """`sprintstatus.advance` returns the CURRENT status when its line regex
+def test_confirm_reports_a_board_write_the_writer_refused(project, capsys, monkeypatch):
+    """`sprintstatus.advance` raises `SprintStatusWriteRefused` when the line edit
     cannot rewrite the entry `story_status` resolved via YAML — a quoted story key
-    is enough, no mock required. That leaves the half-applied state the message
-    has to be honest about: spec signed off and done, board still parked.
+    is enough, no mock required (#842). That leaves the half-applied state the
+    message has to be honest about: spec signed off and done, board still parked.
+    The message names the row, its status, the reason token and the repair, and
+    the park entry stays so a re-run finishes the job.
 
-    Ablation: drop the `landed != "done"` branch and this fails — `✓ confirmed`
-    is printed and the entry is dropped over a board still at awaiting-operator,
-    with nothing left that can find the story."""
+    Ablation: drop the `except sprintstatus.SprintStatusWriteRefused` arm in
+    `_land_confirmation` and `main`'s generic `SprintStatusError` catch answers
+    instead — still exit 1, but with no word that the spec already landed or that
+    re-running `confirm` is the way back, which this row asserts."""
     from bmad_loop import devcontract, frontmatter, operatoractions, sprintstatus
 
     install_bmad_config(project)
@@ -14342,8 +14342,11 @@ def test_confirm_reports_a_board_that_did_not_advance(project, capsys, monkeypat
 
     assert cli.main(_confirm_argv(project, "1-1-a")) == 1
     err = capsys.readouterr().err
-    assert "did not advance" in err and "awaiting-operator" in err
-    assert "Fix the board by hand" in err and "re-run" in err
+    assert "board write was refused" in err and str(project.sprint_status) in err
+    assert "'awaiting-operator'" in err and "(key-not-plain)" in err
+    assert "rewrite the row as a plain one-line `1-1-a: <status>` entry" in err
+    assert "park entry has been left in place" in err
+    assert "re-run `bmad-loop confirm 1-1-a`" in err
     # the spec half landed and stays landed — that is what makes this recoverable
     assert frontmatter.status_of(frontmatter.read_frontmatter(sp)) == "done"
     assert devcontract.has_operator_confirmation(sp)

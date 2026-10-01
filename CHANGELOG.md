@@ -65,6 +65,12 @@ breaking changes may land in a minor release.
 - Edit only the sprint-status row the YAML parser reads, never look-alike text in a block
   scalar or another mapping, and leave a multi-line value the writer cannot read whole
   untouched instead of rewriting only its first line.
+- Raise `SprintStatusWriteRefused` when an existing sprint-status row below its target is
+  in a shape the writer cannot rewrite, instead of returning the unchanged status: a
+  finished dev or review-demotion pass escalates with board, row, statuses and reason and
+  keeps its work (no rollback, no retry); the board carry journals
+  `board-advance-carry-failed` with `refuse_cause`; `bmad-loop confirm` exits 1 naming
+  the repair and keeps the park entry (follow-up to #842).
 
 ## [0.13.0] — 2026-09-28
 
