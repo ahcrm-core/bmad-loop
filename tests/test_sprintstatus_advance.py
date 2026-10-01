@@ -359,7 +359,8 @@ def test_advance_missing_file(tmp_path):
 # line rewritten with a comment invented out of the tail of a quoted value
 # re-parses as a perfectly clean `3-2-x: done`. (Proven by ablation on the sibling
 # defect, PR #365, whose three verification gates all passed the fabricated
-# comment.) The pattern is therefore the gate here, and these tests hold it.
+# comment.) The writer's span splice (DW-514/516) is therefore the gate here,
+# and these tests hold it.
 #
 # Called directly rather than through `advance` wherever the shape under test is
 # the writer's own answer: the typed return names changed, equal, absent, and
@@ -392,10 +393,13 @@ def test_a_hash_inside_a_quoted_value_never_becomes_a_comment(tmp_path):
     assert p.read_text(encoding="utf-8") == board.replace('"a # b"', "done")
 
 
-def test_a_quoted_value_is_replaced_whole_with_no_comment_carried(tmp_path):
+def test_a_quoted_value_is_replaced_whole_and_its_comment_carried(tmp_path):
     """The writer's own half of the case above: the write SUCCEEDS (a quoted
-    hand-edit is still a value the orchestrator owns and replaces), and what it
-    leaves behind is the bare target and nothing else."""
+    hand-edit is still a value the orchestrator owns and replaces), the whole
+    quoted scalar — `#` and all — is replaced by the bare target, and the real
+    comment after the closing quote survives as authored. The parser's span ends
+    at the closing quote, so the splice never has to guess where it is
+    (DW-514/516)."""
     lines = [_DEV, '  3-2-x: "a # b"  # real comment\n']
 
     assert (
@@ -403,9 +407,7 @@ def test_a_quoted_value_is_replaced_whole_with_no_comment_carried(tmp_path):
         == "changed"
     )
 
-    # the trailing comment goes too: nothing here can tell a closing quote from
-    # a quote inside the scalar, so a comment after one is dropped, not guessed.
-    assert "".join(lines) == _DEV + "  3-2-x: done\n"
+    assert "".join(lines) == _DEV + "  3-2-x: done  # real comment\n"
 
 
 def test_a_value_with_internal_spaces_is_matched_whole(tmp_path):
@@ -454,22 +456,22 @@ def test_a_hash_glued_to_the_value_stays_part_of_the_value(tmp_path):
     assert "".join(lines) == _DEV + "  3-2-x: done\n"
 
 
-def test_a_line_with_trailing_whitespace_and_no_comment_is_refused(tmp_path):
-    """Characterization, not a requirement — but pinned so the split cannot
-    change it by accident. Both arms end at a non-space character, so a value
-    with trailing whitespace and no comment is a remainder neither can account
-    for, and the line is left exactly as authored rather than rewritten a few
-    invisible characters shorter. `advance` then raises the refusal
-    (`test_advance_raises_when_an_existing_row_cannot_be_rewritten` is that half)."""
-    trailing = "  3-2-x: backlog  \n"
-    quoted_trailing = "  3-2-x: 'backlog' \n"
+def test_a_line_with_trailing_whitespace_and_no_comment_keeps_it(tmp_path):
+    """Only the value's span is spliced, so trailing whitespace after a plain or
+    quoted value is outside it and stays as authored — the line is neither
+    refused nor rewritten a few invisible characters shorter (DW-514/516)."""
+    cases = {
+        "  3-2-x: backlog  \n": "  3-2-x: done  \n",
+        "  3-2-x: 'backlog' \n": "  3-2-x: done \n",
+    }
 
-    for line in (trailing, quoted_trailing):
+    for line, expected in cases.items():
         lines = [_DEV, line]
-        assert sprintstatus._set_mapping_value(
-            lines, "3-2-x", "done", scope="development_status"
-        ) == sprintstatus._Refused("unreadable-value")
-        assert "".join(lines) == _DEV + line
+        assert (
+            sprintstatus._set_mapping_value(lines, "3-2-x", "done", scope="development_status")
+            == "changed"
+        )
+        assert "".join(lines) == _DEV + expected
 
 
 # ------------------------------------------------------------- folded rows
@@ -662,6 +664,33 @@ def test_a_multi_line_value_the_writer_cannot_read_is_left_untouched(shape, reas
     with pytest.raises(sprintstatus.SprintStatusWriteRefused) as refused:
         sprintstatus.advance(p, "3-2-x", "done")
     assert refused.value.reason == reason
+    assert p.read_bytes() == board
+
+
+@pytest.mark.parametrize(
+    "line",
+    ["  3-2-x: 'backlog'#c\n", '  3-2-x: "backlog"#c\n'],
+    ids=["single-quoted", "double-quoted"],
+)
+def test_a_comment_glued_to_a_closing_quote_is_refused(line, tmp_path):
+    """`'backlog'#c` parses as `backlog`, but splicing only the span would write
+    `done#c`, which re-parses as the status `done#c`. The tail check is the only
+    guard, so the row is refused and left as authored. Ablation: drop the
+    `_VALUE_TAIL_RE` check in `_set_mapping_value` and both ids redden."""
+    lines = [_DEV, line, "  3-3-y: backlog\n"]
+    before = list(lines)
+
+    assert sprintstatus._set_mapping_value(
+        lines, "3-2-x", "done", scope="development_status"
+    ) == sprintstatus._Refused("unreadable-value")
+
+    assert lines == before
+    board = "".join(before).encode("utf-8")
+    p = tmp_path / "sprint-status.yaml"
+    p.write_bytes(board)
+    with pytest.raises(sprintstatus.SprintStatusWriteRefused) as refused:
+        sprintstatus.advance(p, "3-2-x", "done")
+    assert refused.value.reason == "unreadable-value"
     assert p.read_bytes() == board
 
 

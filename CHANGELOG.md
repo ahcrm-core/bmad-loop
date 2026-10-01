@@ -71,6 +71,13 @@ breaking changes may land in a minor release.
   keeps its work (no rollback, no retry); the board carry journals
   `board-advance-carry-failed` with `refuse_cause`; `bmad-loop confirm` exits 1 naming
   the repair and keeps the park entry (follow-up to #842).
+- Replace only a sprint-status value's own text when advancing a row, keeping the
+  gap, inline comment, trailing whitespace and line ending as authored. A null row with a
+  comment (`key:  # note`) keeps its comment, and a bare `key:` row can now be advanced.
+  Refuse rows in a flow-style `{...}` mapping (`mapping-is-flow`) instead of publishing
+  invalid YAML, and any anchored value (`value-is-anchored`), aliased or not. A quoted value
+  with a glued comment (`'backlog'#c`) is now refused (`unreadable-value`) rather than
+  rewritten (DW-514, DW-516).
 
 ## [0.13.0] — 2026-09-28
 

@@ -107,8 +107,10 @@ RefusalReason = Literal[
     "key-not-plain",  # the key is quoted, flow-style, or not where its line says
     "value-not-scalar",  # a nested mapping or sequence
     "value-is-alias",  # `*anchor`: the value's text is authored on another row
+    "value-is-anchored",  # `&anchor value`: aliases elsewhere resolve to this text
+    "mapping-is-flow",  # the row sits in a `{...}` flow mapping, not a block one
     "multiline-value",  # runs past the key line in a shape the collapse cannot read
-    "unreadable-value",  # one line, but neither value arm accounts for all of it
+    "unreadable-value",  # one line, but the text around the value span is not gap + comment
     "row-not-in-mapping",  # the reader resolves the key only through a `<<` merge
 ]
 
@@ -116,6 +118,8 @@ _REFUSAL_TEXT: dict[RefusalReason, str] = {
     "key-not-plain": "its key is not a plain `key:` at the start of its line",
     "value-not-scalar": "its value is a nested mapping or sequence",
     "value-is-alias": "its value is an alias to a node authored elsewhere",
+    "value-is-anchored": "its value carries an anchor that other rows may alias",
+    "mapping-is-flow": "it sits in a flow-style `{...}` mapping, not a block one",
     "multiline-value": "its value runs past the key line in a shape the writer cannot collapse",
     "unreadable-value": "the text after its key is not a value the writer can read whole",
     "row-not-in-mapping": "development_status reaches it only through a `<<` merge",
@@ -412,26 +416,15 @@ def story_status(path: Path, key: str) -> str | None:
     return None
 
 
-# Stage 2 of the value/comment split, applied to the remainder after the key's
-# colon and its gap. Which one runs is decided by the remainder's FIRST
-# character, because that is the only place the scalar's own boundary is
-# knowable from a line edit: a quote opens a scalar that owns every `#` to its
-# right, an unquoted scalar cedes the first whitespace-preceded one.
-#
-# `_QUOTED_VALUE_RE` recognizes NO comment (there is no `rest` group to carry):
-# the whole remainder is the value. `_UNQUOTED_VALUE_RE`'s `val` is lazy, so the
-# FIRST ` #` wins rather than the last — the split is where YAML puts it, not
-# wherever the line happens to end. Both arms demand a trailing `\S`, so a line
-# carrying anything after the value that neither arm can account for — trailing
-# whitespace, no comment — is refused whole rather than silently rewritten
-# without it. Line terminators are excluded before either scalar matcher runs
-# and carried separately per line, so CRLF's `\r` is never mistaken for trailing
-# scalar whitespace (#576).
-_QUOTED_VALUE_RE = re.compile(r"^(?P<val>['\"](?:.*\S)?)$")
-_UNQUOTED_VALUE_RE = re.compile(r"^(?P<val>\S(?:.*?\S)?)(?P<rest>[ \t]+#.*)?$")
-
-
 _Scope = Literal["root", "development_status"]
+
+# A node's leading properties: each an anchor (`&a`) or tag (`!t`, `!!str`,
+# `!<uri>`) token, a run of non-space characters ended by spaces/tabs, a line
+# break, or the end of the text. The scan never crosses a line break, so a
+# property-only value (`key: !!str`) cannot claim the next row's `&anchor`. No
+# plain scalar may open with `&` or `!`, so a value starting with either starts
+# with a property.
+_NODE_PROPERTIES_RE = re.compile(r"(?:[&!]\S*(?:[ \t]+|(?=[\r\n])|\Z))*")
 
 
 @dataclass(frozen=True)
@@ -440,11 +433,14 @@ class _RowSpan:
 
     Line numbers index the caller's ``lines``; columns count characters from the
     start of their line. ``value_*`` is the value node's own extent, so a value
-    that runs past its first line says so here whatever its indentation."""
+    that runs past its first line says so here whatever its indentation. It
+    starts at the node's first property when it has one (a tag), and a null
+    value's extent is empty, sitting right after the key's colon."""
 
     key_line: int
     key_col: int
     value_first_line: int
+    value_start_col: int
     value_last_line: int
     value_end_col: int
     style: str | None  # PyYAML's ScalarNode.style: None for plain
@@ -465,8 +461,11 @@ def _locate_row(lines: list[str], key: str, scope: _Scope) -> _RowSpan | Refusal
     :func:`story_status` read.
 
     Returns None when the mapping has no such entry: the key is absent or only
-    reachable through a ``<<`` merge. An entry whose value is a collection, or an
-    alias to a node authored elsewhere, IS the row, so it comes back as the
+    reachable through a ``<<`` merge. An entry whose value is a collection, an
+    alias to a node authored elsewhere, or a value carrying an anchor (other rows'
+    aliases resolve to its text, so rewriting it would silently move them too), or
+    an entry of a flow-style ``{...}`` mapping (its closing brace and separators
+    share lines with values), IS the row, so it comes back as the
     :data:`RefusalReason` the writer must decline it with rather than as None —
     "not here" and "here, but not editable" are different answers. Raises
     :class:`SprintStatusError` when the lines do not parse — the caller parsed
@@ -484,11 +483,18 @@ def _locate_row(lines: list[str], key: str, scope: _Scope) -> _RowSpan | Refusal
     entry = _last_entry(mapping, key)
     if entry is None:
         return None
+    if any(isinstance(m, yaml.MappingNode) and m.flow_style for m in (root, mapping)):
+        return "mapping-is-flow"
     key_node, value_node = entry
     if not isinstance(value_node, yaml.ScalarNode):
         return "value-not-scalar"
     if value_node.start_mark.index < key_node.end_mark.index:
         return "value-is-alias"  # its marks belong to the anchor, not to this row
+    # A node's start mark is its first property (`&anchor`, `!tag`), so the
+    # properties are the leading whitespace-separated `&`/`!` runs of its source.
+    props = _NODE_PROPERTIES_RE.match(text, value_node.start_mark.index)
+    if props and "&" in {p[0] for p in props.group().split()}:
+        return "value-is-anchored"
 
     starts: list[int] = []
     offset = 0
@@ -501,12 +507,13 @@ def _locate_row(lines: list[str], key: str, scope: _Scope) -> _RowSpan | Refusal
         return line, index - starts[line]
 
     key_line, key_col = where(key_node.start_mark.index)
-    first_line, _ = where(value_node.start_mark.index)
+    first_line, start_col = where(value_node.start_mark.index)
     last_line, end_col = where(value_node.end_mark.index)
     return _RowSpan(
         key_line=key_line,
         key_col=key_col,
         value_first_line=first_line,
+        value_start_col=start_col,
         value_last_line=last_line,
         value_end_col=end_col,
         style=value_node.style,
@@ -549,32 +556,34 @@ def _set_mapping_value(lines: list[str], key: str, new_value: str, *, scope: _Sc
     the row — inside an earlier block scalar, under another mapping, or a
     duplicate the parser overrides — and rewrite it while the real row stays put.
 
-    The split between value and comment is two-stage: the key prefix is matched
-    first and the whole remainder captured, then that remainder decides for
-    itself. An unquoted value keeps the wide class this board needs — it
-    legitimately contains spaces (`last_updated: 01-06-2026 10:00`), which is why
-    it cannot borrow `frontmatter._VALUE_COMMENT_RE`'s conservative token gate —
-    and cedes an inline comment only at whitespace, as YAML does. A remainder
-    that OPENS WITH A QUOTE is taken whole and no comment is recognized in it at
-    all: a fused pattern would guess the boundary from the last ` #` on the line
-    and turn `status: "a # b"` into `status: done # b"`, promoting scalar text
-    into a comment the board never had (#366). The span proves the closing quote
-    is on the key line, but not where on it, so a comment sitting after one is
-    dropped rather than guessed at. Lossy, never wrong, and only a hand-edit
-    reaches it: the writer replaces such a value with a bare token on the next
-    advance.
+    A one-line value is edited as a SPLICE of exactly its source span (DW-514,
+    DW-516): the parser has already proved where the scalar starts and ends on
+    the key line, so only ``[value_start_col, value_end_col)`` is replaced and
+    every other byte — the gap after the colon, trailing whitespace, an inline
+    comment, the line terminator — stays as authored. Nothing is guessed from
+    the text: a `#` inside a quoted scalar (`"a # b"`) is inside the span, so it
+    can never be promoted into a comment (#366), and a comment after a closing
+    quote is carried rather than dropped. A plain value keeps the spaces this
+    board needs (`last_updated: 01-06-2026 10:00`). A null value has an empty
+    span right after the colon, so `key:  # note` becomes `key: done  # note`
+    (a separating space is supplied only when there is no gap). A tag
+    (`!!str backlog`) is part of the span and is replaced with the bare token. The
+    gap and tail checks are defensive: text between the colon and the span that
+    is not spaces or tabs, or anything after it but whitespace and an optional
+    whitespace-led comment, refuses the row as ``unreadable-value``.
 
     Returns ``"changed"`` after a real edit, ``"equal"`` when the value is already
     ``new_value`` (idempotent, nothing edited), ``"absent"`` when ``scope`` holds no
     ``key`` entry, and :class:`_Refused` when the entry is there but the line edit
-    cannot rewrite it exactly — a key authored in quotes or flow style, a value
-    that is a collection or an alias, a remainder neither arm can read, a
-    multi-line shape below. ``lines`` is untouched on every answer but
+    cannot rewrite it exactly — a key authored in quotes, a row in a flow-style
+    mapping, a value that is a collection, an alias, or anchored, a key line
+    whose text around the value span is not gap and comment, a multi-line shape
+    below. ``lines`` is untouched on every answer but
     ``"changed"``. Refused is deliberately not folded into absent: whether a
     declined row is an error is the caller's decision (:func:`_advance_locked`
     raises for the story row), and it can only make it on an answer that says
-    which happened. Each line's terminator is excluded from the scalar match and
-    then reattached exactly as authored (#576).
+    which happened. Each line's terminator lies outside the span and is
+    reattached exactly as authored (#576).
 
     A value may also run past the key line. The one such shape this reads is the
     FOLDED plain row a width-limited dump (ruamel wraps at 80) emits for a long
@@ -612,20 +621,23 @@ def _set_mapping_value(lines: list[str], key: str, new_value: str, *, scope: _Sc
     if row.value_last_line != row.key_line:
         # the value runs onto later lines — a one-line edit would orphan them
         return _Refused("multiline-value")
-    m = re.match(r"^(?P<gap>[ \t]+)(?P<body>\S.*)$", remainder)
-    if m is None:
+    if row.value_start_col < km.end():
         return _Refused("unreadable-value")
-    body = m.group("body")
-    value_pat = _QUOTED_VALUE_RE if body[0] in "'\"" else _UNQUOTED_VALUE_RE
-    vm = value_pat.match(body)
-    if not vm:
+    gap = stripped[km.end() : row.value_start_col]
+    tail = stripped[row.value_end_col :]
+    if gap.strip(" \t") or not _VALUE_TAIL_RE.fullmatch(tail):
         return _Refused("unreadable-value")  # leave the line as authored
-    if vm.group("val") == new_value:
+    if stripped[row.value_start_col : row.value_end_col] == new_value:
         return "equal"  # already at target — idempotent no-op
-    rest = vm.groupdict().get("rest") or ""
     nl = line[len(stripped) :]
-    lines[row.key_line] = f"{indent}{key}:{m.group('gap')}{new_value}{rest}" + nl
+    sep = "" if gap else " "
+    lines[row.key_line] = stripped[: row.value_start_col] + sep + new_value + tail + nl
     return "changed"
+
+
+# What may follow a one-line value's span on its key line: trailing spaces/tabs,
+# or a comment, which YAML opens only at a whitespace-preceded `#`.
+_VALUE_TAIL_RE = re.compile(r"[ \t]*|[ \t]+#.*")
 
 
 # Characters that cannot open a line of the folded row this writer accepts:
