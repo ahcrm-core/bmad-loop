@@ -1465,6 +1465,11 @@ def test_retrying_rmtree_treats_a_vanished_path_as_removed(tmp_path, monkeypatch
     assert not root.exists()
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32" and sys.version_info < (3, 13),
+    reason="win32 rmtree before 3.13 probes via _rmtree_islink, which swallows the "
+    "lstat error, so the denial never reaches the handler",
+)
 def test_retrying_rmtree_never_retries_a_probe(tmp_path, monkeypatch):
     # rmtree returns early once the handler returns for its top-level lstat probe,
     # so "retrying" the probe would report a removal that never happened. Only the
