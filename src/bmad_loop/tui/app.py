@@ -40,6 +40,7 @@ from .. import (
 from ..adapters.multiplexer import MultiplexerError, mux_usable
 from ..journal import load_state, state_lock
 from ..model import (
+    PAUSE_ENVIRONMENT,
     PAUSE_EPIC_BOUNDARY,
     PAUSE_ESCALATION,
     PAUSE_PLAN_CHECKPOINT,
@@ -622,6 +623,14 @@ class BmadLoopApp(App[None]):
         except (OSError, KeyError, ValueError):
             self.notify(f"state for run {run_id} is unreadable", severity="error")
             return
+        if state.paused_stage == PAUSE_ENVIRONMENT:
+            # DW-523: nothing ran and nothing was charged — resume lifts it.
+            self.notify(
+                "an environment pause needs no resolve: fix the environment, then "
+                f"resume (`bmad-loop resume {run_id}`)",
+                severity="warning",
+            )
+            return
         if state.paused_stage != "escalation":
             self.notify(
                 "resolve is only available for a run paused at an escalation",
@@ -706,7 +715,12 @@ class BmadLoopApp(App[None]):
             self._review_story_checkpoint(run_id, run_dir, state)
         elif stage == PAUSE_ESCALATION:
             self._review_escalation(run_id, run_dir, state)
-        elif stage in (PAUSE_SPEC_APPROVAL, PAUSE_EPIC_BOUNDARY, PAUSE_STORY_GATE):
+        elif stage in (
+            PAUSE_SPEC_APPROVAL,
+            PAUSE_EPIC_BOUNDARY,
+            PAUSE_STORY_GATE,
+            PAUSE_ENVIRONMENT,
+        ):
             self._review_gate(run_id, run_dir, state)
         else:
             self.notify(f"no review viewer for pause stage {stage!r}", severity="warning")
@@ -760,7 +774,9 @@ class BmadLoopApp(App[None]):
     def _review_gate(self, run_id: str, run_dir: Path, state: RunState) -> None:
         label = widgets.pause_label(state.paused_stage or "")[0] or "gate"
         spec_path, spec_text, readable = (
-            (None, "", True) if state.paused_stage == PAUSE_STORY_GATE else self._paused_spec(state)
+            (None, "", True)
+            if state.paused_stage in (PAUSE_STORY_GATE, PAUSE_ENVIRONMENT)
+            else self._paused_spec(state)
         )
 
         def done(verb: str | None) -> None:
@@ -775,7 +791,9 @@ class BmadLoopApp(App[None]):
             # this arm even when the task carries a spec_file (DW-243: a sweep
             # bundle re-armed after a dev escalation keeps its spec_file, and its
             # intent-regeneration refusal pauses at this stage) — the repair steer
-            # is in the reason, which the spec viewer would hide.
+            # is in the reason, which the spec viewer would hide. An environment
+            # pause (DW-523) is the same shape: the failed probe and its remedy
+            # are the reason, and the only action is resume.
             subtitle = (
                 self._story_subtitle(state)
                 if state.paused_story_key

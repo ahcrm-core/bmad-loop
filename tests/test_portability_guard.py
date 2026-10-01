@@ -1227,6 +1227,12 @@ JOURNAL_KINDS = frozenset(
         # (`reverify-decision`), from `Engine._resume_reverify`.
         "resume-reverify",
         "reverify-decision",
+        # DW-523. A dispatch-site `environment` pause whose resume re-probe passed
+        # (`env-fault-cleared`, from `Engine._take_env_dispatch_pause`), and the
+        # no-rollback dev re-dispatch that follows (`resume-env-dispatch`, from
+        # `Engine._finish_inflight` and `SweepEngine._recover_inflight_bundle`).
+        "env-fault-cleared",
+        "resume-env-dispatch",
         "epic-boundary",
         "fix-decision",
         "fix-harvest-failed",

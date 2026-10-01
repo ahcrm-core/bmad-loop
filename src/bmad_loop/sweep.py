@@ -3255,10 +3255,16 @@ class SweepEngine(Engine):
         to dispatch it. A bare DEV_VERIFY + spec_file shape is insufficient: the
         pre-action decision save has the same shape for rejected decisions.
 
-        Deliberately narrower than the base _finish_inflight: no
+        Deliberately narrower than the base _finish_inflight: no general
         `_resumable_session` arm, so a bundle whose host died in the
         post-session window still restarts rather than replaying its recorded
-        result. Lifting that is a resume-fidelity change of its own. The
+        result. Lifting that is a resume-fidelity change of its own. The one
+        replay it does run is an `environment` dispatch pause's (DW-523), which
+        `_take_env_dispatch_pause` consumes first: nothing ran after the pause, so
+        a review-dispatch pause at REVIEW_VERIFY replays its completed pass
+        (returns True), and a dev-dispatch pause at PENDING returns False WITHOUT
+        the rollback — an isolated unit is untouched and is discarded for the
+        fresh mount, an in-place tree is the one the bundle starts from. The
         COMMITTING window IS recovered, though — same as the base engine's
         resume-commit arm (#115). The base's `_pending_salvage_session` replay
         (DW-278) is not mirrored either: a bundle whose review-timeout salvage
@@ -3287,8 +3293,37 @@ class SweepEngine(Engine):
             # regardless of live policy; restart is the only path allowed to release
             # or discard its ownership before future work begins.
             task.rebase_spec_paths_on(self._mount_project(task))
+        env_role = self._take_env_dispatch_pause(task)
         mounted = bool(task.worktree_path)
         restart_isolated = self._isolated and mounted
+        if env_role == "review" and task.phase == Phase.REVIEW_VERIFY:
+            resumable = self._resumable_session(task)
+            if resumable is not None and resumable[0] == "review":
+                self.journal.append("resume-env-dispatch", story_key=task.story_key, role=env_role)
+                # deliberate reset to the legal pre-review phase, as the base
+                # engine's replay arm does
+                task.phase = Phase.DEV_VERIFY
+                if mounted:
+                    unit = self._reopen_unit(task)
+                    prev = self.workspace
+                    self.workspace = unit.workspace
+                    try:
+                        self._review_and_commit(task, resume_result=resumable[1])
+                    finally:
+                        self.workspace = prev
+                    self._integrate_unit(task, unit)
+                else:
+                    self._review_and_commit(task, resume_result=resumable[1])
+                return True
+        if env_role == "dev" and task.phase == Phase.PENDING:
+            # Paused at the dev dispatch gate: no session ran, nothing to roll back.
+            self.journal.append("resume-env-dispatch", story_key=task.story_key, role=env_role)
+            if restart_isolated:
+                # the untouched unit; _run_story mounts a fresh one
+                self._discard_unit_for_restart(task)
+            elif mounted:
+                self._release_orphaned_mount(task)
+            return False
         if task.phase == Phase.COMMITTING:
             # the gate+advance save landed pre-death; finish the commit
             # instead of rolling verified bundle work back (see

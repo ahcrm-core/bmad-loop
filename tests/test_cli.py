@@ -4144,6 +4144,24 @@ def test_resolve_rejects_non_escalation_stage(tmp_path, capsys):
     assert "not paused at an escalation" in capsys.readouterr().err
 
 
+def test_resolve_refuses_environment_pause_with_resume_hint(tmp_path, capsys):
+    """DW-523: an environment pause is lifted by a plain resume, so resolve refuses
+    it AND names the remedy; any other non-escalation stage gets the bare refusal."""
+    _make_run_with_state(tmp_path, "r1", paused_stage="environment", paused_reason="x")
+    assert cli.main(["resolve", "--project", str(tmp_path), "r1"]) == 1
+    err = capsys.readouterr().err
+    assert "not paused at an escalation (stage: environment)" in err
+    assert "an environment pause needs no resolve" in err
+    assert "`bmad-loop resume r1`" in err
+
+    _make_run_with_state(tmp_path, "r2", paused_stage="spec-approval", paused_reason="x")
+    assert cli.main(["resolve", "--project", str(tmp_path), "r2"]) == 1
+    err = capsys.readouterr().err
+    assert "not paused at an escalation (stage: spec-approval)" in err
+    assert "needs no resolve" not in err
+    assert "bmad-loop resume" not in err
+
+
 # resolve refuses 'unknown' too, not just 'alive' — re-driving a possibly-live engine.
 @pytest.mark.parametrize(
     "liveness,msg",

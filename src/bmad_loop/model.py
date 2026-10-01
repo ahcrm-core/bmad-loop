@@ -510,10 +510,13 @@ class StoryTask:
     defer_reason: str | None = None
     # where the environment fault behind this task's escalation was detected
     # (DW-523), one of `ENV_FAULT_SITES`; None = the escalation (if any) is not an
-    # environment fault. Set only by `Engine._escalate_env` (directly, or through
-    # `Engine._escalate_outcome` for a verify env fault); cleared by
+    # environment fault. Set by `Engine._escalate_env` (directly, or through
+    # `Engine._escalate_outcome` for a verify env fault) and, for a
+    # `probe:dispatch:<role>` site on a NON-escalated task paused at
+    # `PAUSE_ENVIRONMENT`, by `Engine._pause_environment`; cleared by
     # `runs.rearm_escalation` and `runs.adopt_escalated_branch` — a re-armed
-    # story starts with no fault on record. Survives the resume round-trip.
+    # story starts with no fault on record — and by a resume whose re-probe
+    # passes (`Engine._take_env_dispatch_pause`). Survives the resume round-trip.
     env_fault_site: str | None = None
     # the recovery ref this attempt's work was parked on by the last auto-rollback
     # — an `attempt-preserve/*` branch (commits above baseline) or, when the tree

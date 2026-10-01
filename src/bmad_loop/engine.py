@@ -59,6 +59,8 @@ from .frontmatter import FrontmatterWriteError
 from .install import dev_primitive_or_default
 from .journal import SELF_MINTED_FIELDS, Journal, save_state
 from .model import (
+    ENV_FAULT_SITE_DISPATCH_PREFIX,
+    PAUSE_ENVIRONMENT,
     PAUSE_EPIC_BOUNDARY,
     PAUSE_ESCALATION,
     PAUSE_SPEC_APPROVAL,
@@ -2202,6 +2204,18 @@ class Engine:
                 # release ownership before it can begin in main or a replacement
                 # worktree.
                 task.rebase_spec_paths_on(self._mount_project(task))
+            if (
+                task.env_fault_site == f"{ENV_FAULT_SITE_DISPATCH_PREFIX}dev"
+                and task.phase == Phase.PENDING
+            ):
+                # The resumed dispatch is a start, so it gets the start's story-gate
+                # question — asked BEFORE the dispatch site clears: a gated refusal
+                # then keeps the site, and the next resume still lands on the
+                # no-rollback arm below instead of the restart arm.
+                self._refuse_gated_story(task.story_key)
+            # DW-523: re-probe a dispatch-site environment pause first (re-pauses
+            # unchanged while the environment is still down).
+            env_role = self._take_env_dispatch_pause(task)
             mounted = bool(task.worktree_path)
             restart_isolated = self._isolated and mounted
             if mounted and task.defer_reason is not None:
@@ -2327,6 +2341,27 @@ class Engine:
                 else:
                     self._release_orphaned_mount(task)
                     self._finalize_commit_phase(task)
+            elif env_role == "dev" and task.phase == Phase.PENDING:
+                # DW-523: the run paused at the dev dispatch gate, before the
+                # attempt, the baseline, or anything else moved — so NO rollback:
+                # the tree (and any commit the operator made while paused) is the
+                # one the story starts from. The story gate was asked above, before
+                # the site cleared. A review-dispatch pause needs no arm of its own:
+                # it sits at DEV_VERIFY + spec_file (first cycle) or at
+                # REVIEW_VERIFY with the completed pass on record (later cycles).
+                self.journal.append("resume-env-dispatch", story_key=task.story_key, role=env_role)
+                if mounted:
+                    unit = self._reopen_unit(task)
+                    prev = self.workspace
+                    self.workspace = unit.workspace
+                    try:
+                        self._drive_story(task)
+                    finally:
+                        self.workspace = prev
+                    self._integrate_unit(task, unit)
+                else:
+                    self._release_orphaned_mount(task)
+                    self._drive_story(task)
             else:
                 # This arm is the one that does not finish work: it discards the
                 # worktree or resets the tree to baseline and re-runs the story
@@ -3013,6 +3048,9 @@ class Engine:
 
     def _dev_phase(self, task: StoryTask, resume_result: SessionResult | None = None) -> bool:
         if resume_result is None:
+            # DW-523: probe before anything below mutates the task, so an
+            # `environment` pause leaves nothing to roll back on resume.
+            self._gate_dispatch(task, "dev")
             # A fresh invocation cannot consume a snapshot armed by an earlier,
             # non-replayable invocation. Keep crash replay's snapshot intact.
             self._disarm_ledger_snapshot(task)
@@ -3529,6 +3567,9 @@ class Engine:
         # iteration falls back to the normal budget guard.
         while resume_result is not None or task.review_cycle < self.policy.limits.max_review_cycles:
             if resume_result is None:
+                # DW-523: probe before the cycle is charged; a pause here resumes
+                # through the DEV_VERIFY or completed-pass replay arms.
+                self._gate_dispatch(task, "review")
                 # a resumed result replays the cycle it was recorded under: the
                 # counter must not advance, or the replay burns a review-budget
                 # slot and mislabels its journal/session ids.
@@ -6221,6 +6262,70 @@ class Engine:
                 output_tail=failed.output_tail,
                 spawn_error=failed.spawn_error,
             )
+
+    def _gate_dispatch(self, task: StoryTask, role: str) -> None:
+        """Probe the environment before a ``role`` session launches (DW-523).
+
+        Called before ANY counter, phase, or baseline mutation of the dispatch
+        (the top of :meth:`_dev_phase`, and the review loop before
+        ``review_cycle`` advances), so a failed probe pauses with nothing to undo:
+        no session started, no attempt or cycle was charged, and the tree is the
+        one the pause found. Skipped when no probes are configured (the default —
+        nothing spawns or journals) and when a probe pass already ran since the
+        last session launch (``_env_probes_fresh``): a retry or fix dispatch
+        follows the failure-decision seam, which probed before charging it."""
+        if not self.policy.environment.probes or self._env_probes_fresh:
+            return
+        site = f"{ENV_FAULT_SITE_DISPATCH_PREFIX}{role}"
+        probe = self._run_environment_probes(task, site=site)
+        if not probe.ok:
+            self._pause_environment(task, site=site, probe=probe)
+
+    def _pause_environment(
+        self, task: StoryTask, *, site: str, probe: verify.ProbeOutcome
+    ) -> NoReturn:
+        """Pause the run at the ``environment`` stage over a failed dispatch probe.
+
+        Shaped like :meth:`_pause_for_ledger_repair`: notify, ``_save()``,
+        ``RunPaused`` — and the task's phase, attempt and review cycle stay exactly
+        where they were. NOT :meth:`_escalate`: nothing ran, so there is nothing
+        for ``resolve`` to adjudicate. ``env_fault_site`` records the dispatch site
+        so a plain ``bmad-loop resume`` re-probes first
+        (:meth:`_take_env_dispatch_pause`) and then dispatches the same session
+        without a rollback."""
+        failed = probe.failed
+        assert failed is not None  # only a failed pass pauses
+        role = site.removeprefix(ENV_FAULT_SITE_DISPATCH_PREFIX)
+        reason = (
+            f"environment fault before {role} session dispatch — probe failed "
+            f"({probe.reason}): {failed.command}\n"
+            "no session was started and nothing was charged; fix the environment, then run "
+            f"`bmad-loop resume {self.state.run_id}` (the probes re-run first)"
+        )
+        task.env_fault_site = site
+        gates.notify(self.policy, self.run_dir, f"environment fault: {task.story_key}", reason)
+        self._save()
+        raise RunPaused(reason, PAUSE_ENVIRONMENT, task.story_key)
+
+    def _take_env_dispatch_pause(self, task: StoryTask) -> str | None:
+        """Consume a dispatch-site environment pause on resume (DW-523).
+
+        Returns None unless ``task`` paused at a ``probe:dispatch:<role>`` site.
+        Then the probes re-run in the workspace root: still failing re-pauses at
+        the same site with the task unchanged; healthy journals
+        ``env-fault-cleared``, clears the site, saves, and returns the role whose
+        dispatch the pause withheld — the caller dispatches it without a rollback,
+        because nothing ran before the pause."""
+        site = task.env_fault_site
+        if site is None or not site.startswith(ENV_FAULT_SITE_DISPATCH_PREFIX):
+            return None
+        probe = self._run_environment_probes(task, site=site)
+        if not probe.ok:
+            self._pause_environment(task, site=site, probe=probe)
+        self.journal.append("env-fault-cleared", story_key=task.story_key, site=site)
+        task.env_fault_site = None
+        self._save()
+        return site.removeprefix(ENV_FAULT_SITE_DISPATCH_PREFIX)
 
     def _env_gate_decision(
         self,

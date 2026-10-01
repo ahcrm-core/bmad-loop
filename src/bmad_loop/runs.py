@@ -42,6 +42,7 @@ from .adapters.multiplexer import (
 from .frontmatter import auto_dev_baseline_of, parse_frontmatter, status_of
 from .journal import STATE_FILE, VERIFY_DIR, Journal, load_state, save_state, state_lock
 from .model import (
+    PAUSE_ENVIRONMENT,
     PAUSE_ESCALATION,
     Phase,
     RunState,
@@ -3594,6 +3595,20 @@ class RearmError(Exception):
     """The run/story is not in a re-armable escalation state."""
 
 
+def not_escalation_pause_message(run_id: str, paused_stage: str | None) -> str:
+    """The refusal every resolve path gives a run not paused at an escalation.
+
+    An ``environment`` pause (DW-523) gets the remedy appended: nothing ran and
+    nothing was charged, so it is lifted by a plain ``resume``, never ``resolve``."""
+    message = f"run {run_id} is not paused at an escalation (stage: {paused_stage or 'none'})"
+    if paused_stage == PAUSE_ENVIRONMENT:
+        message += (
+            " — an environment pause needs no resolve: fix the environment, then "
+            f"`bmad-loop resume {run_id}`"
+        )
+    return message
+
+
 def validate_restore_latch(
     state: RunState, task: StoryTask, story_key: str, *, worktree_isolation: bool = False
 ) -> str | None:
@@ -5174,10 +5189,7 @@ def adopt_escalated_branch(run_dir: Path, story_key: str | None = None) -> str:
     with state_lock(run_dir):
         state = load_state(run_dir)
         if state.paused_stage != PAUSE_ESCALATION:
-            raise RearmError(
-                f"run {run_dir.name} is not paused at an escalation "
-                f"(stage: {state.paused_stage or 'none'})"
-            )
+            raise RearmError(not_escalation_pause_message(run_dir.name, state.paused_stage))
         key = story_key or state.paused_story_key
         if key is None:
             raise RearmError(f"run {run_dir.name} has no escalated story to resolve")
@@ -5337,10 +5349,7 @@ def _rearm_escalation_locked(
     """
     state = load_state(run_dir)
     if state.paused_stage != PAUSE_ESCALATION:
-        raise RearmError(
-            f"run {run_dir.name} is not paused at an escalation "
-            f"(stage: {state.paused_stage or 'none'})"
-        )
+        raise RearmError(not_escalation_pause_message(run_dir.name, state.paused_stage))
     key = story_key or state.paused_story_key
     if key is None:
         raise RearmError(f"run {run_dir.name} has no escalated story to resolve")

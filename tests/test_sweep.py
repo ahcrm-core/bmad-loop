@@ -57,6 +57,7 @@ from bmad_loop.bmadconfig import ProjectPaths
 from bmad_loop.engine import RunPaused, _LedgerAnchor, _session_task_id
 from bmad_loop.journal import Journal, load_state, save_state
 from bmad_loop.model import (
+    PAUSE_ENVIRONMENT,
     PAUSE_ESCALATION,
     PAUSE_STORY_GATE,
     Phase,
@@ -71,6 +72,7 @@ from bmad_loop.plugins.model import LoadedPlugin
 from bmad_loop.policy import (
     AdapterPolicy,
     DevPolicy,
+    EnvironmentPolicy,
     GatesPolicy,
     LimitsPolicy,
     NotifyPolicy,
@@ -23875,6 +23877,83 @@ def test_sweep_inflight_bundle_with_reverify_latch_escalates(project):
     assert escalated["reason"] == "resolve --reverify is not supported for sweep runs"
     journal = journal_text(resumed)
     assert "resume-restart" not in journal and "rollback-auto" not in journal
+
+
+def test_bundle_dispatch_pause_resumes_without_restart(project, tmp_path):
+    """DW-523, sweep flavor: an `[environment]` probe failing at a bundle's dev
+    dispatch gate pauses the run at the `environment` stage before any session
+    launches — the task stays PENDING with attempt 0 and records the dispatch
+    site. A plain resume re-probes first, then dispatches the same dev session
+    WITHOUT the restart arm: nothing ran before the pause, so there is nothing
+    to roll back, and a commit the operator made while paused survives.
+
+    Ablation, performed: drop the `env_role == "dev"` arm in
+    `SweepEngine._recover_inflight_bundle` and the resume falls through to the
+    restart arm — this reds on `resume-env-dispatch` never being journaled (a
+    `resume-restart` row is written in its place). The operator-commit check
+    does NOT red under that ablation: the gate fires before `_dev_phase` stamps
+    `baseline_commit`, so the restart arm has no baseline to roll back to on a
+    first dispatch (pinned below as a premise). It guards the outcome, not the arm."""
+    write_ledger(project, {"DW-1": "open"})
+    rig = tmp_path / "env-rig"  # outside the repo: no rollback or commit touches it
+    rig.mkdir()
+    marker = rig / "up"
+    script = rig / "probe.py"
+    script.write_text(
+        f"import os, sys\nsys.exit(0 if os.path.exists(r'{marker}') else 3)\n",
+        encoding="utf-8",
+    )
+    probe = f'"{sys.executable}" "{script}"'
+    policy = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        scm=ScmPolicy(rollback_on_failure=True),
+        environment=EnvironmentPolicy(probes=(probe,)),
+    )
+    engine, adapter = make_sweep(
+        project, [triage_effect(bundle_plan()), *_redrive_script(project)], policy=policy
+    )
+    summary = engine.run()
+
+    assert summary.paused and engine.state.paused_stage == PAUSE_ENVIRONMENT
+    assert engine.state.paused_story_key == "dw-fix"
+    assert [s.role for s in adapter.sessions] == ["triage"]  # triage is not gated
+    task = engine.state.tasks["dw-fix"]
+    assert task.phase == Phase.PENDING and task.attempt == 0
+    assert task.env_fault_site == "probe:dispatch:dev"
+    assert task.baseline_commit is None  # premise: the gate ran before any baseline
+    saved = load_state(engine.run_dir)
+    assert saved.paused_stage == PAUSE_ENVIRONMENT
+    assert saved.tasks["dw-fix"].env_fault_site == "probe:dispatch:dev"
+    assert saved.tasks["dw-fix"].phase == Phase.PENDING and saved.tasks["dw-fix"].attempt == 0
+    (failed,) = _records(engine, "env-probe-failed")
+    assert failed["site"] == "probe:dispatch:dev" and failed["rc"] == 3
+
+    # the operator commits while the run waits, then fixes the environment
+    (project.project / "operator.txt").write_text("operator note\n", encoding="utf-8")
+    git(project.project, "add", "operator.txt")
+    git(project.project, "commit", "-q", "-m", "operator commit while paused")
+    operator_sha = git(project.project, "rev-parse", "HEAD")
+    marker.write_text("up\n", encoding="utf-8")
+
+    resumed, adapter = resume_sweep(project, engine, _redrive_script(project))
+    summary = resumed.run()
+
+    assert not summary.paused and not summary.crashed
+    assert [s.role for s in adapter.sessions] == ["dev", "review"]
+    task = resumed.state.tasks["dw-fix"]
+    assert task.phase == Phase.DONE and task.env_fault_site is None
+    (cleared,) = _records(resumed, "env-fault-cleared")
+    assert cleared["story_key"] == "dw-fix" and cleared["site"] == "probe:dispatch:dev"
+    (redispatch,) = _records(resumed, "resume-env-dispatch")
+    assert redispatch["story_key"] == "dw-fix" and redispatch["role"] == "dev"
+    assert [r for r in _records(resumed, "resume-restart") if r["story_key"] == "dw-fix"] == []
+    assert "rollback-auto" not in journal_kinds(resumed)
+    # the operator's commit is still in the history the bundle landed on
+    # (`git` checks the exit status: a non-ancestor raises CalledProcessError)
+    git(project.project, "merge-base", "--is-ancestor", operator_sha, "HEAD")
+    assert (project.project / "operator.txt").read_text(encoding="utf-8") == "operator note\n"
+    assert ledger_entries(project)["DW-1"].status.startswith("done")
 
 
 def test_resume_committing_bundle_finishes_commit(project):

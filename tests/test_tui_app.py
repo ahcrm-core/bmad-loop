@@ -54,7 +54,14 @@ from bmad_loop import runs as runs_mod
 from bmad_loop import verify
 from bmad_loop.adapters.multiplexer import MultiplexerError, TerminalMultiplexer
 from bmad_loop.journal import UNREADABLE_LINE_KIND, Journal, save_state
-from bmad_loop.model import Phase, RunState, SessionRecord, StoryTask, TokenUsage
+from bmad_loop.model import (
+    PAUSE_ENVIRONMENT,
+    Phase,
+    RunState,
+    SessionRecord,
+    StoryTask,
+    TokenUsage,
+)
 from bmad_loop.runs import RUNS_DIR
 from bmad_loop.tui import data, launch, widgets
 from bmad_loop.tui.app import BmadLoopApp
@@ -4084,6 +4091,35 @@ async def test_resolve_refused_when_not_escalation(project_tree, monkeypatch):
     assert launched == []  # warned, never launched
 
 
+async def test_resolve_refused_on_environment_pause_with_resume_hint(project_tree, monkeypatch):
+    """DW-523: an environment pause is lifted by resume, not resolve — R names that
+    remedy instead of the generic escalation-only refusal, and launches nothing."""
+    launched: list[str] = []
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+    monkeypatch.setattr(launch, "start_resolve_detached", lambda proj, rid: launched.append(rid))
+    make_run(
+        project_tree.project,
+        "20260611-100000-aaaa",
+        paused_stage=PAUSE_ENVIRONMENT,
+        paused_reason="environment fault before dev session dispatch",
+    )
+    app = BmadLoopApp(project_tree.project)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        await until(pilot, lambda: dashboard(app).selected_run_id is not None)
+        await pilot.press("R")
+        await until(
+            pilot,
+            lambda: any("an environment pause needs no resolve" in m for m in notifications(app)),
+        )
+        hint = next(m for m in notifications(app) if "needs no resolve" in m)
+        assert "`bmad-loop resume 20260611-100000-aaaa`" in hint
+        assert not any("only available" in m for m in notifications(app))
+        assert isinstance(app.screen, DashboardScreen), "no confirm / escalation viewer"
+    assert launched == []  # warned, never launched
+
+
 # ------------------------------------------------- stories mode: board + badges
 
 
@@ -4101,6 +4137,14 @@ def test_pause_tag_and_label_render():
     assert pause_label("story-gate") == ("story gate", "yellow")
     assert pause_label("epic-boundary")[0] == "epic gate"
     assert pause_label("spec-approval")[0] == "spec-approval gate"
+
+
+def test_pause_tag_and_label_render_environment():
+    """DW-523: an environment pause gets its own badge — the gate viewer titles
+    itself from pause_label, so the label is load-bearing UI too."""
+    tag = pause_tag(PAUSE_ENVIRONMENT)
+    assert tag.plain == "env" and "red" in str(tag.style)
+    assert pause_label(PAUSE_ENVIRONMENT) == ("environment fault", "bold red")
 
 
 def test_stopping_tag_renders():
@@ -8136,6 +8180,54 @@ async def test_story_gate_pause_shows_reason_and_resumes(
         body = render(app.screen.query_one("#reason Static", Static).content)
         assert "gated by unlanded deferred work" in body
         assert "DW-1" in body, "the reason names the blocking entry, not a blank pane"
+        await click(pilot, await ready(pilot, "#act-resume"))
+        await until(pilot, lambda: calls == ["20260611-100000-aaaa"])
+
+
+_ENV_REASON = (
+    "environment fault before dev session dispatch — probe failed (rc=3): probe\n"
+    "no session was started and nothing was charged; fix the environment, then run "
+    "`bmad-loop resume 20260611-100000-aaaa` (the probes re-run first)"
+)
+
+
+async def test_review_pause_environment_opens_resume_viewer(project_tree, monkeypatch):
+    """DW-523: an environment pause is spec-less like a story gate — the failed probe
+    and its remedy ARE the reason, so it shows even when the paused task carries a
+    spec_file. Ablation: drop PAUSE_ENVIRONMENT from `_review_gate`'s spec-less tuple
+    (spec read) or from `action_review_pause`'s routing (no viewer at all)."""
+    spec_reads: list[bool] = []
+
+    def unused_spec_read(*args):
+        spec_reads.append(True)
+        return None, "", True
+
+    monkeypatch.setattr(BmadLoopApp, "_paused_spec", unused_spec_read)
+    calls: list[str] = []
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(launch, "resume_detached", lambda proj, rid: calls.append(rid))
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+    spec = project_tree.implementation_artifacts / "spec-1-1-a.md"
+    spec.write_text("# spec-1-1-a\n", encoding="utf-8")
+    make_run(
+        project_tree.project,
+        "20260611-100000-aaaa",
+        paused_stage=PAUSE_ENVIRONMENT,
+        paused_reason=_ENV_REASON,
+        paused_story_key="1-1-a",
+        tasks={"1-1-a": StoryTask(story_key="1-1-a", epic=1, spec_file=str(spec))},
+    )
+    app = BmadLoopApp(project_tree.project)
+    async with app.run_test() as pilot:
+        await _open_review(app, pilot, PauseReasonModal)  # routed away from the spec viewer
+        assert spec_reads == [], "an environment-pause viewer must not read the spec"
+        title = render(app.screen.query_one(".title", Static).content)
+        assert "environment fault" in title
+        await ready(pilot, "#reason Static")
+        # wide enough that the remedy's command does not wrap mid-string
+        body = render(app.screen.query_one("#reason Static", Static).content, width=400)
+        assert "probe failed (rc=3)" in body
+        assert "bmad-loop resume 20260611-100000-aaaa" in body
         await click(pilot, await ready(pilot, "#act-resume"))
         await until(pilot, lambda: calls == ["20260611-100000-aaaa"])
 

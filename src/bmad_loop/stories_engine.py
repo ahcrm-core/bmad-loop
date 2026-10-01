@@ -636,6 +636,11 @@ class StoriesEngine(Engine):
         # `Halt after planning.` prompt + BMAD_LOOP_PLAN_HALT env are emitted by
         # _dev_prompt / _extra_session_env, both keyed off the same on-disk state).
         # dev_resume None means a fresh drive, not a mid-session crash replay.
+        if dev_resume is None:
+            # DW-523: the dispatch gate `_dev_phase` runs, asked before the plan-halt
+            # latch and journal below so an `environment` pause writes neither (a
+            # passing probe is fresh, so `_dev_phase` does not probe twice).
+            self._gate_dispatch(task, "dev")
         if dev_resume is None and self._plan_halt_leg(task, self._entry_for(task)):
             # Latch the plan-review obligation BEFORE the session runs, so it
             # survives a crash in the post-session window, a non-fixable retry that

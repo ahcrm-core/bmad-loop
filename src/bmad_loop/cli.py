@@ -3951,8 +3951,7 @@ def cmd_resolve(args: argparse.Namespace) -> int:
     reverify_named = bool(getattr(args, "reverify", False) and args.story)
     if not _resolve_pause_admits(state.paused_stage, reverify_named=reverify_named):
         print(
-            f"run {args.run_id} is not paused at an escalation "
-            f"(stage: {state.paused_stage or 'none'})",
+            runs.not_escalation_pause_message(args.run_id, state.paused_stage),
             file=sys.stderr,
         )
         return 1
@@ -4281,8 +4280,7 @@ def cmd_resolve(args: argparse.Namespace) -> int:
             fresh_state = load_state(run_dir)
             if fresh_state.paused_stage != PAUSE_ESCALATION:
                 print(
-                    f"run {args.run_id} is not paused at an escalation "
-                    f"(stage: {fresh_state.paused_stage or 'none'})",
+                    runs.not_escalation_pause_message(args.run_id, fresh_state.paused_stage),
                     file=sys.stderr,
                 )
                 return 1
@@ -4413,8 +4411,7 @@ def _resolve_adopt(
             fresh_state = load_state(run_dir)
             if fresh_state.paused_stage != PAUSE_ESCALATION:
                 print(
-                    f"run {args.run_id} is not paused at an escalation "
-                    f"(stage: {fresh_state.paused_stage or 'none'})",
+                    runs.not_escalation_pause_message(args.run_id, fresh_state.paused_stage),
                     file=sys.stderr,
                 )
                 return 1
@@ -4545,8 +4542,7 @@ def _resolve_reverify(
             fresh_state = load_state(run_dir)
             if not _resolve_pause_admits(fresh_state.paused_stage, reverify_named=explicit_story):
                 print(
-                    f"run {args.run_id} is not paused at an escalation "
-                    f"(stage: {fresh_state.paused_stage or 'none'})",
+                    runs.not_escalation_pause_message(args.run_id, fresh_state.paused_stage),
                     file=sys.stderr,
                 )
                 return 1

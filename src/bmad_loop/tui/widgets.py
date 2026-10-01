@@ -28,6 +28,7 @@ from .. import policy
 from ..escalation import display_pause_reason
 from ..journal import UNREADABLE_LINE_KIND
 from ..model import (
+    PAUSE_ENVIRONMENT,
     PAUSE_EPIC_BOUNDARY,
     PAUSE_ESCALATION,
     PAUSE_PLAN_CHECKPOINT,
@@ -78,6 +79,7 @@ _PAUSE_BADGES: dict[str, tuple[str, str, str]] = {
     PAUSE_EPIC_BOUNDARY: ("epic", "epic gate", "yellow"),
     PAUSE_STORY_GATE: ("gate", "story gate", "yellow"),
     PAUSE_ESCALATION: ("esc", "escalation", "bold red"),
+    PAUSE_ENVIRONMENT: ("env", "environment fault", "bold red"),
 }
 
 
