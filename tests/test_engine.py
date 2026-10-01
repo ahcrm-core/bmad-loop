@@ -5446,6 +5446,51 @@ def test_a_hard_stop_inside_the_demotion_gate_unwinds_before_it_travels(project,
     assert story_status(project.sprint_status, "1-1-a") == "done"
 
 
+def test_a_refused_review_demotion_pauses_without_a_retry_or_an_unwind(project):
+    """The demotion's board write meets a row the writer refuses — here the board
+    was reformatted to a quoted key while the review ran. Nothing was written, so
+    the pass pauses for the operator: no second review, no unwind, the dev leg's
+    `done` intent and the board's bytes exactly as they were (#842).
+
+    Ablation: drop the `except SprintStatusWriteRefused` arm in
+    `_park_review_demotion` and the raw refusal ends the run as `run-crash`."""
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    quoted = _REFUSED_ROW_BOARD.format(status="done")
+
+    def reformat_board() -> None:
+        project.sprint_status.write_text(quoted, encoding="utf-8")
+
+    engine, adapter = make_engine(
+        project,
+        [
+            generic_dev_effect(project, "1-1-a"),
+            _review_pass(
+                project,
+                "1-1-a",
+                "awaiting-operator",
+                operator_actions=ACTIONS,
+                on_entry=reformat_board,
+            ),
+            _review_pass(project, "1-1-a", "awaiting-operator", operator_actions=ACTIONS),
+        ],
+        policy=_demotion_policy(),
+    )
+
+    summary = engine.run()
+
+    assert summary.paused and not summary.crashed
+    assert engine.state.paused_stage == PAUSE_ESCALATION
+    assert len(adapter.sessions) == 2  # the dev session and one review pass
+    task = engine.state.tasks["1-1-a"]
+    assert task.phase == Phase.ESCALATED
+    assert task.board_advance_intended == "done" and task.operator_actions == []
+    assert project.sprint_status.read_text(encoding="utf-8") == quoted
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    assert "run-crash" not in kinds and "review-verify-failed" not in kinds
+    (escalated,) = [e for e in engine.journal.entries() if e["kind"] == "story-escalated"]
+    assert "review pass" in escalated["reason"] and "(key-not-plain)" in escalated["reason"]
+
+
 def test_a_demotion_whose_actions_vanish_after_the_gate_is_not_parked(project, monkeypatch):
     """The post-gate re-read fallback: the gate passed, but re-reading the spec for
     the actions to latch finds none (here: the read degrades to None, as
@@ -6656,6 +6701,87 @@ def test_post_dev_state_sync_skips_on_unreadable_spec(project, monkeypatch):
     events = [e for e in engine.journal.entries() if e["kind"] == "spec-read-failed"]
     assert len(events) == 1 and events[0]["site"] == "post-dev-sync"
     assert events[0]["story_key"] == "1-1-a"
+
+
+# A board row `story_status` resolves through YAML but the line-edit writer refuses:
+# a quoted key is the smallest shape that does it (#842).
+_REFUSED_ROW_BOARD = "development_status:\n  epic-1: in-progress\n  '1-1-a': {status}\n"
+
+
+@pytest.mark.parametrize(
+    ("spec_status", "target", "policy"),
+    [("done", "done", None), ("awaiting-operator", "awaiting-operator", "park")],
+)
+def test_post_dev_state_sync_escalates_a_refused_board_write(project, spec_status, target, policy):
+    """Both terminal mirrors — `done` and the park stage — pause on a row the writer
+    refuses, naming board, row, current, target and the reason token, and record no
+    `board_advance_intended`: nothing landed for a carry to re-apply. The spec is
+    recorded so a resolve has something to act on.
+
+    Ablation: drop the `except SprintStatusWriteRefused` arm in
+    `_post_dev_state_sync` and this fails with the raw refusal, not `RunPaused`."""
+    project.sprint_status.write_text(
+        _REFUSED_ROW_BOARD.format(status="ready-for-dev"), encoding="utf-8"
+    )
+    engine, _ = make_engine(project, [], policy=_park_policy() if policy else None)
+    sp = spec_path(project, "1-1-a")
+    sp.parent.mkdir(parents=True, exist_ok=True)
+    write_spec(sp, spec_status, "abc123", operator_actions=ACTIONS if policy else None)
+    before = project.sprint_status.read_bytes()
+    task = StoryTask(story_key="1-1-a", epic=1, phase=Phase.DEV_VERIFY)
+    engine.state.tasks[task.story_key] = task
+
+    with pytest.raises(RunPaused):
+        engine._post_dev_state_sync(task, {"spec_file": str(sp)})
+
+    assert task.phase == Phase.ESCALATED
+    assert task.board_advance_intended is None
+    assert task.spec_file == str(sp)
+    assert project.sprint_status.read_bytes() == before
+    (escalated,) = [e for e in engine.journal.entries() if e["kind"] == "story-escalated"]
+    reason = escalated["reason"]
+    assert str(project.sprint_status) in reason
+    assert "'1-1-a'" in reason and "'ready-for-dev'" in reason and f"{target!r}" in reason
+    assert "(key-not-plain)" in reason and "kept rather than rolled back" in reason
+
+
+def test_a_refused_board_write_pauses_a_finished_dev_attempt_without_retry(project):
+    """End to end through `run()`: the dev session finishes and flips its spec to
+    `done`, the board row is one the writer refuses, and the run pauses on that
+    attempt. Exactly one session, no rollback, the session's work and spec still on
+    disk, the board untouched, no crash (#842).
+
+    Ablation (no-retry gate): make the `except SprintStatusWriteRefused` arm in
+    `_post_dev_state_sync` `return` instead of escalating, and `verify_dev` reads
+    the unadvanced board as a stage mismatch — the attempt is rolled back and a
+    second session launches, which this test's script would serve."""
+    project.sprint_status.write_text(
+        _REFUSED_ROW_BOARD.format(status="ready-for-dev"), encoding="utf-8"
+    )
+    board = project.sprint_status.read_bytes()
+    engine, adapter = make_engine(
+        project,
+        [
+            generic_dev_effect(project, "1-1-a", followup_review=False),
+            generic_dev_effect(project, "1-1-a", followup_review=False),
+        ],
+    )
+
+    summary = engine.run()
+
+    assert summary.paused and not summary.crashed and summary.done == 0
+    assert engine.state.paused_stage == PAUSE_ESCALATION
+    assert len(adapter.sessions) == 1  # the finished attempt was not re-driven
+    task = engine.state.tasks["1-1-a"]
+    assert task.phase == Phase.ESCALATED and task.board_advance_intended is None
+    assert "change for 1-1-a" in (project.project / "src.txt").read_text()  # not rolled back
+    assert read_frontmatter(spec_path(project, "1-1-a"))["status"] == "done"
+    assert project.sprint_status.read_bytes() == board
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    assert "run-crash" not in kinds
+    assert not [k for k in kinds if "rollback" in k or "rolled-back" in k]
+    (escalated,) = [e for e in engine.journal.entries() if e["kind"] == "story-escalated"]
+    assert "(key-not-plain)" in escalated["reason"]
 
 
 # ------------------------------------------- closes_deferred auto-resolve (#234)

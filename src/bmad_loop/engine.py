@@ -100,11 +100,19 @@ from .runs import (
     set_owner_run_dir,
     task_spec_path,
 )
-from .sprintstatus import ACTIONABLE_STATUSES, STATUS_ORDER, SprintStatusError
+from .sprintstatus import (
+    ACTIONABLE_STATUSES,
+    STATUS_ORDER,
+    SprintStatusError,
+    SprintStatusWriteRefused,
+)
 from .sprintstatus import advance as sprint_advance
 from .sprintstatus import advanced_bytes as sprint_advanced_bytes
 from .sprintstatus import load as load_sprint_status
-from .sprintstatus import next_actionable, parse_selector
+from .sprintstatus import (
+    next_actionable,
+    parse_selector,
+)
 from .sprintstatus import status_in_bytes as sprint_status_in_bytes
 from .sprintstatus import story_status as sprint_story_status
 from .statemachine import advance
@@ -4034,7 +4042,12 @@ class Engine:
         host death between the write and any save). A death after a save that
         carried the park-stage intent — none happens inside this method, but a
         raise that escaped the unwind would leave one — is not recognized as this
-        write, and the row stays where it is."""
+        write, and the row stays where it is.
+
+        A demotion the writer REFUSES (``SprintStatusWriteRefused``, #842) wrote
+        nothing, so it escalates before the gate with no unwind and the prior
+        ``board_advance_intended`` untouched. The unwind above is for a demotion
+        that landed; its re-advance meets the row the demotion just rewrote."""
         board = self.workspace.paths.sprint_status
         # A board gone by now is the gate's to refuse (sprint None -> retry), not a
         # crash here: `advance` answers None over a missing file, `load` raises.
@@ -4052,7 +4065,14 @@ class Engine:
                 sprint_advance(board, task.story_key, "done")
             task.board_advance_intended = prior_intended
 
-        sprint_advance(board, task.story_key, verify.AWAITING_OPERATOR, allow_regression=True)
+        try:
+            sprint_advance(board, task.story_key, verify.AWAITING_OPERATOR, allow_regression=True)
+        except SprintStatusWriteRefused as refused:
+            # Nothing was written, so there is nothing to unwind and the prior
+            # intent still stands; a row the writer cannot rewrite is operator
+            # work, not a reason to retry the review.
+            self._escalate_board_refusal(task, refused, "review pass")
+            raise  # unreachable: `_escalate` raises RunPaused
         task.board_advance_intended = verify.AWAITING_OPERATOR
         try:
             outcome = self._gate_review_demotion(task, result)
@@ -4948,7 +4968,16 @@ class Engine:
         Not saved here, deliberately: the write it describes lands in a unit
         worktree that a host loss discards whole, and the re-drive re-derives the
         intent from the spec. Only the merge makes that write survivable, and every
-        path to a merge persists the task before reaching it."""
+        path to a merge persists the task before reaching it.
+
+        A row the writer refuses (``SprintStatusWriteRefused``: the row is there,
+        below target, in a shape the line edit cannot rewrite) escalates instead of
+        recording anything (#842). Left to ``verify_dev`` it read as an ordinary
+        stage mismatch — a session that never finished — so a finished attempt was
+        rolled back and its story re-driven into the same refusal. The pause keeps
+        the attempt's tree and spec for the operator, who repairs the row and then
+        adopts or re-drives; ``board_advance_intended`` stays unset because no board
+        holds the advance."""
         if not self._generic_dev():
             return
         spec_file = result_mapping(result_json).get("spec_file")
@@ -4973,16 +5002,41 @@ class Engine:
         # a board that already agrees with the spec than against one two stages
         # behind it.
         if self._operator_park_enabled() and status == verify.AWAITING_OPERATOR:
-            sprint_advance(
-                self.workspace.paths.sprint_status, task.story_key, verify.AWAITING_OPERATOR
-            )
-            task.board_advance_intended = verify.AWAITING_OPERATOR
+            target = verify.AWAITING_OPERATOR
+        elif status == success_status:
+            target = "review" if review_enabled else "done"
+        else:
             return
-        if status != success_status:
-            return
-        target = "review" if review_enabled else "done"
-        sprint_advance(self.workspace.paths.sprint_status, task.story_key, target)
+        try:
+            sprint_advance(self.workspace.paths.sprint_status, task.story_key, target)
+        except SprintStatusWriteRefused as refused:
+            # The session reached its terminal; the board row is what failed. Pause
+            # here, BEFORE `verify_dev` reads the board, records no intent (nothing
+            # landed for a carry to re-apply), and keep the attempt the way the dev
+            # loop's own escalation arm does.
+            self._record_dev_spec(task, result_json)
+            self._disarm_ledger_snapshot(task)
+            self._escalate_board_refusal(task, refused, "dev session")
+            raise  # unreachable: `_escalate` raises RunPaused
         task.board_advance_intended = target
+
+    def _escalate_board_refusal(
+        self, task: StoryTask, refused: SprintStatusWriteRefused, leg: str
+    ) -> None:
+        """Pause on a sprint-board row the sole writer would not rewrite (#842).
+
+        Shared by the two terminal writes a finished session's work hangs on — the
+        post-dev mirror and the review demotion — and by nothing best effort: the
+        carry journals its refusal and returns. ``_escalate`` raises ``RunPaused``,
+        so the in-flight attempt is neither verified, retried, nor rolled back, and
+        the reason carries the writer's own message (board, row, current, target,
+        reason token, repair)."""
+        self._escalate(
+            task,
+            f"the {leg} for {task.story_key} reached its terminal status, but the sprint "
+            f"board refused the advance, so its work is kept rather than rolled back or "
+            f"retried: {refused}",
+        )
 
     def _post_dev_accepted_sync(self, task: StoryTask, result_json: dict | None) -> None:
         """Write bookkeeping that is valid only after a dev attempt is accepted.
@@ -9378,9 +9432,12 @@ class Engine:
         Fail CLOSED, like its sibling and for its reason, and that covers
         ``advanced_bytes`` returning None: a row missing from HEAD's board leaves nothing
         to compare against, and "I could not compute the intended content" must not read
-        as "the tree is mine". A row the writer declines to rewrite is NOT that case — it
-        hands HEAD's bytes back unchanged, and the compare then rightly accepts a board
-        nobody touched."""
+        as "the tree is mine". A row the writer refuses to rewrite fails closed the same
+        way: ``advanced_bytes`` raises ``SprintStatusWriteRefused`` for it (#842) where it
+        used to hand HEAD's bytes back unchanged, and an untouched — or someone else's —
+        board compared against those would be accepted as an advance no board holds. A
+        HEAD blob that does not parse (``SprintStatusError``) has no intended content
+        either."""
         repo = self.paths.repo_root
         try:
             rel = board.resolve().relative_to(repo.resolve()).as_posix()
@@ -9394,7 +9451,7 @@ class Engine:
             # stages it OVER the index, so a staged version distinct from both HEAD and
             # this advance is destroyed rather than committed.
             return verify.index_holds_no_foreign_content(repo, rel, intended)
-        except (verify.GitError, OSError, RuntimeError, ValueError):
+        except (verify.GitError, OSError, RuntimeError, ValueError, SprintStatusError):
             return False
 
     def _carry_board_advance(self, task: StoryTask) -> None:
@@ -9467,13 +9524,17 @@ class Engine:
 
         What ``advance`` CAN report is that the row did not REACH ``target``, and
         that is a different question from whether it wrote — the one this method has
-        to ask before naming its outcome ``board-advance-carried``. It answers
+        to ask before naming its outcome ``board-advance-carried``. It reports
         below-target in two shapes, both of them a carry that did not happen: `None`
         when the story's row is gone (deleted or renamed while the isolated session
-        held its own copy, or before a merge-to-carry replay), and
-        the current status when the row is there but ``_set_mapping_value``'s line
-        regex could not rewrite it — a quoted or block-scalar key, which
-        ``story_status``'s full YAML parse resolves and the writer then declines.
+        held its own copy, or before a merge-to-carry replay), and a raised
+        ``SprintStatusWriteRefused`` when the row is there but the line edit cannot
+        rewrite it — a quoted key, an alias, a block scalar, which ``story_status``'s
+        full YAML parse resolves and the writer then refuses (#842). The refusal is
+        caught here and journaled with its ``status`` and ``refuse_cause`` (the
+        writer's stable reason token) rather than raised: uncaught, it would end
+        finalization, and every resume that replays the carry, on a row a retry
+        cannot repair.
         A whole board that is gone is the shape ``advance`` cannot be allowed to
         answer for at all: it returns None over a missing file, but the pre-advance
         row probe's own read raises ``SprintStatusError`` there — so the caller
@@ -9519,7 +9580,19 @@ class Engine:
                     status=foreign,
                 )
                 return
-        landed = sprint_advance(board, task.story_key, target)
+        try:
+            landed = sprint_advance(board, task.story_key, target)
+        except SprintStatusWriteRefused as refused:
+            # The row is there and below target, and the writer wrote nothing:
+            # the same failed carry, with the writer's reason token beside it.
+            self.journal.append(
+                "board-advance-carry-failed",
+                story_key=task.story_key,
+                target=target,
+                status=refused.current,
+                refuse_cause=refused.reason,
+            )
+            return
         if not _at_or_past(landed, target):
             self.journal.append(
                 "board-advance-carry-failed",

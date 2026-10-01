@@ -38,6 +38,12 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Read and write CHANGELOG and version files as UTF-8 in the release scripts; a portability
+  guard now refuses file `open` / `read_text` / `write_text` without an explicit encoding in
+  `src/bmad_loop` (DW-513).
+- Keep a Windows release cut byte-stable: the release scripts write CHANGELOG and version
+  files with LF line endings, and exchange `git`/`gh` text — release notes included — as
+  UTF-8 rather than the ANSI code page (DW-517, DW-518).
 - Ignore hook events from nested coding-CLI sessions that inherit the relay environment,
   so a child's `Stop`/`SessionEnd` no longer completes or crashes the launched session:
   an id that announces its own `SessionStart` after the launched session's first is
@@ -65,6 +71,24 @@ breaking changes may land in a minor release.
 - Edit only the sprint-status row the YAML parser reads, never look-alike text in a block
   scalar or another mapping, and leave a multi-line value the writer cannot read whole
   untouched instead of rewriting only its first line.
+- Raise `SprintStatusWriteRefused` when an existing sprint-status row below its target is
+  in a shape the writer cannot rewrite, instead of returning the unchanged status: a
+  finished dev or review-demotion pass escalates with board, row, statuses and reason and
+  keeps its work (no rollback, no retry); the board carry journals
+  `board-advance-carry-failed` with `refuse_cause`; `bmad-loop confirm` exits 1 naming
+  the repair and keeps the park entry (follow-up to #842).
+- Replace only a sprint-status value's own text when advancing a row, keeping the
+  gap, inline comment, trailing whitespace and line ending as authored. A null row with a
+  comment (`key:  # note`) keeps its comment, and a bare `key:` row can now be advanced.
+  Refuse rows in a flow-style `{...}` mapping (`mapping-is-flow`) instead of publishing
+  invalid YAML, and any anchored value (`value-is-anchored`), aliased or not. A quoted value
+  with a glued comment (`'backlog'#c`) is now refused (`unreadable-value`) rather than
+  rewritten (DW-514, DW-516).
+- Advance the sprint-status row the reader reads, matched by its parsed key rather than
+  its text (`advance`'s epic lift now lifts a lone `epic-01` row as epic 1). Refuse two distinct keys that
+  read as one (`"2001-01-04"` and the date `2001-01-04`; `epic-1` and `epic-01`) as
+  `key-ambiguous`, publishing nothing, instead of rewriting a row the reader ignores or
+  regressing a `done` epic (DW-515).
 
 ## [0.13.0] — 2026-09-28
 

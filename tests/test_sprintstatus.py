@@ -518,3 +518,194 @@ def test_load_action_items_metadata_fault_raises_typed(project_tree, monkeypatch
     with pytest.raises(sprintstatus.SprintStatusError, match="could not be read") as exc_info:
         sprintstatus.load_action_items(project_tree.sprint_status)
     assert not isinstance(exc_info.value, sprintstatus.ActionItemsMalformed)
+
+
+# ------------------------------------------------- value-span splice (DW-514/516)
+#
+# The one-line writer replaces exactly the value node's source span. Driven
+# through `advanced_bytes`, the reproduction surface: each board below published
+# invalid YAML or lost its comment when the edit rewrote everything after `key:`.
+
+
+@pytest.mark.parametrize(
+    ("board", "reason"),
+    [
+        # rewriting the anchored text would leave `*st` dangling (or silently
+        # move every row that aliases it)
+        (b"development_status:\n  1-1-a: &st backlog\n  1-2-b: *st\n", "value-is-anchored"),
+        (b"development_status:\n  1-1-a: !!str &x backlog\n", "value-is-anchored"),
+        # the row's line also carries the flow mapping's closing brace
+        (b"development_status: {epic-1: in-progress,\n  1-1-a: backlog}\n", "mapping-is-flow"),
+    ],
+    ids=["anchored", "tag-then-anchor", "flow-mapping"],
+)
+def test_advance_refuses_anchored_and_flow_rows(tmp_path, board, reason):
+    """Ablation: drop the refusals in `_locate_row` and the anchored boards publish
+    a dangling alias or a dropped anchor, while the flow board falls back to
+    `unreadable-value` (its closing brace fails the tail check), which the
+    `reason` assertion catches."""
+    with pytest.raises(sprintstatus.SprintStatusWriteRefused) as exc_info:
+        sprintstatus.advanced_bytes(board, "1-1-a", "in-progress")
+    assert exc_info.value.reason == reason
+
+    p = tmp_path / "sprint-status.yaml"
+    p.write_bytes(board)
+    with pytest.raises(sprintstatus.SprintStatusWriteRefused) as exc_info:
+        sprintstatus.advance(p, "1-1-a", "in-progress")
+    assert exc_info.value.reason == reason
+    assert p.read_bytes() == board  # nothing published
+
+
+@pytest.mark.parametrize(
+    ("row", "expected"),
+    [
+        (b"  1-1-a:  # note\n", b"  1-1-a: in-progress  # note\n"),
+        (b"  1-1-a:\n", b"  1-1-a: in-progress\n"),
+        (b'  1-1-a: "a # b"  # real comment\n', b"  1-1-a: in-progress  # real comment\n"),
+        (b"  1-1-a: backlog  \n", b"  1-1-a: in-progress  \n"),
+        (b"  1-1-a: backlog  # c\r\n", b"  1-1-a: in-progress  # c\r\n"),
+        # a property-only value: the anchor scan must not reach the next row's key
+        (b"  1-1-a: !!str\n  &k 1-3-c: backlog\n", b"  1-1-a: in-progress\n  &k 1-3-c: backlog\n"),
+    ],
+    ids=[
+        "null-comment",
+        "bare-null",
+        "quoted-comment",
+        "trailing-whitespace",
+        "crlf-comment",
+        "tag-only-before-anchored-key",
+    ],
+)
+def test_advance_splices_only_the_value_span(row, expected):
+    """Every byte outside the value span — gap, comment, trailing whitespace,
+    terminator — survives as authored. Ablation: restore the old regex split and
+    the null+comment row loses `# note` while the bare null is refused."""
+    head = b"development_status:\n"
+    tail = b"  1-2-b: backlog\n"
+
+    out = sprintstatus.advanced_bytes(head + row + tail, "1-1-a", "in-progress")
+
+    assert out == head + expected + tail
+    assert sprintstatus.status_in_bytes(out, "1-1-a") == "in-progress"
+
+
+# ------------------------------------------------------ reader key identity (DW-515)
+#
+# The writer resolves its row by the key `load()` reads — `str()` of the
+# constructed key, epic/retro numbers as ints — not by the node's text. Two
+# distinct constructed keys reading as one leave the reader's answer to
+# iteration order, so the write path refuses them.
+
+
+@pytest.mark.parametrize(
+    ("board", "story_key", "refused_key", "current"),
+    [
+        # a str key and a date key, both `str()` to 2001-01-04: the reader reads
+        # the first (backlog), the old writer rewrote the date row (done)
+        (
+            b'development_status:\n  "2001-01-04": backlog\n  2001-01-04: done\n',
+            "2001-01-04",
+            "2001-01-04",
+            "backlog",
+        ),
+        # epic-1 and epic-01 are both epic 1: the reader's lift sees backlog
+        # (last wins), the old writer regressed the `epic-1: done` row
+        (
+            b"development_status:\n  epic-1: done\n  epic-01: backlog\n  1-1-a: backlog\n",
+            "1-1-a",
+            "epic-1",
+            "backlog",
+        ),
+        # the same collision as the first row, one key reached through a merge
+        (
+            b'development_status:\n  <<: {"2001-01-04": backlog}\n  2001-01-04: done\n',
+            "2001-01-04",
+            "2001-01-04",
+            "backlog",
+        ),
+    ],
+    ids=["str-date-collision", "epic-collision", "merge-explicit-collision"],
+)
+def test_advance_refuses_keys_the_reader_cannot_tell_apart(
+    tmp_path, board, story_key, refused_key, current
+):
+    """Ablation: resolve with `_last_entry(mapping, key)` again and the
+    str/date and merge boards publish an edit of the `done` row, while the epic
+    board regresses `epic-1: done` to in-progress — no raise anywhere."""
+    with pytest.raises(sprintstatus.SprintStatusWriteRefused) as exc_info:
+        sprintstatus.advanced_bytes(board, story_key, "in-progress")
+    err = exc_info.value
+    assert (err.reason, err.story_key, err.current, err.target) == (
+        "key-ambiguous",
+        refused_key,
+        current,
+        "in-progress",
+    )
+    assert err.path is None
+
+    p = tmp_path / "sprint-status.yaml"
+    p.write_bytes(board)
+    with pytest.raises(sprintstatus.SprintStatusWriteRefused) as exc_info:
+        sprintstatus.advance(p, story_key, "in-progress", now="02-06-2026 09:00")
+    err = exc_info.value
+    assert (err.reason, err.story_key, err.current, err.path) == (
+        "key-ambiguous",
+        refused_key,
+        current,
+        p,
+    )
+    assert "keep exactly one" in str(err)
+    assert p.read_bytes() == board  # nothing published: no story row, epic, or last_updated
+
+
+@pytest.mark.parametrize(
+    ("board", "expected", "epics"),
+    [
+        # a lone non-canonical epic key is still epic 1 to the reader: lift it
+        # under its own spelling (the old writer looked for `epic-1:` and skipped)
+        (
+            b"development_status:\n  epic-01: backlog\n  1-1-a: backlog\n",
+            b"development_status:\n  epic-01: in-progress\n  1-1-a: in-progress\n",
+            {1: "in-progress"},
+        ),
+        # an exact duplicate constructs to one key: last wins, not ambiguous
+        (
+            b"development_status:\n  1-1-a: backlog\n  1-1-a: backlog\n",
+            b"development_status:\n  1-1-a: backlog\n  1-1-a: in-progress\n",
+            {},
+        ),
+        # the folded collapse rewrites the row under its own key text too
+        (
+            b"development_status:\n  epic-01:\n    backlog\n  1-1-a: backlog\n",
+            b"development_status:\n  epic-01: in-progress\n  1-1-a: in-progress\n",
+            {1: "in-progress"},
+        ),
+    ],
+    ids=["non-canonical-lone-epic", "exact-duplicate", "folded-non-canonical-epic"],
+)
+def test_advance_edits_the_row_the_reader_reads(tmp_path, board, expected, epics):
+    """Ablation: match `key` instead of `row.key_text` in `_set_mapping_value`
+    and the lone `epic-01` row refuses `key-not-plain`, which the lift swallows,
+    so it stays `backlog`; resolve with `_last_entry` and it is never found.
+    Collapse the folded row under `{key}` instead of `{row.key_text}` and the
+    folded board publishes `epic-1: in-progress`."""
+    assert sprintstatus.advanced_bytes(board, "1-1-a", "in-progress") == expected
+
+    p = tmp_path / "sprint-status.yaml"
+    p.write_bytes(board)
+    assert sprintstatus.advance(p, "1-1-a", "in-progress") == "in-progress"
+    assert p.read_bytes() == expected
+    assert sprintstatus.story_status(p, "1-1-a") == "in-progress"
+    assert sprintstatus.load(p).epics == epics  # the reader sees the lifted row
+
+
+def test_other_epic_lift_refusals_stay_best_effort(tmp_path):
+    """Only `key-ambiguous` makes the lift loud: a quoted epic key the writer
+    declines (`key-not-plain`) is left as authored and the story still moves.
+
+    Ablation: raise on any `_Refused` epic edit and this reddens."""
+    board = b'development_status:\n  "epic-1": backlog\n  1-1-a: backlog\n'
+    p = tmp_path / "sprint-status.yaml"
+    p.write_bytes(board)
+    assert sprintstatus.advance(p, "1-1-a", "in-progress") == "in-progress"
+    assert p.read_bytes() == b'development_status:\n  "epic-1": backlog\n  1-1-a: in-progress\n'
