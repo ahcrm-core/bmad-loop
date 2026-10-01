@@ -9474,3 +9474,37 @@ async def test_replan_on_a_spec_that_vanished_after_render_names_the_anchored_pa
         await pilot.pause()
         assert any(f"no spec at {spec}" in m for m in notifications(app))
         assert not any("could not reset" in m for m in notifications(app))
+
+
+@pytest.mark.parametrize("key", ["R", "p"], ids=["resolve", "review"])
+async def test_resolve_on_a_deferred_pause_points_at_cli_reverify(project_tree, monkeypatch, key):
+    """DW-522: a run paused for manual recovery on a DEFERRED story has no
+    escalation to resolve — both the resolve verb and the pause viewer notify the
+    CLI's `resolve --reverify` / `resume` choice instead of launching the agent or
+    opening the escalation modal. Ablation, performed: drop the
+    `_deferred_pause_notified` check from either path and its row fails."""
+    launched: list[str] = []
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+    monkeypatch.setattr(launch, "start_resolve_detached", lambda proj, rid: launched.append(rid))
+    run_id = "20260611-100000-aaaa"
+    make_run(
+        project_tree.project,
+        run_id,
+        paused_stage="escalation",
+        paused_reason="ACTION REQUIRED — manual recovery",
+        paused_story_key="1-1-a",
+        tasks={"1-1-a": StoryTask(story_key="1-1-a", epic=1, phase=Phase.DEFERRED)},
+    )
+    hint = f"bmad-loop resolve {run_id} --reverify"
+    app = BmadLoopApp(project_tree.project)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        await until(pilot, lambda: dashboard(app).selected_run_id is not None)
+        await pilot.press(key)
+        await until(pilot, lambda: any(hint in m for m in notifications(app)))
+        assert isinstance(app.screen, DashboardScreen)
+    assert launched == []
+    [message] = [m for m in notifications(app) if hint in m]
+    assert "1-1-a was deferred, not escalated" in message
+    assert f"bmad-loop resume {run_id}" in message

@@ -21,6 +21,10 @@ probes` are set, every retry, defer or budget-exhausted decision (dev, fix,
   review, blocking workflow) re-runs them first, and a failing probe pauses the
   run as an environment fault instead — the attempt is not charged and the
   story's `env_fault_site` records where it was detected (DW-523).
+- Add `bmad-loop resolve <run> --reverify`: re-verify a DEFERRED (or
+  environment-fault escalated) in-place story's kept work at HEAD — the
+  `[verify]` commands are replayed, then review follows policy and the story
+  commits on a pass, with no dev session and no resolve agent (DW-522).
 
 ### Changed
 

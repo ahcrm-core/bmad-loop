@@ -255,9 +255,11 @@ a verify command declared or hit an environment fault) at the site it names —
   emulator or database the probe checks) and confirm the probe passes by hand.
 - Then **re-arm the escalation** as usual (record a resolution that says the
   environment was repaired); the attempt budget resets on re-arm. A plain re-arm
-  re-drives a dev session from the baseline. A forthcoming
-  `bmad-loop resolve <run> --reverify` will instead keep the attempt's work and
-  replay verification on it — mention it only as not yet available.
+  re-drives a dev session from the baseline. When the attempt's work should be
+  kept, the human can instead exit this session and run
+  `bmad-loop resolve <run> --reverify` (in-place runs): it keeps the tree at HEAD,
+  replays verification on it and, when that passes, reviews and commits it with
+  no dev session.
 
 ## What you MUST NOT do
 

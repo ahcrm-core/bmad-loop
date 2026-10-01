@@ -271,6 +271,7 @@ RUN_STATE_TRANSACTIONS = {
     ("cli.py", "_resume_paused_run"),
     ("cli.py", "cmd_resolve"),
     ("cli.py", "_resolve_adopt"),
+    ("cli.py", "_resolve_reverify"),
     ("journal.py", "save_state"),
     ("runs.py", "rearm_escalation"),
     ("runs.py", "rearm_for_reverify"),
@@ -1221,6 +1222,11 @@ JOURNAL_KINDS = frozenset(
         # DW-522. A DEFERRED or environment-fault ESCALATED story re-armed for a
         # verify replay of its kept tree, from `runs._rearm_for_reverify_locked`.
         "story-reverify-armed",
+        # DW-522. The engine's `_finish_inflight` reverify arm entering the replay
+        # (`resume-reverify`), and the replay's `decide_reverify` routing
+        # (`reverify-decision`), from `Engine._resume_reverify`.
+        "resume-reverify",
+        "reverify-decision",
         "epic-boundary",
         "fix-decision",
         "fix-harvest-failed",

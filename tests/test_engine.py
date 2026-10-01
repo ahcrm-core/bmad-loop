@@ -38,6 +38,7 @@ from conftest import (
     fault_read_text,
     generic_dev_effect,
     git,
+    install_bmad_config,
     nested_repo_root_paths,
     plant_root_markers,
     refuse_to_resolve,
@@ -23920,3 +23921,257 @@ def test_ledger_restores_refuse_a_link_at_the_ledger_parent_below_the_mount(
         assert not outside_ledger.exists()
     else:
         assert outside_ledger.read_text(encoding="utf-8") == lands
+
+
+# ------------------------------------- DW-522: `resolve --reverify` engine replay
+
+
+def _committing_dev(project, story_key: str, name: str, *, followup_review: bool = False):
+    """A completed dev (or repair) session that finalizes the spec and COMMITS its
+    work as ``name`` — the reported shape: the attempt's product sits in commits."""
+
+    def effect(spec):
+        result = dev_effect(project, story_key, followup_review=followup_review)(spec)
+        (project.project / name).write_text(f"{name} work\n")
+        git(project.project, "add", name)
+        git(project.project, "commit", "-q", "-m", f"attempt work {name}")
+        return result
+
+    return effect
+
+
+def _reverify_policy(marker: Path, **kw) -> Policy:
+    """The reported config: in place, rollback OFF, two dev attempts, an e2e verify
+    command that passes only while ``marker`` (the container, outside the repo)
+    exists."""
+    kw.setdefault("gates", GatesPolicy(mode="none"))
+    return Policy(
+        notify=QUIET,
+        scm=ScmPolicy(rollback_on_failure=False),
+        limits=LimitsPolicy(max_dev_attempts=2),
+        verify=VerifyPolicy(commands=(_file_exists_cmd(marker),)),
+        **kw,
+    )
+
+
+def _deferred_in_place(project, tmp_path, *, followup_review: bool = False, **policy_kw):
+    """Run the reported scenario to its pause: both dev attempts commit, the e2e
+    verify fails both times (container down), the story DEFERS, and rollback-off
+    pauses the run for manual recovery with the work intact. Returns
+    (engine, marker, baseline)."""
+    # `resolve --reverify` locates the code root through the BMAD config
+    install_bmad_config(project)
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    marker = tmp_path / "container-up"
+    engine, adapter = make_engine(
+        project,
+        [
+            _committing_dev(project, "1-1-a", "e2e-1.txt", followup_review=followup_review),
+            _committing_dev(project, "1-1-a", "e2e-2.txt", followup_review=followup_review),
+        ],
+        policy=_reverify_policy(marker, **policy_kw),
+    )
+    summary = engine.run()
+    assert summary.paused
+    task = engine.state.tasks["1-1-a"]
+    assert task.phase == Phase.DEFERRED
+    assert [s.role for s in adapter.sessions] == ["dev", "dev"]
+    assert engine.state.paused_stage == PAUSE_ESCALATION
+    return engine, marker, task.baseline_commit
+
+
+def _rows(engine, kind: str) -> list[dict]:
+    return [e for e in Journal(engine.run_dir).entries() if e["kind"] == kind]
+
+
+def test_reverify_deferred_in_place_story_commits_without_a_dev_session(project, tmp_path):
+    """DW-522, the reported scenario: a deferred in-place story whose committed work
+    is green once the environment is back reaches DONE through `resolve --reverify`
+    with ZERO dev sessions — verify replays on HEAD, the work squashes into one story
+    commit, and the spec/board finish at done."""
+    engine, marker, baseline = _deferred_in_place(project, tmp_path)
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    # Which pause fired on the defer: NOT manual-recovery shape (c) but the
+    # owned-spec one — `_defer` stashes the spec into the run dir BEFORE its
+    # rollback, so `rollback_or_pause` finds the attempt-bound spec missing and
+    # pauses through `pause_for_owned_spec_recovery` (which tells the operator to
+    # reset — exactly what --reverify must steer them away from).
+    assert "rollback-owned-spec-manual-required" in kinds
+    assert "rollback-manual-required" not in kinds
+    assert "attempt-owned spec needs manual recovery" in engine.state.paused_reason
+    assert "bmad-loop resolve test-run --reverify" in engine.state.paused_reason
+
+    marker.write_text("up\n")  # the operator restarts the container
+    runs.rearm_for_reverify(engine.run_dir, project_root=project.project)
+    engine2, adapter2 = resume_engine(project, engine, [])
+    summary = engine2.run()
+
+    assert adapter2.sessions == []
+    assert not summary.paused
+    task = engine2.state.tasks["1-1-a"]
+    assert task.phase == Phase.DONE
+    assert task.reverify_from == ""
+    assert len(verify.commits_above(project.project, baseline)) == 1  # squashed
+    assert (project.project / "e2e-1.txt").is_file() and (project.project / "e2e-2.txt").is_file()
+    assert read_frontmatter(spec_path(project, "1-1-a"))["status"] == "done"
+    assert story_status(project.sprint_status, "1-1-a") == "done"
+    kinds = [e["kind"] for e in Journal(engine2.run_dir).entries()]
+    assert "resume-reverify" in kinds and "resume-restart" not in kinds
+    [decision] = _rows(engine2, "reverify-decision")
+    assert decision["action"] == "proceed" and decision["origin"] == "deferred"
+    replay = [
+        e
+        for e in _rows(engine2, "verify-command-result")
+        if e["verification_sequence"] == decision["verification_sequence"]
+    ]
+    assert [(e["verification_stage"], e["returncode"]) for e in replay] == [("dev", 0)]
+
+
+def test_reverify_runs_the_recommended_review(project, tmp_path):
+    """DW-522: a passing replay hands the kept work to the review loop under normal
+    policy — the dev result recommended a follow-up review, so exactly one review
+    session runs (and still no dev session) before the commit."""
+    engine, marker, _ = _deferred_in_place(project, tmp_path, followup_review=True)
+    marker.write_text("up\n")
+    runs.rearm_for_reverify(engine.run_dir, project_root=project.project)
+    engine2, adapter2 = resume_engine(
+        project, engine, [review_effect(project, "1-1-a", clean=True)]
+    )
+    engine2.run()
+
+    assert [s.role for s in adapter2.sessions] == ["review"]
+    assert engine2.state.tasks["1-1-a"].phase == Phase.DONE
+
+
+def test_reverify_with_the_environment_still_down_re_defers_without_a_session(project, tmp_path):
+    """DW-522: re-verifying before the environment is back fails the replay; a
+    DEFERRED origin goes back to DEFERRED (no retry, no dev session), the latch is
+    spent, and the tree is still the operator's to recover."""
+    engine, _marker, baseline = _deferred_in_place(project, tmp_path)
+    runs.rearm_for_reverify(engine.run_dir, project_root=project.project)
+    engine2, adapter2 = resume_engine(project, engine, [])
+    summary = engine2.run()
+
+    assert adapter2.sessions == []
+    assert summary.paused  # rollback OFF: the re-defer pauses for recovery again
+    task = load_state(engine2.run_dir).tasks["1-1-a"]
+    assert task.phase == Phase.DEFERRED
+    assert task.reverify_from == ""
+    [decision] = _rows(engine2, "reverify-decision")
+    assert decision["action"] == "defer" and decision["env_fault"] is False
+    assert decision["reason"].startswith("reverify failed: ")
+    assert len(verify.commits_above(project.project, baseline)) == 2  # kept, unsquashed
+
+
+def test_reverify_env_fault_replay_re_escalates(project, tmp_path):
+    """DW-522: a replay whose `[environment]` probe still fails is an environment
+    fault, never a re-defer — the story ESCALATES at site `verify:dev` (so it stays
+    reverifiable) without a session, and no `[verify]` command runs."""
+    engine, _marker, _ = _deferred_in_place(project, tmp_path)
+    rig = _env_rig(tmp_path, up=False)
+    policy = dataclasses.replace(engine.policy, environment=EnvironmentPolicy(probes=(rig.probe,)))
+    runs.rearm_for_reverify(engine.run_dir, project_root=project.project)
+    engine2, adapter2 = resume_engine(project, engine, [], policy=policy)
+    summary = engine2.run()
+
+    assert adapter2.sessions == []
+    assert summary.paused and engine2.state.paused_stage == PAUSE_ESCALATION
+    task = engine2.state.tasks["1-1-a"]
+    assert task.phase == Phase.ESCALATED
+    assert task.env_fault_site == "verify:dev"
+    [decision] = _rows(engine2, "reverify-decision")
+    assert decision["action"] == "pause" and decision["env_fault"] is True
+    assert decision["verification_sequence"] is None  # preflight: no command ran
+    assert "--reverify" in (engine2.run_dir / "ATTENTION").read_text()
+
+
+def test_reverify_of_an_env_fault_escalation_commits(project, tmp_path):
+    """DW-522 + DW-523: an attempt whose verify preflight probe failed escalates at
+    `verify:dev` with its committed work kept; once the environment is back,
+    `resolve --reverify` commits that work with no dev session."""
+    install_bmad_config(project)
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    rig = _env_rig(tmp_path, up=False)
+    policy = _env_policy(
+        rig,
+        _OK,
+        scm=ScmPolicy(rollback_on_failure=False),
+        limits=LimitsPolicy(max_dev_attempts=2),
+    )
+    engine, adapter = make_engine(
+        project, [_committing_dev(project, "1-1-a", "e2e-1.txt")], policy=policy
+    )
+    summary = engine.run()
+    assert summary.paused and [s.role for s in adapter.sessions] == ["dev"]
+    task = engine.state.tasks["1-1-a"]
+    assert task.phase == Phase.ESCALATED and task.env_fault_site == "verify:dev"
+    baseline = task.baseline_commit
+
+    rig.up.write_text("up\n")
+    outcome = runs.rearm_for_reverify(engine.run_dir, project_root=project.project)
+    assert outcome.story_key == "1-1-a"
+    engine2, adapter2 = resume_engine(project, engine, [])
+    engine2.run()
+
+    assert adapter2.sessions == []
+    task = engine2.state.tasks["1-1-a"]
+    assert task.phase == Phase.DONE and task.env_fault_site is None
+    [decision] = _rows(engine2, "reverify-decision")
+    assert decision["origin"] == "escalated" and decision["action"] == "proceed"
+    assert len(verify.commits_above(project.project, baseline)) == 1
+
+
+def test_reverify_arm_precedes_the_spec_approval_arm(project, tmp_path):
+    """DW-522: a re-armed task sits at DEV_VERIFY with a spec_file — the exact shape
+    of a spec-approval pause. The reverify arm must win, or `_resume_after_dev_verify`
+    reviews and COMMITS the kept work without replaying the (still failing) verify.
+    Ablation: move the `task.reverify_from` arm below the DEV_VERIFY + spec_file arm
+    in `_finish_inflight` and this story commits."""
+    engine, _marker, baseline = _deferred_in_place(project, tmp_path)
+    runs.rearm_for_reverify(engine.run_dir, project_root=project.project)
+    engine2, _ = resume_engine(project, engine, [])
+    engine2.run()
+
+    kinds = [e["kind"] for e in Journal(engine2.run_dir).entries()]
+    assert "resume-review" not in kinds
+    assert engine2.state.tasks["1-1-a"].phase == Phase.DEFERRED
+    assert engine2.state.tasks["1-1-a"].commit_sha is None
+    assert len(verify.commits_above(project.project, baseline)) == 2
+
+
+def test_reverify_honors_the_spec_approval_gate(project, tmp_path):
+    """DW-522: a passing replay is an accepted dev leg, so the spec-approval gate
+    pauses it exactly as `_drive_story` would — with the latch already spent, so
+    the approval resume goes through the ordinary review/commit arm and never
+    replays verify a second time."""
+    engine, marker, _ = _deferred_in_place(
+        project, tmp_path, gates=GatesPolicy(mode="per-story-spec-approval")
+    )
+    marker.write_text("up\n")
+    runs.rearm_for_reverify(engine.run_dir, project_root=project.project)
+    engine2, adapter2 = resume_engine(project, engine, [])
+    summary = engine2.run()
+
+    assert adapter2.sessions == []
+    assert summary.paused and engine2.state.paused_stage == PAUSE_SPEC_APPROVAL
+    task = load_state(engine2.run_dir).tasks["1-1-a"]
+    assert task.phase == Phase.DEV_VERIFY and task.reverify_from == ""
+
+    engine3, adapter3 = resume_engine(project, engine2, [])
+    engine3.run()
+    assert adapter3.sessions == []
+    assert engine3.state.tasks["1-1-a"].phase == Phase.DONE
+    kinds = [e["kind"] for e in Journal(engine3.run_dir).entries()]
+    assert kinds.count("reverify-decision") == 1 and "resume-review" in kinds
+
+
+def test_defer_pause_notice_names_resolve_reverify(project, tmp_path):
+    """DW-522: the deferral that pauses for manual recovery points at `resolve
+    --reverify` in both operator records — the ACTION REQUIRED pause notice and the
+    `story deferred` note. Ablation: drop the hint from `_defer`'s pause note and
+    the story-deferred half fails."""
+    engine, _marker, _ = _deferred_in_place(project, tmp_path)
+    attention = (engine.run_dir / "ATTENTION").read_text()
+    deferred_note = attention[attention.index("story deferred: 1-1-a") :]
+    assert "bmad-loop resolve test-run --reverify" in deferred_note
+    assert "bmad-loop resolve test-run --reverify" in engine.state.paused_reason

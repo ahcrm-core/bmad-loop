@@ -6087,7 +6087,7 @@ def deferred_stash_path(run_dir: Path, story_key: str, spec_name: str) -> Path:
     return run_dir / "deferred" / safe_segment(story_key) / spec_name
 
 
-def _latest_completed_dev_record(task: StoryTask) -> SessionRecord | None:
+def latest_completed_dev_record(task: StoryTask) -> SessionRecord | None:
     """The task's latest COMPLETED dev-role session record, or None. Fix sessions are
     recorded under the dev role too, so a repaired attempt's verdict is the one read."""
     return next(
@@ -6158,7 +6158,7 @@ def reverify_refusal(
         )
     if not task.spec_file:
         return f"story {story_key} has no story spec, so there is nothing to re-verify"
-    latest = _latest_completed_dev_record(task)
+    latest = latest_completed_dev_record(task)
     if latest is None or latest.result_json is None:
         return (
             f"story {story_key} has no completed dev session result to re-verify; "

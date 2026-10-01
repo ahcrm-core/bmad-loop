@@ -628,6 +628,8 @@ class BmadLoopApp(App[None]):
                 severity="warning",
             )
             return
+        if self._deferred_pause_notified(run_id, state):
+            return
         if _engine_possibly_live(run_dir):
             self.notify(f"run {run_id} may still be live — stop it first", severity="warning")
             return
@@ -642,6 +644,24 @@ class BmadLoopApp(App[None]):
             ),
             lambda ok: self._launch_resolve(run_id) if ok else None,
         )
+
+    def _deferred_pause_notified(self, run_id: str, state: RunState) -> bool:
+        """Point a pause on a DEFERRED story at the CLI (DW-522) and say so.
+
+        A deferred story pauses at the escalation stage (manual recovery), but
+        there is no escalation to resolve: the resolve agent and the re-arm would
+        both re-drive it from scratch. Its kept work is re-verified by
+        `bmad-loop resolve --reverify`, which the TUI does not drive."""
+        story_key = state.paused_story_key
+        task = state.tasks.get(story_key) if story_key else None
+        if task is None or task.phase != Phase.DEFERRED:
+            return False
+        self.notify(
+            f"{story_key} was deferred, not escalated: run `bmad-loop resolve {run_id} "
+            f"--reverify` (re-verify kept work) or `bmad-loop resume {run_id}` (move on)",
+            severity="warning",
+        )
+        return True
 
     def _launch_resolve(self, run_id: str) -> None:
         """Open the interactive resolve agent for run_id in a ctl window and
@@ -831,6 +851,8 @@ class BmadLoopApp(App[None]):
         self.push_screen(modal, done)
 
     def _review_escalation(self, run_id: str, run_dir: Path, state: RunState) -> None:
+        if self._deferred_pause_notified(run_id, state):
+            return
         story_key = state.paused_story_key or "?"
         task = state.tasks.get(story_key)
         expected_generation = task.generation if task is not None else None

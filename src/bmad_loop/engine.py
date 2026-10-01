@@ -43,6 +43,7 @@ from .escalation import (
     Decision,
     critical_session_reason,
     decide_dev,
+    decide_reverify,
     decide_review_session,
     display_critical_reason,
     display_pause_reason,
@@ -70,6 +71,7 @@ from .model import (
     SessionRecord,
     StoryTask,
     VerifyOutcome,
+    env_fault_site_reverifiable,
     result_mapping,
 )
 from .mountpaths import rebased_project
@@ -94,6 +96,7 @@ from .runs import (
     events_dir_for,
     graceful_stop_requested,
     kill_session,
+    latest_completed_dev_record,
     mount_root_identity,
     owner_run_dir,
     pinned_state_env,
@@ -2217,6 +2220,27 @@ class Engine:
                 finally:
                     self.workspace = prev
                 self._integrate_unit(task, unit)
+            elif task.reverify_from and task.phase == Phase.DEV_VERIFY:
+                # `resolve --reverify` (DW-522) re-armed a DEFERRED or env-fault
+                # ESCALATED story onto its kept attempt product. Ahead of the
+                # spec-approval arm below, which matches the same DEV_VERIFY +
+                # spec_file shape and would review and commit WITHOUT the verify
+                # replay this latch exists to run.
+                self.journal.append(
+                    "resume-reverify", story_key=task.story_key, origin=task.reverify_from
+                )
+                if mounted:
+                    unit = self._reopen_unit(task)
+                    prev = self.workspace
+                    self.workspace = unit.workspace
+                    try:
+                        self._resume_reverify(task)
+                    finally:
+                        self.workspace = prev
+                    self._integrate_unit(task, unit)
+                else:
+                    self._release_orphaned_mount(task)
+                    self._resume_reverify(task)
             elif task.phase == Phase.DEV_VERIFY and task.spec_file:
                 # paused at the spec-approval gate (or, in stories mode, a
                 # plan-checkpoint awaiting implementation — _resume_after_dev_verify
@@ -6262,7 +6286,8 @@ class Engine:
             f"({probe.reason}): {failed.command}",
             f"the attempt is not charged: an [environment] probe failed after the {role} "
             "failure, so the environment, not the story, is the likelier cause — fix the "
-            "environment, then re-arm the escalation (the attempt budget resets on re-arm)",
+            "environment, then re-arm the escalation (the attempt budget resets on re-arm), "
+            "or keep the attempt's work with `bmad-loop resolve <run> --reverify`",
         ]
         if decision.reason:
             lines.append(f"withheld {decision.action}: {decision.reason[:500]}")
@@ -6456,6 +6481,88 @@ class Engine:
         self.journal.append("resume-review", story_key=task.story_key)
         self._finish_post_dev_accepted_sync(task)
         self._review_and_commit(task)
+
+    def _resume_reverify(self, task: StoryTask) -> None:
+        """Replay dev verification against the kept attempt product (DW-522).
+
+        `runs.rearm_for_reverify` moved a DEFERRED or env-fault ESCALATED story to
+        DEV_VERIFY with `reverify_from` latched; the tree (HEAD plus its dirty
+        state) is the attempt, and no dev session runs. The replay re-derives the
+        board from the latest completed dev result, re-runs the artifact gate and,
+        when it passes, the `[verify]` commands (environment preflight included),
+        then routes through the pure `decide_reverify`: PROCEED continues exactly
+        as an accepted dev leg does in `_drive_story` (post_dev_phase workflows,
+        the spec-approval gate, review per policy, commit); DEFER re-defers; PAUSE
+        escalates. Nothing is charged — the replay never retries.
+
+        The latch is cleared in memory BEFORE any decision acts, so the save each
+        action makes persists it cleared: a crash mid-defer then replays through
+        the defer arm, never through a second verify replay. The accepted-session
+        latch is deliberately not stamped: the generation the re-arm bumped means
+        no record matches the current attempt, and story runs never read it."""
+        origin = task.reverify_from
+        record = latest_completed_dev_record(task)
+        if record is None or record.result_json is None:
+            task.reverify_from = ""
+            self._escalate(task, "reverify: no completed dev result to re-verify")
+            return
+        result_json = record.result_json
+        self._disarm_ledger_snapshot(task)
+        # The replay-safe board writer (never-regress, latest-wins); a refused row
+        # escalates through `_escalate_board_refusal` as on the dev leg.
+        self._post_dev_state_sync(task, result_json)
+        outcome = self._verify_dev_artifacts(task, result_json)
+        verified = NO_VERIFY_COMMANDS
+        if outcome.ok:
+            outcome, verified = self._verify_commands_with_results(task, "dev")
+        self._emit(
+            "post_dev_verify",
+            task,
+            # no session ran: the replay verified a kept product
+            session_status=None,
+            result_json=result_json,
+            verify_reason=outcome.reason,
+            command_results=verified.results,
+            verification_stage=verified.stage,
+            verification_sequence=verified.sequence,
+        )
+        decision = decide_reverify(task, outcome)
+        self.journal.append(
+            "reverify-decision",
+            story_key=task.story_key,
+            origin=origin,
+            action=str(decision.action),
+            reason=decision.reason,
+            env_fault=outcome.env_fault,
+            verification_sequence=verified.sequence,
+        )
+        task.reverify_from = ""
+        if decision.action == Action.PROCEED:
+            self._save()
+            self._emit("post_dev_phase", task)
+            if self._run_workflows("post_dev_phase", task, task.attempt):
+                return
+            # parity with `_drive_story`'s accepted dev leg
+            if gates.pause_after_spec(self.policy):
+                gates.notify(
+                    self.policy,
+                    self.run_dir,
+                    f"spec ready for approval: {task.story_key}",
+                    f"review {self._operator_spec_path(task)}, then "
+                    f"`bmad-loop resume {self.state.run_id}`",
+                )
+                raise RunPaused(
+                    f"awaiting spec approval for {task.story_key}",
+                    PAUSE_SPEC_APPROVAL,
+                    task.story_key,
+                )
+            self._review_and_commit(task)
+        elif decision.action == Action.DEFER:
+            self._defer(task, decision.reason)
+        elif outcome.env_fault:
+            self._escalate_env(task, decision.reason, site="verify:dev")
+        else:
+            self._escalate(task, decision.reason)
 
     def _after_story(self, task: StoryTask) -> None:
         """Hook fired once a story is fully processed and (under isolation)
@@ -8865,7 +8972,8 @@ class Engine:
                     reason,
                     note=" — the tree was NOT rolled back: the run paused for manual "
                     "recovery first (see the ACTION REQUIRED notice for where the "
-                    "attempt's work is)",
+                    "attempt's work is); if only the environment was broken, `bmad-loop "
+                    f"resolve {self.state.run_id} --reverify` re-verifies the kept work",
                 )
                 raise
             # The reset reverts a *tracked* ledger's uncommitted edits, so the
@@ -9978,11 +10086,18 @@ class Engine:
                 env_fault_site=task.env_fault_site,
             )
         displayed = display_critical_reason(reason, task.spec_file)
+        # An environment fault that left a verifiable product can keep it (DW-522).
+        reverify = (
+            f"; or fix the environment and keep the work with "
+            f"`bmad-loop resolve {self.state.run_id} --reverify`"
+            if env_fault_site_reverifiable(task)
+            else ""
+        )
         gates.notify(
             self.policy,
             self.run_dir,
             f"CRITICAL escalation: {task.story_key}",
-            f"{displayed} — resolve, then `bmad-loop resume {self.state.run_id}`",
+            f"{displayed} — resolve, then `bmad-loop resume {self.state.run_id}`{reverify}",
         )
         self._save()
         raise RunPaused(reason, PAUSE_ESCALATION, task.story_key)

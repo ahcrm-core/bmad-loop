@@ -4675,6 +4675,31 @@ def test_pause_committed_wording_offers_accept_baseline(project, tmp_path):
     assert "bmad-loop resume run-1 --accept-baseline" in excinfo.value.reason
 
 
+@pytest.mark.parametrize("deferred", [True, False], ids=["deferred", "escalated"])
+def test_manual_recovery_pauses_point_a_deferred_story_at_resolve_reverify(
+    project, tmp_path, deferred
+):
+    """DW-522: both manual-recovery pauses on a DEFERRED story name `resolve
+    --reverify` — the gesture that keeps the work instead of the reset the notice
+    otherwise walks the operator through. Any other phase gets no such hint.
+    Ablation: drop either `if task.phase == Phase.DEFERRED` append and its half
+    fails."""
+    repo = project.project
+    flow = _make_flow(workspace=Workspace.default(project), run_dir=tmp_path)
+    task = _task(repo)
+    task.phase = Phase.DEFERRED if deferred else Phase.ESCALATED
+    _commit_something(repo)
+    hint = "bmad-loop resolve run-1 --reverify"
+
+    with pytest.raises(_Pause) as manual:
+        flow.pause_for_manual_recovery(task, task.baseline_commit)
+    with pytest.raises(_Pause) as owned:
+        flow.pause_for_owned_spec_recovery(task, str(repo / "spec.md"), "boom")
+
+    assert (hint in manual.value.reason) is deferred
+    assert (hint in owned.value.reason) is deferred
+
+
 # ------------------------------------------ DW-371: restart park notice / adoption
 
 

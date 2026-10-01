@@ -16,6 +16,7 @@ import pytest
 import yaml
 from conftest import (
     _OK,
+    _REVERIFY_KEY,
     MISSING_TOOL_CMD,
     NUL_PATH_RESOLVE_FAULTS,
     PROJECT_MARKER_CMD,
@@ -23,6 +24,7 @@ from conftest import (
     REPO_ROOT_MARKER_CMD,
     UNDECODABLE_LEDGER,
     UNRESOLVABLE,
+    _reverify_run,
     assert_run_state_lock_held,
     escalated_run,
     fault_metadata_probe,
@@ -18231,3 +18233,149 @@ def test_resume_accept_baseline_latches_for_one_resume_only(project, monkeypatch
     assert cli.main(argv) == 0
     assert seen == [True, False]
     assert load_state(run_dir).accept_baseline is False
+
+
+# ----------------------------------------------- resolve --reverify (DW-522)
+
+
+def _reverify_project(tmp_path):
+    """A deferred in-place run (`conftest._reverify_run`) and its project root."""
+    run_dir, spec = _reverify_run(tmp_path)
+    return run_dir, spec.parents[2]
+
+
+def _resolve_reverify(project, *extra):
+    return cli.main(["resolve", "--project", str(project), "r1", "--reverify", *extra])
+
+
+def test_resolve_reverify_rearms_and_resumes(tmp_path, monkeypatch, capsys):
+    from bmad_loop.journal import Journal, load_state
+    from bmad_loop.model import Phase
+
+    run_dir, project = _reverify_project(tmp_path)
+    resumed = []
+    monkeypatch.setattr(cli, "_resume_paused_run", lambda proj, rd: resumed.append(rd) or 0)
+
+    rc = _resolve_reverify(project, "--resume")
+
+    assert rc == 0 and resumed == [run_dir]
+    out = capsys.readouterr()
+    assert "No dev session and no resolve agent run" in out.err
+    assert "included in the story's squashed commit" in out.err
+    assert f"re-armed {_REVERIFY_KEY} for re-verification" in out.out
+    task = load_state(run_dir).tasks[_REVERIFY_KEY]
+    assert task.phase == Phase.DEV_VERIFY and task.reverify_from == "deferred"
+    assert [e["kind"] for e in Journal(run_dir).entries()].count("story-reverify-armed") == 1
+
+
+def test_resolve_reverify_no_resume_persists_the_latch(tmp_path, monkeypatch, capsys):
+    from bmad_loop.journal import load_state
+
+    run_dir, project = _reverify_project(tmp_path)
+    monkeypatch.setattr(
+        cli, "_resume_paused_run", lambda *_a: pytest.fail("--no-resume must not resume")
+    )
+
+    rc = _resolve_reverify(project, "--no-resume")
+
+    assert rc == 0
+    assert "resume when ready: bmad-loop resume r1" in capsys.readouterr().out
+    assert load_state(run_dir).tasks[_REVERIFY_KEY].reverify_from == "deferred"
+
+
+def test_resolve_reverify_cancel_writes_nothing(tmp_path, monkeypatch, capsys):
+    run_dir, project = _reverify_project(tmp_path)
+    before = _state_bytes(run_dir)
+    monkeypatch.setattr(cli, "_confirm", lambda _q: False)
+
+    rc = _resolve_reverify(project)
+
+    assert rc == 0
+    assert "cancelled" in capsys.readouterr().out
+    assert _state_bytes(run_dir) == before
+
+
+@pytest.mark.parametrize(
+    "other", [["--adopt-branch"], ["--restore-patch", "p.patch"]], ids=["adopt", "restore"]
+)
+def test_resolve_reverify_is_mutually_exclusive_with_adopt_and_restore(tmp_path, capsys, other):
+    _run_dir, project = _reverify_project(tmp_path)
+    with pytest.raises(SystemExit) as exc:
+        _resolve_reverify(project, *other)
+    assert exc.value.code == 2
+    assert "not allowed with argument" in capsys.readouterr().err
+
+
+def test_resolve_reverify_refusals_leave_state_untouched(tmp_path, monkeypatch, capsys):
+    """A story the replay cannot claim is refused BEFORE the statement and the
+    prompt, with state.json unchanged. Ablation, performed: delete the
+    `runs.reverify_refusal` early exit in `_resolve_reverify` and the prompt is
+    reached (the locked re-arm would still refuse, but only after asking)."""
+    from bmad_loop.journal import load_state, save_state
+    from bmad_loop.model import Phase, StoryTask
+
+    run_dir, project = _reverify_project(tmp_path)
+    state = load_state(run_dir)
+    # a later story was picked: an in-place replay would squash its work in too
+    state.tasks["1-1-b"] = StoryTask(story_key="1-1-b", epic=1, phase=Phase.PENDING)
+    save_state(run_dir, state)
+    before = _state_bytes(run_dir)
+    monkeypatch.setattr(cli, "_confirm", lambda _q: pytest.fail("prompted for a refused replay"))
+
+    rc = _resolve_reverify(project)
+
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "a later story was picked" in err and "re-verifying" not in err
+    assert _state_bytes(run_dir) == before
+
+
+def test_resolve_on_a_deferred_task_without_reverify_hints_the_flag(tmp_path, monkeypatch, capsys):
+    """A bare `resolve` on a deferred story names `--reverify` instead of the generic
+    "no escalated story" refusal, and writes nothing. Ablation, performed: delete the
+    DEFERRED hint branch in `cmd_resolve` and the generic refusal prints instead."""
+    run_dir, project = _reverify_project(tmp_path)
+    before = _state_bytes(run_dir)
+    monkeypatch.setattr(cli, "_confirm", lambda _q: pytest.fail("prompted"))
+
+    rc = cli.main(["resolve", "--project", str(project), "r1"])
+
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert f"story {_REVERIFY_KEY} is deferred, not escalated" in err
+    assert "bmad-loop resolve r1 --reverify" in err
+    assert _state_bytes(run_dir) == before
+
+
+@pytest.mark.parametrize("force", [True, False], ids=["force", "no-force"])
+def test_resolve_reverify_force_unknown_proceeds(tmp_path, monkeypatch, capsys, force):
+    from bmad_loop.journal import load_state
+
+    run_dir, project = _reverify_project(tmp_path)
+    before = _state_bytes(run_dir)
+    monkeypatch.setattr(runs, "engine_liveness", lambda _rd: "unknown")
+    monkeypatch.setattr(cli, "_resume_paused_run", lambda *_a: 0)
+
+    rc = _resolve_reverify(project, "--resume", *(["--force"] if force else []))
+
+    if force:
+        assert rc == 0
+        assert load_state(run_dir).tasks[_REVERIFY_KEY].reverify_from == "deferred"
+    else:
+        assert rc == 1
+        assert "unverifiable pid" in capsys.readouterr().err
+        assert _state_bytes(run_dir) == before
+
+
+def test_resolve_reverify_never_launches_the_resolve_agent(tmp_path, monkeypatch):
+    """--reverify runs no interactive session even without --no-interactive: the
+    agent, the adapters and the escalation re-arm are never reached."""
+    from bmad_loop import resolve
+
+    _run_dir, project = _reverify_project(tmp_path)
+    monkeypatch.setattr(resolve, "run_session", lambda *a, **k: pytest.fail("ran the agent"))
+    monkeypatch.setattr(cli, "_make_adapters", lambda *a, **k: pytest.fail("built adapters"))
+    monkeypatch.setattr(runs, "rearm_escalation", lambda *a, **k: pytest.fail("re-armed"))
+    monkeypatch.setattr(cli, "_resume_paused_run", lambda *_a: 0)
+
+    assert _resolve_reverify(project, "--resume") == 0

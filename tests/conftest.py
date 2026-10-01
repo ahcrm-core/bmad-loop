@@ -2555,3 +2555,86 @@ def escalated_run(
     state.run_dir_identity = platform_util.root_identity_record(run_dir)
     save_state(run_dir, state)
     return EscalatedRun(run_dir=run_dir, state=state, task=task)
+
+
+# DW-522: an in-place run paused on a story whose attempt committed above its
+# baseline — shared by the `rearm_for_reverify` (tests/test_runs.py) and
+# `resolve --reverify` (tests/test_cli.py) tests.
+_REVERIFY_KEY = "1-1-a"
+_REVERIFY_SPEC_REL = "_bmad-output/implementation-artifacts/1-1-a.md"
+_REVERIFY_SPEC_BYTES = (
+    b"---\r\ntitle: t\r\nstatus: in-review\r\n---\r\n\r\n## Intent\r\n\r\nbody\r\n"
+)
+
+
+def _reverify_run(tmp_path, *, phase="deferred", spec="live", env_fault_site=None):
+    """An in-place run paused on a story whose attempt committed above its baseline:
+    the reported shape (isolation none, rollback off). `phase` is the story's terminal
+    phase; `spec` is "live" (in the artifacts dir) or "stashed" (moved under the run
+    dir the way `Engine._stash_deferred_artifacts` moves it)."""
+    from bmad_loop.model import PAUSE_ESCALATION, Phase, SessionRecord
+
+    project = tmp_path / "proj"
+    config = project / "_bmad" / "bmm" / "config.yaml"
+    config.parent.mkdir(parents=True)
+    config.write_text(
+        "implementation_artifacts: '{project-root}/_bmad-output/implementation-artifacts'\n"
+        "planning_artifacts: '{project-root}/_bmad-output/planning-artifacts'\n",
+        encoding="utf-8",
+    )
+    (project / ".gitignore").write_text(".bmad-loop/\n", encoding="utf-8")
+    git(project, "init", "-q", "-b", "main")
+    git(project, "config", "user.email", "test@test")
+    git(project, "config", "user.name", "test")
+    git(project, "add", "-A")
+    git(project, "commit", "-q", "-m", "initial")
+    baseline = git(project, "rev-parse", "HEAD")
+    (project / "app.py").write_text("print('attempt')\n", encoding="utf-8")
+    git(project, "add", "app.py")
+    git(project, "commit", "-q", "-m", "attempt")
+
+    run_dir = project / ".bmad-loop" / "runs" / "r1"
+    spec_path = project / _REVERIFY_SPEC_REL
+    spec_path.parent.mkdir(parents=True)
+    if spec == "live":
+        spec_path.write_bytes(_REVERIFY_SPEC_BYTES)
+    else:
+        stash = runs.deferred_stash_path(run_dir, _REVERIFY_KEY, spec_path.name)
+        stash.parent.mkdir(parents=True)
+        stash.write_bytes(_REVERIFY_SPEC_BYTES)
+
+    task = StoryTask(
+        story_key=_REVERIFY_KEY,
+        epic=1,
+        phase=Phase.DEFERRED if phase == "deferred" else Phase.ESCALATED,
+        attempt=2,
+        review_cycle=1,
+        followup_reviews_spent=1,
+        baseline_commit=baseline,
+        baseline_untracked=[],
+        spec_file=_REVERIFY_SPEC_REL,
+        defer_reason="verify failed: e2e" if phase == "deferred" else None,
+        env_fault_site=env_fault_site,
+        salvage_refile_pending=True,
+        resolved_redrive=False,
+        board_advance_intended="review",
+    )
+    task.sessions.append(
+        SessionRecord(
+            task_id="1-1-a-dev-2", role="dev", status="completed", result_json={"status": "done"}
+        )
+    )
+    state = RunState(
+        run_id="r1",
+        project=str(project),
+        started_at="2026-10-01T10:00:00",
+        repo_root=str(project.resolve()),
+        paused_reason="manual recovery",
+        paused_stage=PAUSE_ESCALATION,
+        paused_story_key=_REVERIFY_KEY,
+        tasks={_REVERIFY_KEY: task},
+    )
+    save_state(run_dir, state)
+    state.run_dir_identity = platform_util.root_identity_record(run_dir)
+    save_state(run_dir, state)
+    return run_dir, spec_path

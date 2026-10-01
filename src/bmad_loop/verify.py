@@ -9612,7 +9612,8 @@ def _env_fault_outcome(result: CommandResult, reason: str, cause: str) -> Verify
         f"verify environment fault ({reason}): {result.command}\n"
         f"{_ENV_FAULT_CLAUSES[cause]} — this is the run environment, "
         "not the story; fix the environment, then re-arm the escalation "
-        f"(the attempt budget resets on re-arm){output}",
+        "(the attempt budget resets on re-arm), or keep the attempt's work with "
+        f"`bmad-loop resolve <run> --reverify` (verify replayed, no dev session){output}",
         env_fault=True,
         env_fault_cause=cause,
     )
