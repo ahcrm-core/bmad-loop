@@ -1492,6 +1492,179 @@ def test_retrying_rmtree_never_retries_a_probe(tmp_path, monkeypatch):
     assert root.exists()
 
 
+def _dir_not_empty() -> OSError:
+    """Win32's ERROR_DIR_NOT_EMPTY, which CPython maps to ENOTEMPTY. On a real
+    host a genuinely non-empty directory reports this same 145; only `.winerror`
+    tells it from a POSIX-shaped ENOTEMPTY."""
+    exc = OSError(errno.ENOTEMPTY, "directory not empty")
+    exc.winerror = 145  # pyright: ignore[reportAttributeAccessIssue]
+    return exc
+
+
+def _flaky_rmdir(monkeypatch, target_name: str, failures: int | None, exc: OSError):
+    """Patch ``os.rmdir`` (the one ``shutil.rmtree`` calls) to raise ``exc`` for
+    the directory named ``target_name`` — ``failures`` times, or forever when
+    ``None``. Matched by basename: the fd-based walk passes a bare name plus
+    ``dir_fd``, the handler's retry the full path."""
+    calls = {"n": 0}
+    real_rmdir = os.rmdir
+
+    def fake(path, *args, **kwargs):
+        if os.path.basename(os.fspath(path)) == target_name:
+            calls["n"] += 1
+            if failures is None or calls["n"] <= failures:
+                raise exc
+        real_rmdir(path, *args, **kwargs)
+
+    monkeypatch.setattr(platform_util.os, "rmdir", fake)
+    return calls
+
+
+@pytest.mark.parametrize("failures", [1, 2])
+def test_retrying_rmtree_retries_a_delete_pending_child(tmp_path, monkeypatch, failures):
+    # A child unlinked under another process's FILE_SHARE_DELETE handle stays
+    # delete-pending, so the parent rmdir sees WinError 145 until the handle closes.
+    # failures=2 makes the 145 repeat INSIDE the backoff loop, which only clears
+    # when the loop itself was handed the rmdir predicate.
+    monkeypatch.setattr(platform_util.sys, "platform", "win32")
+    sleeps: list[float] = []
+    monkeypatch.setattr(platform_util.time, "sleep", lambda s: sleeps.append(s))
+    root = _tree(tmp_path)
+    calls = _flaky_rmdir(monkeypatch, "logs", failures, _dir_not_empty())
+
+    platform_util.retrying_rmtree(root)
+
+    assert not root.exists()
+    # the walk's own failing call, the in-loop failures, then success
+    assert calls["n"] == failures + 1
+    assert len(sleeps) == failures - 1  # a backoff only between in-loop attempts
+
+
+def test_retrying_rmtree_raises_when_a_delete_pending_child_never_clears(tmp_path, monkeypatch):
+    monkeypatch.setattr(platform_util.sys, "platform", "win32")
+    monkeypatch.setattr(platform_util, "_REPLACE_ATTEMPTS", 3)
+    sleeps: list[float] = []
+    monkeypatch.setattr(platform_util.time, "sleep", lambda s: sleeps.append(s))
+    root = _tree(tmp_path)
+    not_empty = _dir_not_empty()
+    calls = _flaky_rmdir(monkeypatch, "logs", None, not_empty)
+
+    with pytest.raises(OSError) as caught:
+        platform_util.retrying_rmtree(root)
+
+    assert caught.value is not_empty
+    assert calls["n"] == 1 + 3  # the walk's call, then every retry attempt
+    assert len(sleeps) == 2  # no sleep after the final attempt
+    assert root.exists()  # partial removal, the final failure is not swallowed
+
+
+def test_retrying_rmtree_no_retry_on_an_errno_only_dir_not_empty(tmp_path, monkeypatch):
+    # The rmdir predicate keys on .winerror, not errno: an ENOTEMPTY with no
+    # winerror attached (a POSIX-shaped error) is not retried and surfaces at once.
+    monkeypatch.setattr(platform_util.sys, "platform", "win32")
+    sleeps: list[float] = []
+    monkeypatch.setattr(platform_util.time, "sleep", lambda s: sleeps.append(s))
+    root = _tree(tmp_path)
+    not_empty = OSError(errno.ENOTEMPTY, "directory not empty")
+    calls = _flaky_rmdir(monkeypatch, "logs", None, not_empty)
+
+    with pytest.raises(OSError) as caught:
+        platform_util.retrying_rmtree(root)
+
+    assert caught.value is not_empty
+    assert calls["n"] == 1
+    assert sleeps == []
+
+
+def test_retrying_rmtree_retries_a_sharing_violation_on_rmdir(tmp_path, monkeypatch):
+    # rmdir runs under the rmdir predicate, which must still cover the sharing
+    # violation, not only the 145.
+    monkeypatch.setattr(platform_util.sys, "platform", "win32")
+    sleeps: list[float] = []
+    monkeypatch.setattr(platform_util.time, "sleep", lambda s: sleeps.append(s))
+    root = _tree(tmp_path)
+    calls = _flaky_rmdir(monkeypatch, "logs", 2, PermissionError(32, "in use"))
+
+    platform_util.retrying_rmtree(root)
+
+    assert not root.exists()
+    assert calls["n"] == 3
+    assert len(sleeps) == 1
+
+
+def test_retrying_rmtree_no_dir_not_empty_retry_on_posix(tmp_path, monkeypatch):
+    monkeypatch.setattr(platform_util.sys, "platform", "linux")
+    sleeps: list[float] = []
+    monkeypatch.setattr(platform_util.time, "sleep", lambda s: sleeps.append(s))
+    root = _tree(tmp_path)
+    not_empty = _dir_not_empty()
+    calls = _flaky_rmdir(monkeypatch, "logs", 1, not_empty)
+
+    with pytest.raises(OSError) as caught:
+        platform_util.retrying_rmtree(root)
+
+    assert caught.value is not_empty  # the original error, as a bare rmtree raises it
+    assert calls["n"] == 1
+    assert sleeps == []
+
+
+def test_retrying_rmtree_no_dir_not_empty_retry_on_unlink(tmp_path, monkeypatch):
+    # 145 is retried for the parent rmdir only; on an unlink it is not transient.
+    monkeypatch.setattr(platform_util.sys, "platform", "win32")
+    sleeps: list[float] = []
+    monkeypatch.setattr(platform_util.time, "sleep", lambda s: sleeps.append(s))
+    root = _tree(tmp_path)
+    not_empty = _dir_not_empty()
+    calls = _flaky_unlink(monkeypatch, "held.log", None, not_empty)
+
+    with pytest.raises(OSError) as caught:
+        platform_util.retrying_rmtree(root)
+
+    assert caught.value is not_empty
+    assert calls["n"] == 1
+    assert sleeps == []
+
+
+def test_dir_not_empty_does_not_widen_atomic_replace(tmp_path, monkeypatch):
+    # The rmdir predicate is rmtree's alone: the shared sharing-violation gate that
+    # atomic_replace runs under still raises a 145 at once.
+    monkeypatch.setattr(platform_util.sys, "platform", "win32")
+    sleeps: list[float] = []
+    monkeypatch.setattr(platform_util.time, "sleep", lambda s: sleeps.append(s))
+    not_empty = _dir_not_empty()
+    calls = {"n": 0}
+
+    def replace(src, dst):
+        calls["n"] += 1
+        raise not_empty
+
+    monkeypatch.setattr(platform_util.os, "replace", replace)
+
+    with pytest.raises(OSError) as caught:
+        platform_util.atomic_replace(tmp_path / "s", tmp_path / "d")
+
+    assert caught.value is not_empty
+    assert calls["n"] == 1
+    assert sleeps == []
+
+
+def test_dir_not_empty_does_not_widen_retrying_unlink(tmp_path, monkeypatch):
+    monkeypatch.setattr(platform_util.sys, "platform", "win32")
+    sleeps: list[float] = []
+    monkeypatch.setattr(platform_util.time, "sleep", lambda s: sleeps.append(s))
+    target = tmp_path / "held.log"
+    target.write_text("x", encoding="utf-8")
+    not_empty = _dir_not_empty()
+    calls = _flaky_unlink(monkeypatch, "held.log", None, not_empty)
+
+    with pytest.raises(OSError) as caught:
+        platform_util.retrying_unlink(target)
+
+    assert caught.value is not_empty
+    assert calls["n"] == 1
+    assert sleeps == []
+
+
 @pytest.mark.skipif(sys.platform != "win32", reason="real Windows open-handle delete denial")
 def test_retrying_rmtree_outlasts_a_real_open_handle(tmp_path):
     # Real-host evidence: Python's open() grants no FILE_SHARE_DELETE, so the unlink
@@ -1506,6 +1679,87 @@ def test_retrying_rmtree_outlasts_a_real_open_handle(tmp_path):
     finally:
         timer.cancel()
         handle.close()
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="real Windows delete-pending child")
+def test_retrying_rmtree_outlasts_a_delete_pending_child(tmp_path, monkeypatch, request):
+    """Real-host characterization of the WinError 145 retry. ``held.log`` is held
+    open WITH ``FILE_SHARE_DELETE``, so its unlink succeeds; under legacy delete
+    semantics the name lingers delete-pending and the parent rmdir fails with 145
+    until the timer closes the handle, while the POSIX delete recent Windows uses
+    on NTFS unlinks it at once. The test passes either way: it exists to show the
+    removal completes on the real host, whichever behavior that host has. How many 145s
+    the parent rmdir saw is recorded as the ``rmdir_winerror_145_count`` JUnit
+    property, so the CI XML shows which delete semantics the runner has."""
+    import ctypes
+    from ctypes import wintypes
+
+    generic_read = 0x80000000
+    share_all = 0x7  # FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE
+    open_existing = 3
+    file_attribute_normal = 0x80
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
+    kernel32.CreateFileW.argtypes = (
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    )
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    invalid_handle_value = wintypes.HANDLE(-1).value
+
+    root = _tree(tmp_path)
+    handle = kernel32.CreateFileW(
+        str(root / "logs" / "held.log"),
+        generic_read,
+        share_all,
+        None,
+        open_existing,
+        file_attribute_normal,
+        None,
+    )
+    assert handle not in (None, invalid_handle_value), ctypes.get_last_error()  # type: ignore[attr-defined]
+
+    lock = threading.Lock()
+    closed = False
+
+    def close_once() -> None:
+        nonlocal closed
+        with lock:
+            if not closed:
+                closed = True
+                kernel32.CloseHandle(handle)
+
+    seen_145 = {"n": 0}
+    real_rmdir = os.rmdir
+
+    def spy_rmdir(*args, **kwargs):
+        try:
+            real_rmdir(*args, **kwargs)
+        except OSError as exc:
+            if getattr(exc, "winerror", None) == 145:
+                seen_145["n"] += 1
+            raise
+
+    monkeypatch.setattr(platform_util.os, "rmdir", spy_rmdir)
+
+    timer = threading.Timer(0.2, close_once)
+    timer.start()
+    try:
+        platform_util.retrying_rmtree(root)
+        assert not root.exists()
+    finally:
+        timer.cancel()
+        close_once()
+        # user_properties directly: the record_property fixture warns under xunit2,
+        # but junitxml writes these properties either way — recorded on failure too
+        request.node.user_properties.append(("rmdir_winerror_145_count", seen_145["n"]))
 
 
 # --------------------------------------------------------------------- file_lock

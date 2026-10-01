@@ -47,6 +47,8 @@ breaking changes may land in a minor release.
 - Retry the transient Windows sharing violation a concurrent reader's handle causes while
   `delete`/`archive` (CLI and TUI) remove the run dir, instead of failing on the first one
   (DW-519).
+- Retry the WinError 145 a parent `rmdir` hits while `delete`/`archive` remove the run dir
+  and a child is still delete-pending under another process's handle (DW-520).
 - Ignore hook events from nested coding-CLI sessions that inherit the relay environment,
   so a child's `Stop`/`SessionEnd` no longer completes or crashes the launched session:
   an id that announces its own `SessionStart` after the launched session's first is
