@@ -16,11 +16,21 @@ breaking changes may land in a minor release.
 - Add `[verify] env_fault_rc` (0 = disabled; 75 = EX_TEMPFAIL suggested): a verify
   command exiting with it declares an environment fault instead of a code
   failure (DW-523).
+- Re-probe the environment before a failure is charged: when `[environment]
+probes` are set, every retry, defer or budget-exhausted decision (dev, fix,
+  review, blocking workflow) re-runs them first, and a failing probe pauses the
+  run as an environment fault instead — the attempt is not charged and the
+  story's `env_fault_site` records where it was detected (DW-523).
 
 ### Changed
 
 - Reword the rc 126/127 environment-fault pause: it names the shell convention
   instead of asserting "command not found / not executable" (DW-523).
+
+### Fixed
+
+- Escalate an environment fault at the review-budget rescue gate instead of
+  deferring the story as unconverged (DW-523).
 
 ## [0.13.1] — 2026-10-01
 

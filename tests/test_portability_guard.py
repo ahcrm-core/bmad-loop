@@ -580,6 +580,10 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         "entries_now",
         "env_fault",
         "env_fault_evidence",
+        # DW-523: where an environment fault was detected — a closed
+        # `model.ENV_FAULT_SITES` slug (`verify:dev`, `probe:decision:review`, ...),
+        # never authored text, on `story-escalated` and `dev-decision`.
+        "env_fault_site",
         "epic",
         "errors",
         "expired_clock",
@@ -1202,6 +1206,10 @@ JOURNAL_KINDS = frozenset(
         # `Engine._observe_environment_probes` (dev/fix verify, and the review
         # gates through `_review_probe_sink`): `site` names the asking seam.
         "env-probe-failed",
+        # DW-523. A charging failure decision (retry / defer / budget-exhausted)
+        # replaced by a PAUSE because a re-probe failed, from
+        # `Engine._env_gate_decision`: `site` is the `env_fault_site` recorded.
+        "env-fault-reclassified",
         "epic-boundary",
         "fix-decision",
         "fix-harvest-failed",

@@ -65,6 +65,35 @@ PAUSE_STORY_GATE = "story-gate"
 # commit (skip-if-last). Both re-arm through the same resume path.
 PAUSE_PLAN_CHECKPOINT = "plan-checkpoint"
 PAUSE_STORY_CHECKPOINT = "story-checkpoint"
+# An `[environment] probe` failed right before a session dispatch (DW-523): the
+# environment, not the story, blocks the run, so nothing was charged or rolled
+# back and resume re-probes before dispatching. Reserved for the dispatch gate.
+PAUSE_ENVIRONMENT = "environment"
+
+# Where an environment fault was detected (DW-523), as recorded in
+# `StoryTask.env_fault_site`. A CLOSED vocabulary: `verify:<role>` — a verify
+# pass reported the env fault itself (a failed preflight probe, a declared
+# `[verify] env_fault_rc`, rc 126/127); `probe:decision:<role>` — a failure the
+# deciders would have charged (retry / defer) was re-probed and a probe failed;
+# `probe:claim:<role>` — a session claimed an environment fault and a probe
+# confirmed it; `probe:dispatch:<role>` — a probe failed before a session launch.
+ENV_FAULT_SITE_DISPATCH_PREFIX = "probe:dispatch:"
+ENV_FAULT_SITES = frozenset(
+    {
+        "verify:dev",
+        "verify:fix",
+        "verify:review",
+        "probe:decision:dev",
+        "probe:decision:fix",
+        "probe:decision:review",
+        "probe:decision:workflow",
+        "probe:claim:dev",
+        "probe:claim:fix",
+        "probe:claim:review",
+        f"{ENV_FAULT_SITE_DISPATCH_PREFIX}dev",
+        f"{ENV_FAULT_SITE_DISPATCH_PREFIX}review",
+    }
+)
 
 # Reasons recorded in RunState.sweeps_refused (trigger -> reason). A CLOSED
 # vocabulary of short slugs, deliberately not a formatted exception: `bmad-loop
@@ -479,6 +508,13 @@ class StoryTask:
     # gone).
     operator_actions: list[str] = field(default_factory=list)
     defer_reason: str | None = None
+    # where the environment fault behind this task's escalation was detected
+    # (DW-523), one of `ENV_FAULT_SITES`; None = the escalation (if any) is not an
+    # environment fault. Set only by `Engine._escalate_env` (directly, or through
+    # `Engine._escalate_outcome` for a verify env fault); cleared by
+    # `runs.rearm_escalation` and `runs.adopt_escalated_branch` — a re-armed
+    # story starts with no fault on record. Survives the resume round-trip.
+    env_fault_site: str | None = None
     # the recovery ref this attempt's work was parked on by the last auto-rollback
     # — an `attempt-preserve/*` branch (commits above baseline) or, when the tree
     # was also dirty, the `refs/attempt-preserve-dirty/*` snapshot, which is
@@ -694,6 +730,7 @@ class StoryTask:
             "commit_sha": self.commit_sha,
             "operator_actions": self.operator_actions,
             "defer_reason": self.defer_reason,
+            "env_fault_site": self.env_fault_site,
             "preserve_ref": self.preserve_ref,
             "preserve_partial": self.preserve_partial,
             "preserve_from_attempt": self.preserve_from_attempt,
@@ -973,6 +1010,7 @@ class StoryTask:
             commit_sha=d.get("commit_sha"),
             operator_actions=[str(a) for a in d.get("operator_actions", [])],
             defer_reason=d.get("defer_reason"),
+            env_fault_site=d.get("env_fault_site"),
             preserve_ref=d.get("preserve_ref"),
             preserve_partial=bool(d.get("preserve_partial", False)),
             preserve_from_attempt=bool(d.get("preserve_from_attempt", False)),

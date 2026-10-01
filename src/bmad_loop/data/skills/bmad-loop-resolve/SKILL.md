@@ -38,6 +38,7 @@ These environment variables are set:
   "redrive_base_ref": "<branch the re-drive reads, or HEAD>",
   "baseline_commit": "<sha>",
   "paused_reason": "CRITICAL escalation from review session: ...",
+  "env_fault_site": null,
   "escalations": [
     {
       "type": "<kind>",
@@ -238,6 +239,25 @@ Use the patch two ways:
 
 If the attempted reading was wrong (the common case), omit `restore_patch`
 entirely: the orchestrator re-drives from scratch against the corrected intent.
+
+## Special case: an environment-fault escalation
+
+When `env_fault_site` in the context is **not** `null`, the run paused because the
+**environment** failed, not the story: an operator `[environment]` probe failed (or
+a verify command declared or hit an environment fault) at the site it names —
+`verify:<role>`, `probe:decision:<role>`, `probe:claim:<role>` or
+`probe:dispatch:<role>`. The attempt was **not** charged.
+
+- **No spec change is needed.** Do not clarify the intent or reinterpret the
+  story to explain the failure; `paused_reason` names the probe or command that
+  failed and its output tail.
+- Tell the human to **fix the environment** (start the stopped service, container,
+  emulator or database the probe checks) and confirm the probe passes by hand.
+- Then **re-arm the escalation** as usual (record a resolution that says the
+  environment was repaired); the attempt budget resets on re-arm. A plain re-arm
+  re-drives a dev session from the baseline. A forthcoming
+  `bmad-loop resolve <run> --reverify` will instead keep the attempt's work and
+  replay verification on it — mention it only as not yet available.
 
 ## What you MUST NOT do
 

@@ -5187,6 +5187,9 @@ def adopt_escalated_branch(run_dir: Path, story_key: str | None = None) -> str:
         # engine's resume arm already completes without re-running any gate.
         task.phase = Phase.COMMITTING
         task.adopt_pending = True
+        # The adopted branch is committed as-is: no environment fault remains on
+        # record for the story (DW-523).
+        task.env_fault_site = None
         save_state(run_dir, state)
         Journal(run_dir).append(
             "escalation-adopted",
@@ -5391,6 +5394,7 @@ def _rearm_escalation_locked(
     task.review_cycle = 0
     task.followup_reviews_spent = 0  # human-resolved re-drive gets a fresh damping budget
     task.defer_reason = None
+    task.env_fault_site = None  # the re-armed story starts with no fault on record (DW-523)
     task.rearmed = True  # resume-time recovery notice describes a clean rebuild,
     # not a failed attempt (engine._finish_inflight clears it once the rebuild runs)
     # Always (re)assign the latch: a None restore_patch clears a stale one left by

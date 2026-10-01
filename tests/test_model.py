@@ -9,6 +9,9 @@ import pytest
 from conftest import refuse_to_resolve
 
 from bmad_loop.model import (
+    ENV_FAULT_SITE_DISPATCH_PREFIX,
+    ENV_FAULT_SITES,
+    PAUSE_ENVIRONMENT,
     SWEEP_REFUSED_DIRTY,
     SWEEP_REFUSED_NOT_STARTED,
     Phase,
@@ -534,6 +537,36 @@ def test_escalations_resolved_upto_defaults_zero_for_legacy_state():
 def test_resolved_redrive_round_trips():
     task = StoryTask(story_key="1-1-a", epic=1, resolved_redrive=True)
     assert StoryTask.from_dict(task.to_dict()).resolved_redrive is True
+
+
+def test_env_fault_site_round_trips_and_defaults_none():
+    task = StoryTask(story_key="1-1-a", epic=1, env_fault_site="probe:decision:dev")
+    restored = StoryTask.from_dict(json.loads(json.dumps(task.to_dict())))
+    assert restored.env_fault_site == "probe:decision:dev"
+    assert StoryTask(story_key="1-1-a", epic=1).env_fault_site is None
+    doc = StoryTask(story_key="1-1-a", epic=1).to_dict()
+    del doc["env_fault_site"]  # state.json from before the field existed
+    assert StoryTask.from_dict(doc).env_fault_site is None
+
+
+def test_env_fault_sites_vocabulary():
+    assert ENV_FAULT_SITES == {
+        "verify:dev",
+        "verify:fix",
+        "verify:review",
+        "probe:decision:dev",
+        "probe:decision:fix",
+        "probe:decision:review",
+        "probe:decision:workflow",
+        "probe:claim:dev",
+        "probe:claim:fix",
+        "probe:claim:review",
+        "probe:dispatch:dev",
+        "probe:dispatch:review",
+    }
+    dispatch = {s for s in ENV_FAULT_SITES if s.startswith(ENV_FAULT_SITE_DISPATCH_PREFIX)}
+    assert dispatch == {"probe:dispatch:dev", "probe:dispatch:review"}
+    assert PAUSE_ENVIRONMENT == "environment"
 
 
 def test_resolved_redrive_defaults_false_for_legacy_state():

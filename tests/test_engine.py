@@ -12,7 +12,9 @@ import signal
 import subprocess
 import sys
 import time
+from collections.abc import Sequence
 from pathlib import Path
+from typing import NamedTuple
 
 import pytest
 from conftest import (
@@ -13158,6 +13160,454 @@ def test_declared_env_fault_rc_pauses_dev_without_burning_budget(project):
     assert "configured environment-fault code" in engine.state.paused_reason
     decision = [e for e in engine.journal.entries() if e["kind"] == "dev-decision"][-1]
     assert decision["env_fault"] is True
+
+
+# ------------------------------------- DW-523: the failure-decision environment seam
+
+
+class _EnvRig(NamedTuple):
+    """An environment the tests can kill: `probe` passes while `up` exists. Lives
+    in a tmp dir OUTSIDE the repo, so no rollback or commit ever touches it."""
+
+    up: Path
+    probe: str
+    root: Path
+
+    def verify(self, codes: Sequence[int], *, kill_from: int | None = None) -> str:
+        """A verify command whose Nth run (1-based) exits ``codes[N-1]`` (the last
+        code repeats) and, from run ``kill_from`` on, deletes ``up`` first — the
+        container dying under the verify pass."""
+        counter = self.root / "verify-count"
+        return _python_cmd(
+            self.root / "verify.py",
+            "import os, pathlib, sys\n"
+            f"p = pathlib.Path(r'{counter}')\n"
+            "n = int(p.read_text()) + 1 if p.exists() else 1\n"
+            "p.write_text(str(n))\n"
+            f"codes = {list(codes)!r}\n"
+            f"kill_from = {kill_from!r}\n"
+            f"if kill_from is not None and n >= kill_from and os.path.exists(r'{self.up}'):\n"
+            f"    os.remove(r'{self.up}')\n"
+            "sys.exit(codes[min(n, len(codes)) - 1])\n",
+        )
+
+
+def _env_rig(tmp_path: Path, *, up: bool = True) -> _EnvRig:
+    root = tmp_path / "env-rig"
+    root.mkdir()
+    marker = root / "up"
+    if up:
+        marker.write_text("up\n", encoding="utf-8")
+    probe = _python_cmd(
+        root / "probe.py",
+        f"import os, sys\nsys.exit(0 if os.path.exists(r'{marker}') else 3)\n",
+    )
+    return _EnvRig(up=marker, probe=probe, root=root)
+
+
+def _env_policy(rig: _EnvRig, *commands: str, **kw) -> Policy:
+    return Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        verify=VerifyPolicy(commands=tuple(commands)),
+        environment=EnvironmentPolicy(probes=(rig.probe,)),
+        **kw,
+    )
+
+
+def _reclassified(engine) -> list[dict]:
+    return [e for e in engine.journal.entries() if e["kind"] == "env-fault-reclassified"]
+
+
+def _fix_session_effect(spec):
+    """A completed repair session that changes nothing the verify pass reads."""
+    return SessionResult(
+        status="completed", result_json={"workflow": "auto-dev", "escalations": []}
+    )
+
+
+def test_container_death_mid_verify_pauses_instead_of_deferring(project, tmp_path):
+    """The reported case (DW-523): the environment dies DURING the dev verify pass
+    (the preflight probe passed, then the command failed as the container went
+    down). With the budget spent, `decide_dev` says DEFER — the seam re-probes,
+    the probe fails, and the story ESCALATES with the attempt uncharged instead.
+    Ablation: drop the dev-leg `_env_gate_decision` and the story is DEFERRED."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    rig = _env_rig(tmp_path)
+    policy = _env_policy(rig, rig.verify([1], kill_from=1), limits=LimitsPolicy(max_dev_attempts=1))
+    engine, adapter = make_engine(project, [dev_effect(project, "1-1-a")], policy=policy)
+    summary = engine.run()
+
+    assert summary.paused and summary.escalated == 1 and summary.deferred == 0
+    assert [s.role for s in adapter.sessions] == ["dev"]
+    task = engine.state.tasks["1-1-a"]
+    assert task.phase == Phase.ESCALATED
+    assert task.env_fault_site == "probe:decision:dev"
+    assert load_state(engine.run_dir).tasks["1-1-a"].env_fault_site == "probe:decision:dev"
+    assert engine.state.paused_stage == PAUSE_ESCALATION
+    reason = engine.state.paused_reason
+    assert reason.startswith("environment fault: dev defer withheld — probe failed (rc=3)")
+    assert "the attempt is not charged" in reason
+    (reclassified,) = _reclassified(engine)
+    assert reclassified["action"] == "defer" and reclassified["site"] == "probe:decision:dev"
+    entries = engine.journal.entries()
+    (probe_failed,) = [e for e in entries if e["kind"] == "env-probe-failed"]
+    assert probe_failed["site"] == "probe:decision:dev"
+    decision = [e for e in entries if e["kind"] == "dev-decision"][-1]
+    assert decision["action"] == "pause" and decision["env_fault_site"] == "probe:decision:dev"
+    escalated = [e for e in entries if e["kind"] == "story-escalated"][-1]
+    assert escalated["env_fault_site"] == "probe:decision:dev"
+    assert "story-deferred" not in {e["kind"] for e in entries}
+
+
+def test_healthy_probes_leave_verify_retry_unchanged(project, tmp_path, monkeypatch):
+    """A healthy re-probe returns the decision untouched: the ordinary failing
+    story retries then defers exactly as it does without probes — and the seam
+    did probe at each charging decision."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    rig = _env_rig(tmp_path)
+    policy = _env_policy(rig, _FAIL, limits=LimitsPolicy(max_dev_attempts=2))
+    engine, adapter = make_engine(
+        project, [dev_effect(project, "1-1-a"), dev_effect(project, "1-1-a")], policy=policy
+    )
+    sites: list[str] = []
+    real = engine._run_environment_probes
+
+    def spy(task, *, site):
+        sites.append(site)
+        return real(task, site=site)
+
+    monkeypatch.setattr(engine, "_run_environment_probes", spy)
+    summary = engine.run()
+
+    assert summary.deferred == 1 and summary.escalated == 0
+    assert [s.role for s in adapter.sessions] == ["dev", "dev"]
+    task = engine.state.tasks["1-1-a"]
+    assert task.phase == Phase.DEFERRED and task.env_fault_site is None
+    assert sites == ["verify:dev", "probe:decision:dev"] * 2
+    decisions = [e for e in engine.journal.entries() if e["kind"] == "dev-decision"]
+    assert [d["action"] for d in decisions] == ["retry", "defer"]
+    assert all("env_fault_site" not in d for d in decisions)
+    assert not _reclassified(engine)
+
+
+def test_failed_dev_session_with_failing_probe_pauses_not_retries(project, tmp_path):
+    """A crashed dev session would RETRY (spending an attempt); a failing probe
+    reclassifies it — no second dev session is launched. Ablation: drop the
+    dev-leg gate and a second dev session runs."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    rig = _env_rig(tmp_path, up=False)
+    policy = _env_policy(rig, limits=LimitsPolicy(max_dev_attempts=3))
+    engine, adapter = make_engine(
+        project,
+        [SessionResult(status="crashed"), dev_effect(project, "1-1-a")],
+        policy=policy,
+    )
+    summary = engine.run()
+
+    assert summary.paused and summary.escalated == 1
+    assert [s.role for s in adapter.sessions] == ["dev"]
+    task = engine.state.tasks["1-1-a"]
+    assert task.phase == Phase.ESCALATED and task.attempt == 1
+    assert task.env_fault_site == "probe:decision:dev"
+    assert engine.state.paused_reason.startswith("environment fault: dev retry withheld")
+    assert "withheld retry: dev session crashed" in engine.state.paused_reason
+    (reclassified,) = _reclassified(engine)
+    assert reclassified["action"] == "retry"
+
+
+def test_review_session_failure_with_failing_probe_pauses(project, tmp_path):
+    """A crashed review session would RETRY (spending a review cycle); the seam
+    re-probes and pauses instead. The dev leg PROCEEDed, so it never probed."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    rig = _env_rig(tmp_path, up=False)
+    engine, adapter = make_engine(
+        project,
+        [
+            dev_effect(project, "1-1-a"),
+            SessionResult(status="crashed"),
+            review_effect(project, "1-1-a", clean=True),
+        ],
+        policy=_env_policy(rig),
+    )
+    summary = engine.run()
+
+    assert summary.paused and summary.escalated == 1 and summary.done == 0
+    assert [s.role for s in adapter.sessions] == ["dev", "review"]
+    task = engine.state.tasks["1-1-a"]
+    assert task.phase == Phase.ESCALATED and task.review_cycle == 1
+    assert task.env_fault_site == "probe:decision:review"
+    assert engine.state.paused_reason.startswith("environment fault: review retry withheld")
+    (failed,) = [e for e in engine.journal.entries() if e["kind"] == "env-probe-failed"]
+    assert failed["site"] == "probe:decision:review"
+
+
+def test_review_gate_failure_reclassified_before_fix_dispatch(project, tmp_path):
+    """The review gate's preflight passes, then its command fails as the
+    environment dies: the failure would dispatch a fix session (charging a dev
+    attempt) — the seam re-probes first and pauses, so no fix session runs.
+    Ablation: drop the review-gate `_env_gate_decision` and a fix session runs."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    rig = _env_rig(tmp_path)
+    engine, adapter = make_engine(
+        project,
+        [
+            dev_effect(project, "1-1-a"),
+            review_effect(project, "1-1-a", clean=True),
+            _fix_session_effect,
+        ],
+        policy=_env_policy(rig, rig.verify([0, 1], kill_from=2)),
+    )
+    summary = engine.run()
+
+    assert summary.paused and summary.escalated == 1 and summary.deferred == 0
+    assert [s.role for s in adapter.sessions] == ["dev", "review"]  # no fix session
+    task = engine.state.tasks["1-1-a"]
+    assert task.phase == Phase.ESCALATED and task.attempt == 1
+    assert task.env_fault_site == "probe:decision:review"
+    (reclassified,) = _reclassified(engine)
+    assert reclassified["action"] == "retry"
+
+
+def test_fix_failure_reclassified_before_next_attempt(project, tmp_path):
+    """A fix session's verify fails as the environment dies: the next repair
+    attempt is withheld. The review-gate failure before it re-probed healthy, so
+    exactly one fix session ran. Ablation: drop the `_fix_phase` gate and a
+    second fix session is requested."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    rig = _env_rig(tmp_path)
+    engine, adapter = make_engine(
+        project,
+        [
+            dev_effect(project, "1-1-a"),
+            review_effect(project, "1-1-a", clean=True),
+            _fix_session_effect,
+            _fix_session_effect,
+        ],
+        policy=_env_policy(
+            rig, rig.verify([0, 1], kill_from=3), limits=LimitsPolicy(max_dev_attempts=3)
+        ),
+    )
+    summary = engine.run()
+
+    assert summary.paused and summary.escalated == 1 and summary.deferred == 0
+    assert [s.role for s in adapter.sessions] == ["dev", "review", "dev"]
+    task = engine.state.tasks["1-1-a"]
+    assert task.phase == Phase.ESCALATED and task.attempt == 2
+    assert task.env_fault_site == "probe:decision:fix"
+    assert engine.state.paused_reason.startswith("environment fault: fix retry withheld")
+    (reclassified,) = _reclassified(engine)
+    assert reclassified["site"] == "probe:decision:fix" and reclassified["action"] == "retry"
+
+
+def test_skip_review_failure_reclassified_not_deferred(project, tmp_path):
+    """review.enabled = false: the commit gate's failure would dispatch a repair
+    (and ultimately defer); a failing re-probe escalates instead. Ablation: drop
+    the skip-review gates and the story is DEFERRED."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    rig = _env_rig(tmp_path)
+    policy = _env_policy(
+        rig,
+        rig.verify([0, 1], kill_from=2),
+        review=ReviewPolicy(enabled=False),
+        limits=LimitsPolicy(max_dev_attempts=1),
+    )
+    engine, adapter = make_engine(project, [dev_effect(project, "1-1-a")], policy=policy)
+    summary = engine.run()
+
+    assert summary.paused and summary.escalated == 1 and summary.deferred == 0
+    assert [s.role for s in adapter.sessions] == ["dev"]
+    task = engine.state.tasks["1-1-a"]
+    assert task.phase == Phase.ESCALATED
+    assert task.env_fault_site == "probe:decision:review"
+    assert "story-deferred" not in {e["kind"] for e in engine.journal.entries()}
+
+
+def test_review_nonconvergence_defer_reclassified(project, tmp_path):
+    """A review loop that spends its budget without converging would defer; the
+    seam re-probes that budget-exhausted DEFER and escalates on a failed probe.
+    Ablation: drop the non-converged gate and the story is DEFERRED."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    rig = _env_rig(tmp_path, up=False)
+    engine, adapter = make_engine(
+        project,
+        [dev_effect(project, "1-1-a")]
+        + [review_effect(project, "1-1-a", clean=False, finalized=False) for _ in range(2)],
+        policy=_env_policy(rig, limits=LimitsPolicy(max_review_cycles=2)),
+    )
+    summary = engine.run()
+
+    assert summary.paused and summary.escalated == 1 and summary.deferred == 0
+    assert [s.role for s in adapter.sessions] == ["dev", "review", "review"]
+    task = engine.state.tasks["1-1-a"]
+    assert task.phase == Phase.ESCALATED and task.env_fault_site == "probe:decision:review"
+    (reclassified,) = _reclassified(engine)
+    assert reclassified["action"] == "defer"
+    assert "review did not converge within budget" in engine.state.paused_reason
+
+
+def test_blocking_workflow_failure_reclassified(project, tmp_path):
+    """A failed blocking workflow would defer the story; with a failing probe
+    the seam escalates with site `probe:decision:workflow` instead. Ablation:
+    drop the workflow gate and the story is DEFERRED."""
+    from bmad_loop.plugins import PluginRegistry
+    from bmad_loop.plugins.model import LoadedPlugin, PluginManifest, WorkflowSpec
+
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    rig = _env_rig(tmp_path, up=False)
+    manifest = PluginManifest(
+        name="wf",
+        api_version=1,
+        workflows=(
+            WorkflowSpec(
+                name="doc",
+                stage="post_dev_phase",
+                role="review",
+                prompt="/doc {story_key}",
+                blocking=True,
+            ),
+        ),
+    )
+    engine, adapter = make_engine(
+        project,
+        [dev_effect(project, "1-1-a"), SessionResult(status="error", result_json={})],
+        policy=_env_policy(rig),
+        registry=PluginRegistry([LoadedPlugin(manifest=manifest)]),
+    )
+    summary = engine.run()
+
+    assert summary.paused and summary.escalated == 1 and summary.deferred == 0
+    assert len(adapter.sessions) == 2
+    task = engine.state.tasks["1-1-a"]
+    assert task.phase == Phase.ESCALATED
+    assert task.env_fault_site == "probe:decision:workflow"
+    assert engine.state.paused_reason.startswith("environment fault: workflow defer withheld")
+
+
+def test_rescue_gate_env_fault_escalates_not_defers(project):
+    """Bug fix (DW-523): an env fault at the review-budget rescue gate fell
+    through to the "did not converge" defer — filing verify-green work as
+    unconverged over an environment fault. It escalates now, recording
+    `verify:review`. No probes involved: rc 127 is itself the env fault.
+    Ablation: revert the `or rescue.env_fault` conjunct and it DEFERS."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    root = project.project.parent / "rescue-rig"
+    root.mkdir()
+    counter = root / "count"
+    command = _python_cmd(
+        root / "verify.py",
+        "import pathlib, sys\n"
+        f"p = pathlib.Path(r'{counter}')\n"
+        "n = int(p.read_text()) + 1 if p.exists() else 1\n"
+        "p.write_text(str(n))\n"
+        "sys.exit(0 if n == 1 else 127)\n",
+    )
+    engine, adapter = make_engine(
+        project,
+        [dev_effect(project, "1-1-a")]
+        + [review_effect(project, "1-1-a", clean=False) for _ in range(3)],
+        policy=Policy(
+            gates=GatesPolicy(mode="none"),
+            notify=QUIET,
+            scm=ScmPolicy(rollback_on_failure=True),
+            verify=VerifyPolicy(commands=(command,)),
+            limits=LimitsPolicy(max_followup_reviews=5),
+        ),
+    )
+    summary = engine.run()
+
+    assert not summary.crashed
+    assert summary.paused and summary.escalated == 1 and summary.deferred == 0
+    assert [s.role for s in adapter.sessions] == ["dev", "review", "review", "review"]
+    task = engine.state.tasks["1-1-a"]
+    assert task.phase == Phase.ESCALATED and task.env_fault_site == "verify:review"
+    assert "verify environment fault" in engine.state.paused_reason
+    entries = engine.journal.entries()
+    (failed,) = [e for e in entries if e["kind"] == "review-verify-failed"]
+    assert failed["env_fault"] is True and failed["contradiction"] is False
+    kinds = {e["kind"] for e in entries}
+    assert "story-deferred" not in kinds and "review-budget-committed" not in kinds
+    assert "change for 1-1-a" in (project.project / "src.txt").read_text()
+
+
+@pytest.mark.parametrize("role", ["dev", "fix", "review"])
+def test_env_fault_site_recorded_per_verify_site(project, tmp_path, role):
+    """A verify env fault (rc 127) escalates with `verify:<role>` — the pass that
+    reported it — on the task, in `story-escalated`, and through state.json."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    root = tmp_path / "site-rig"
+    root.mkdir()
+    counter = root / "count"
+    codes = {"dev": [127], "review": [0, 127], "fix": [0, 1, 127]}[role]
+    command = _python_cmd(
+        root / "verify.py",
+        "import pathlib, sys\n"
+        f"p = pathlib.Path(r'{counter}')\n"
+        "n = int(p.read_text()) + 1 if p.exists() else 1\n"
+        "p.write_text(str(n))\n"
+        f"codes = {codes!r}\n"
+        "sys.exit(codes[min(n, len(codes)) - 1])\n",
+    )
+    engine, adapter = make_engine(
+        project,
+        [
+            dev_effect(project, "1-1-a"),
+            review_effect(project, "1-1-a", clean=True),
+            _fix_session_effect,
+        ],
+        policy=Policy(
+            gates=GatesPolicy(mode="none"),
+            notify=QUIET,
+            verify=VerifyPolicy(commands=(command,)),
+            limits=LimitsPolicy(max_dev_attempts=3),
+        ),
+    )
+    summary = engine.run()
+
+    assert summary.paused and summary.escalated == 1
+    expected_roles = {"dev": ["dev"], "review": ["dev", "review"], "fix": ["dev", "review", "dev"]}
+    assert [s.role for s in adapter.sessions] == expected_roles[role]
+    site = f"verify:{role}"
+    assert engine.state.tasks["1-1-a"].env_fault_site == site
+    assert load_state(engine.run_dir).tasks["1-1-a"].env_fault_site == site
+    escalated = [e for e in engine.journal.entries() if e["kind"] == "story-escalated"][-1]
+    assert escalated["env_fault_site"] == site
+    assert not _reclassified(engine)  # already an env fault: nothing to re-probe
+
+
+def test_no_probes_configured_journals_no_env_kinds(project, monkeypatch):
+    """Defaults are byte-identical (DW-523): with no `[environment] probes` the
+    seam spawns nothing and journals nothing new, even across a retry and a
+    defer, and no record carries `env_fault_site`. Ablation: drop the
+    `not self.policy.environment.probes` early return and the probe runner is
+    called."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    called: list[object] = []
+    real = verify.run_environment_probes
+
+    def spy(policy, cwd):
+        called.append(cwd)
+        return real(policy, cwd)
+
+    monkeypatch.setattr(verify, "run_environment_probes", spy)
+    policy = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        verify=VerifyPolicy(commands=(_FAIL,)),
+        limits=LimitsPolicy(max_dev_attempts=2),
+    )
+    engine, adapter = make_engine(
+        project, [dev_effect(project, "1-1-a"), dev_effect(project, "1-1-a")], policy=policy
+    )
+    summary = engine.run()
+
+    assert summary.deferred == 1
+    assert called == []
+    entries = engine.journal.entries()
+    kinds = {e["kind"] for e in entries}
+    assert not kinds & {"env-probe-failed", "env-fault-reclassified"}
+    assert all("env_fault_site" not in e for e in entries)
+    assert engine.state.tasks["1-1-a"].env_fault_site is None
 
 
 def _spawn_error_names(message: str, path: Path) -> bool:

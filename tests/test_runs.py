@@ -3956,6 +3956,41 @@ def test_rearm_clears_a_stale_adopt_latch(tmp_path):
     assert task.adopt_pending is False
 
 
+def test_rearm_clears_env_fault_site(tmp_path):
+    """DW-523: a re-armed story starts with no environment fault on record.
+
+    Ablation, performed: drop the `env_fault_site = None` in
+    `_rearm_escalation_locked` and this reddens."""
+    run_dir, _spec = _escalated_run(tmp_path, _SPEC_WITH_ARR)
+    state = load_state(run_dir)
+    state.tasks["1-1-a"].env_fault_site = "probe:decision:dev"
+    save_state(run_dir, state)
+
+    runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
+
+    assert load_state(run_dir).tasks["1-1-a"].env_fault_site is None
+
+
+def test_adopt_clears_env_fault_site(tmp_path):
+    """DW-523: adopting the escalated branch commits it as-is, so no environment
+    fault stays on record.
+
+    Ablation, performed: drop the `env_fault_site = None` in
+    `adopt_escalated_branch` and this reddens."""
+    from bmad_loop.model import Phase
+
+    run_dir, _wt = _adoptable(tmp_path)
+    state = load_state(run_dir)
+    state.tasks["1-1-a"].env_fault_site = "verify:review"
+    save_state(run_dir, state)
+
+    runs.adopt_escalated_branch(run_dir)
+
+    task = load_state(run_dir).tasks["1-1-a"]
+    assert task.phase == Phase.COMMITTING and task.adopt_pending is True
+    assert task.env_fault_site is None
+
+
 def _adoptable(tmp_path):
     """An escalation-paused run whose ESCALATED task keeps a worktree + branch + spec."""
     wt = tmp_path / "wt"

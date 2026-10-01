@@ -48,6 +48,14 @@ REVIEW_TIMEOUT_STATUSES = frozenset({"timeout", "stalled", "over_budget"})
 class Decision:
     action: Action
     reason: str = ""
+    # The action was driven by a spent budget (`_exhausted_action`): a DEFER, or
+    # a PAUSE re-escalating a resolved-CRITICAL re-drive (DW-523). The engine's
+    # environment seam re-probes before such a decision lands, exactly as it
+    # does before a RETRY, because both charge the story for the failure.
+    budget_exhausted: bool = False
+    # Set only by the engine's environment seam (DW-523), never by a decider: the
+    # `StoryTask.env_fault_site` a PAUSE it produced must record on escalation.
+    env_site: str | None = None
 
 
 def _escalation_list(result_json: dict[str, Any] | None) -> list[Any]:
@@ -326,7 +334,7 @@ def decide_dev(
         reason = session_failure_reason("dev", result)
         if budget_left:
             return Decision(Action.RETRY, reason)
-        return Decision(exhausted, _exhaust_reason(task, reason))
+        return Decision(exhausted, _exhaust_reason(task, reason), budget_exhausted=True)
 
     assert outcome is not None
     if outcome.ok:
@@ -335,7 +343,7 @@ def decide_dev(
         return Decision(Action.PAUSE, outcome.reason)
     if budget_left:
         return Decision(Action.RETRY, outcome.reason)
-    return Decision(exhausted, _exhaust_reason(task, outcome.reason))
+    return Decision(exhausted, _exhaust_reason(task, outcome.reason), budget_exhausted=True)
 
 
 def decide_review_session(task: StoryTask, result: SessionResult, policy: Policy) -> Decision:
@@ -364,6 +372,7 @@ def decide_review_session(task: StoryTask, result: SessionResult, policy: Policy
                 return Decision(
                     _exhausted_action(task),
                     _exhaust_reason(task, f"{reason} (review.on_timeout=defer)"),
+                    budget_exhausted=True,
                 )
             if mode == "salvage-if-done":
                 return Decision(Action.SALVAGE, reason)
@@ -388,7 +397,7 @@ def review_exhausted(task: StoryTask, reason: str) -> Decision:
     retry bound and launching another reviewer would be unsafe. It preserves the
     same resolved-CRITICAL re-drive rule as ordinary review-budget exhaustion.
     """
-    return Decision(_exhausted_action(task), _exhaust_reason(task, reason))
+    return Decision(_exhausted_action(task), _exhaust_reason(task, reason), budget_exhausted=True)
 
 
 def _exhausted_action(task: StoryTask) -> Action:
@@ -408,3 +417,15 @@ def _exhaust_reason(task: StoryTask, reason: str) -> str:
             f"instead of deferring: {reason}"
         )
     return reason
+
+
+def env_fault_claim(result_json: Any) -> str | None:
+    """The agent's "Environment fault:" claim in a session result, or ``None``.
+
+    A claim never decides anything on its own — it only makes the engine run
+    the operator's ``[environment] probes`` (DW-523). Total on any input. A stub
+    until the dev contract learns to synthesize the claim: it answers ``None``
+    for every document today.
+    """
+    del result_json
+    return None

@@ -425,6 +425,47 @@ def test_review_exhausted_reescalates_resolved_redrive():
     assert "re-escalating instead of deferring" in decision.reason
 
 
+def test_exhausted_decisions_carry_budget_exhausted():
+    """Every action `_exhausted_action` drives is marked `budget_exhausted`
+    (DW-523), so the engine's environment seam re-probes before it lands; a RETRY
+    and a non-budget PAUSE stay unmarked. Ablate any one `budget_exhausted=True`
+    and its row reddens."""
+    crashed = SessionResult(status="crashed")
+    exhausted = {
+        "dev verify defer": decide_dev(_task(attempt=2), COMPLETED, FAILING, POLICY),
+        "dev session defer": decide_dev(_task(attempt=2), crashed, None, POLICY),
+        "dev resolved-redrive pause": decide_dev(
+            _task(attempt=2, resolved_redrive=True), COMPLETED, FAILING, POLICY
+        ),
+        "review_exhausted": escalation.review_exhausted(_task(), "harvest unreadable"),
+        "review budget spent": decide_review_session(_task(review_cycle=2), crashed, POLICY),
+        "on_timeout=defer": decide_review_session(
+            _task(review_cycle=1), SessionResult(status="timeout"), _policy("defer")
+        ),
+    }
+    for name, decision in exhausted.items():
+        assert decision.action in (Action.DEFER, Action.PAUSE), name
+        assert decision.budget_exhausted is True, name
+        assert decision.env_site is None, name  # only the engine seam sets it
+    assert exhausted["dev resolved-redrive pause"].action == Action.PAUSE
+
+    charged_retries = (
+        decide_dev(_task(attempt=1), COMPLETED, FAILING, POLICY),
+        decide_dev(_task(attempt=1), crashed, None, POLICY),
+        decide_review_session(_task(review_cycle=1), crashed, POLICY),
+    )
+    for decision in charged_retries:
+        assert decision.action == Action.RETRY
+        assert decision.budget_exhausted is False
+    critical = VerifyOutcome.escalate("rc=127", env_fault=True)
+    assert decide_dev(_task(attempt=2), COMPLETED, critical, POLICY).budget_exhausted is False
+
+
+def test_env_fault_claim_is_total_and_none_until_the_contract_reports_one():
+    for document in (None, {}, [], "Environment fault: db down", 7, {"env_fault_claim": "x"}):
+        assert escalation.env_fault_claim(document) is None
+
+
 # ------------------------------- review.on_timeout routing (#271)
 
 
