@@ -1344,6 +1344,170 @@ def test_retrying_unlink_propagates_missing_file(tmp_path):
         platform_util.retrying_unlink(tmp_path / "gone.md")
 
 
+# --------------------------------------------------------------- retrying_rmtree
+
+
+def _tree(tmp_path: Path) -> Path:
+    root = tmp_path / "run"
+    (root / "logs").mkdir(parents=True)
+    (root / "state.json").write_text("{}", encoding="utf-8")
+    (root / "logs" / "held.log").write_text("x", encoding="utf-8")
+    return root
+
+
+def _flaky_unlink(monkeypatch, target_name: str, failures: int | None, exc: OSError):
+    """Patch ``os.unlink`` (the one ``shutil.rmtree`` calls) to raise ``exc`` for
+    the entry named ``target_name`` — ``failures`` times, or forever when ``None``.
+    Matched by basename: the fd-based walk passes a bare name plus ``dir_fd``, the
+    handler's retry the full path."""
+    calls = {"n": 0}
+    real_unlink = os.unlink
+
+    def fake(path, *args, **kwargs):
+        if os.path.basename(os.fspath(path)) == target_name:
+            calls["n"] += 1
+            if failures is None or calls["n"] <= failures:
+                raise exc
+        real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(platform_util.os, "unlink", fake)
+    return calls
+
+
+def test_retrying_rmtree_retries_then_succeeds(tmp_path, monkeypatch):
+    # A concurrent reader's handle denies the delete on Windows; the backoff clears it
+    # and the walk carries on to remove the rest of the tree.
+    monkeypatch.setattr(platform_util.sys, "platform", "win32")
+    sleeps: list[float] = []
+    monkeypatch.setattr(platform_util.time, "sleep", lambda s: sleeps.append(s))
+    root = _tree(tmp_path)
+    calls = _flaky_unlink(monkeypatch, "held.log", 2, PermissionError(13, "in use"))
+
+    platform_util.retrying_rmtree(root)
+
+    assert not root.exists()
+    # the walk's own failing call, one more failure inside the retry, then success
+    assert calls["n"] == 3
+    assert len(sleeps) == 1
+
+
+def test_retrying_rmtree_raises_after_retries_run_out(tmp_path, monkeypatch):
+    monkeypatch.setattr(platform_util.sys, "platform", "win32")
+    monkeypatch.setattr(platform_util, "_REPLACE_ATTEMPTS", 3)
+    sleeps: list[float] = []
+    monkeypatch.setattr(platform_util.time, "sleep", lambda s: sleeps.append(s))
+    root = _tree(tmp_path)
+    calls = _flaky_unlink(monkeypatch, "held.log", None, PermissionError(32, "in use"))
+
+    with pytest.raises(PermissionError):
+        platform_util.retrying_rmtree(root)
+
+    assert calls["n"] == 1 + 3  # the walk's call, then every retry attempt
+    assert len(sleeps) == 2  # no sleep after the final attempt
+    assert root.exists()  # partial removal, the final failure is not swallowed
+
+
+def test_retrying_rmtree_no_retry_on_posix(tmp_path, monkeypatch):
+    monkeypatch.setattr(platform_util.sys, "platform", "linux")
+    sleeps: list[float] = []
+    monkeypatch.setattr(platform_util.time, "sleep", lambda s: sleeps.append(s))
+    root = _tree(tmp_path)
+    denied = PermissionError(13, "Permission denied")
+    calls = _flaky_unlink(monkeypatch, "held.log", None, denied)
+
+    with pytest.raises(PermissionError) as caught:
+        platform_util.retrying_rmtree(root)
+
+    assert caught.value is denied  # the original error, as a bare rmtree raises it
+    assert calls["n"] == 1
+    assert sleeps == []
+
+
+def test_retrying_rmtree_no_retry_on_a_non_sharing_error(tmp_path, monkeypatch):
+    monkeypatch.setattr(platform_util.sys, "platform", "win32")
+    sleeps: list[float] = []
+    monkeypatch.setattr(platform_util.time, "sleep", lambda s: sleeps.append(s))
+    root = _tree(tmp_path)
+    eio = OSError(errno.EIO, "I/O error")
+    calls = _flaky_unlink(monkeypatch, "held.log", None, eio)
+
+    with pytest.raises(OSError) as caught:
+        platform_util.retrying_rmtree(root)
+
+    assert caught.value is eio
+    assert calls["n"] == 1
+    assert sleeps == []
+
+
+def test_retrying_rmtree_treats_a_vanished_path_as_removed(tmp_path, monkeypatch):
+    # The holder deleted (or moved) the entry between the denial and the retry: the
+    # goal is met, so the walk continues instead of failing on FileNotFoundError.
+    monkeypatch.setattr(platform_util.sys, "platform", "win32")
+    monkeypatch.setattr(platform_util.time, "sleep", lambda _s: None)
+    root = _tree(tmp_path)
+    real_unlink = os.unlink
+    calls = {"n": 0}
+
+    def fake(path, *args, **kwargs):
+        if os.path.basename(os.fspath(path)) == "held.log":
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise PermissionError(32, "in use")
+            real_unlink(path, *args, **kwargs)  # really remove it ...
+            raise FileNotFoundError(errno.ENOENT, "gone", os.fspath(path))  # ... and say so
+        real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(platform_util.os, "unlink", fake)
+
+    platform_util.retrying_rmtree(root)
+
+    assert calls["n"] == 2
+    assert not root.exists()
+
+
+def test_retrying_rmtree_never_retries_a_probe(tmp_path, monkeypatch):
+    # rmtree returns early once the handler returns for its top-level lstat probe,
+    # so "retrying" the probe would report a removal that never happened. Only the
+    # removal ops (unlink/rmdir) are retried; a probe's denial surfaces at once.
+    monkeypatch.setattr(platform_util.sys, "platform", "win32")
+    sleeps: list[float] = []
+    monkeypatch.setattr(platform_util.time, "sleep", lambda s: sleeps.append(s))
+    root = _tree(tmp_path)
+    real_lstat = os.lstat
+    calls = {"n": 0}
+
+    def flaky_lstat(path, *args, **kwargs):
+        if os.fspath(path) == os.fspath(root) and calls["n"] == 0:
+            calls["n"] += 1
+            raise PermissionError(32, "in use")
+        return real_lstat(path, *args, **kwargs)
+
+    monkeypatch.setattr(platform_util.os, "lstat", flaky_lstat)
+
+    with pytest.raises(PermissionError):
+        platform_util.retrying_rmtree(root)
+
+    assert calls["n"] == 1
+    assert sleeps == []
+    assert root.exists()
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="real Windows open-handle delete denial")
+def test_retrying_rmtree_outlasts_a_real_open_handle(tmp_path):
+    # Real-host evidence: Python's open() grants no FILE_SHARE_DELETE, so the unlink
+    # is denied until the timer closes the handle; the real backoff outlasts it.
+    root = _tree(tmp_path)
+    handle = open(root / "logs" / "held.log", encoding="utf-8")  # noqa: SIM115
+    timer = threading.Timer(0.2, handle.close)
+    timer.start()
+    try:
+        platform_util.retrying_rmtree(root)
+        assert not root.exists()
+    finally:
+        timer.cancel()
+        handle.close()
+
+
 # --------------------------------------------------------------------- file_lock
 
 

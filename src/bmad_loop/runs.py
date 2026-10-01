@@ -61,6 +61,7 @@ from .platform_util import (
     pinned_root_identity,
     recorded_root_identity,
     require_root_pinned,
+    retrying_rmtree,
     retrying_unlink,
     root_identity_record,
     safe_segment,
@@ -2936,7 +2937,7 @@ def delete_run(
             )
         if not force:
             _refuse_live_session(project, run_dir.name, "delete", warn=warn)
-        shutil.rmtree(run_dir)
+        retrying_rmtree(run_dir)
         # after the run dir, never before: a raise above leaves the run whole, and a
         # whole run keeps its control plane (see _discard_state_dir).
         _discard_state_dir(project, run_dir.name)
@@ -3026,7 +3027,7 @@ def _archive_run_locked(project: Path, run_dir: Path) -> Path:
         with contextlib.suppress(OSError):
             tmp.unlink(missing_ok=True)  # provably ours: mkstemp minted the name
         raise
-    shutil.rmtree(run_dir)
+    retrying_rmtree(run_dir)
     _discard_state_dir(project, run_dir.name)  # same tail as delete_run
     return dest
 
