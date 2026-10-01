@@ -7,6 +7,8 @@ breaking changes may land in a minor release.
 
 ## [Unreleased]
 
+## [0.13.1] — 2026-10-01
+
 ### Added
 
 - Tag hook events with relay-side process lineage; once the launched session's first
@@ -16,18 +18,18 @@ breaking changes may land in a minor release.
   `SessionStart` reports an id other than the pin, so the drop of its own events as
   foreign is no longer silent; a nested CLI's `mismatch`-tagged start is skipped (DW-509).
 - Record opt-in per-worker test metrics with `pytest --test-metrics-dir=PATH`, keeping
-  wall-clock apart from summed worker-seconds; bound a run with a tree-stopping deadline via
-  `scripts/run_test_benchmark.py`. Upload metrics and JUnit from every CI test job, failed or
-  timed out included.
+  wall-clock apart from summed worker-seconds; bound a run with a tree-stopping deadline
+  via `scripts/run_test_benchmark.py`. Upload metrics and JUnit from every CI test job,
+  failed or timed out included.
 - Shard tests by digest with `pytest --ci-shard=I/N` (whole functions and xdist groups, no
   hand-kept list); prove a sharded run complete and disjoint with
   `tests/perf_report.py verify-shards`.
 
 ### Changed
 
-- A tmux coding-CLI pane's start command now shows the `/bin/sh -c
-'BMAD_LOOP_LAUNCH_PID=$$; …'` prelude; the command itself runs under `default-shell`
-  exactly as before (DW-507).
+- A tmux coding-CLI pane's start command now shows the
+  `/bin/sh -c 'BMAD_LOOP_LAUNCH_PID=$$; …'` prelude; the command itself runs under
+  `default-shell` exactly as before (DW-507).
 - Run each Windows CI leg as two shards plus a serial psmux-gate job; fail the
   `test (windows, py3.x)` aggregator on a missing or red shard or gate, a test run in no
   shard or two, a skipped live-gate test, or a shard or gate job whose latest attempt
@@ -38,17 +40,6 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
-- Read and write CHANGELOG and version files as UTF-8 in the release scripts; a portability
-  guard now refuses file `open` / `read_text` / `write_text` without an explicit encoding in
-  `src/bmad_loop` (DW-513).
-- Keep a Windows release cut byte-stable: the release scripts write CHANGELOG and version
-  files with LF line endings, and exchange `git`/`gh` text — release notes included — as
-  UTF-8 rather than the ANSI code page (DW-517, DW-518).
-- Retry the transient Windows sharing violation a concurrent reader's handle causes while
-  `delete`/`archive` (CLI and TUI) remove the run dir, instead of failing on the first one
-  (DW-519).
-- Retry the WinError 145 a parent `rmdir` hits while `delete`/`archive` remove the run dir
-  and a child is still delete-pending under another process's handle (DW-520).
 - Ignore hook events from nested coding-CLI sessions that inherit the relay environment,
   so a child's `Stop`/`SessionEnd` no longer completes or crashes the launched session:
   an id that announces its own `SessionStart` after the launched session's first is
@@ -66,16 +57,12 @@ breaking changes may land in a minor release.
   stays unpinned until it adds `session_id_flag = "--session-id"`. A claude run paused
   before upgrading reports the host-exec config changed on resume: its launched argv
   gained `--session-id`. Dry-run previews show the flag as `--session-id <auto>`.
-- Return `bmad-loop validate`'s coding-CLI probe at its timeout on a Windows `.cmd` launcher
-  and kill the launcher's descendants, instead of waiting for the launched program to exit
-  (120 s observed in CI).
 - Advance a sprint-status row whose status is folded onto an indented continuation line,
   as a width-80 YAML dump writes a long story key, instead of leaving the old status and
-  rolling the finished story back; the row collapses to one `key: status` line (#842).
+  rolling the finished story back; the row collapses to one `key: status` line. Edit only
+  the row the YAML parser reads, never look-alike text in a block scalar or another
+  mapping, and leave a multi-line value the writer cannot read whole untouched (#842).
   Contributed by [@mswanson](https://github.com/mswanson).
-- Edit only the sprint-status row the YAML parser reads, never look-alike text in a block
-  scalar or another mapping, and leave a multi-line value the writer cannot read whole
-  untouched instead of rewriting only its first line.
 - Raise `SprintStatusWriteRefused` when an existing sprint-status row below its target is
   in a shape the writer cannot rewrite, instead of returning the unchanged status: a
   finished dev or review-demotion pass escalates with board, row, statuses and reason and
@@ -90,10 +77,22 @@ breaking changes may land in a minor release.
   with a glued comment (`'backlog'#c`) is now refused (`unreadable-value`) rather than
   rewritten (DW-514, DW-516).
 - Advance the sprint-status row the reader reads, matched by its parsed key rather than
-  its text (`advance`'s epic lift now lifts a lone `epic-01` row as epic 1). Refuse two distinct keys that
-  read as one (`"2001-01-04"` and the date `2001-01-04`; `epic-1` and `epic-01`) as
-  `key-ambiguous`, publishing nothing, instead of rewriting a row the reader ignores or
-  regressing a `done` epic (DW-515).
+  its text (`advance`'s epic lift now lifts a lone `epic-01` row as epic 1). Refuse two
+  distinct keys that read as one (`"2001-01-04"` and the date `2001-01-04`; `epic-1` and
+  `epic-01`) as `key-ambiguous`, publishing nothing, instead of rewriting a row the reader
+  ignores or regressing a `done` epic (DW-515).
+- Retry the transient Windows errors `delete`/`archive` (CLI and TUI) hit while removing a
+  run dir — a sharing violation from a concurrent reader's handle, and the WinError 145 a
+  parent `rmdir` hits while a child is still delete-pending — instead of failing on the
+  first one (DW-519, DW-520).
+- Return `bmad-loop validate`'s coding-CLI probe at its timeout on a Windows `.cmd` launcher
+  and kill the launcher's descendants, instead of waiting for the launched program to exit
+  (120 s observed in CI).
+- Keep a Windows release cut byte-stable: the release scripts read and write CHANGELOG and
+  version files as UTF-8 with LF line endings, and exchange `git`/`gh` text — release
+  notes included — as UTF-8 rather than the ANSI code page. A portability guard now
+  refuses file `open` / `read_text` / `write_text` without an explicit encoding in
+  `src/bmad_loop` (DW-513, DW-517, DW-518).
 
 ## [0.13.0] — 2026-09-28
 
@@ -6463,7 +6462,8 @@ enforced in CI.
   implementation phase, driven by a Python control loop with hook-based session transport and
   resumable on-disk run state.
 
-[Unreleased]: https://github.com/bmad-code-org/bmad-loop/compare/v0.13.0...HEAD
+[Unreleased]: https://github.com/bmad-code-org/bmad-loop/compare/v0.13.1...HEAD
+[0.13.1]: https://github.com/bmad-code-org/bmad-loop/releases/tag/v0.13.1
 [0.13.0]: https://github.com/bmad-code-org/bmad-loop/releases/tag/v0.13.0
 [0.12.0]: https://github.com/bmad-code-org/bmad-loop/releases/tag/v0.12.0
 [0.11.1]: https://github.com/bmad-code-org/bmad-loop/releases/tag/v0.11.1
