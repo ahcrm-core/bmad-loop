@@ -1766,6 +1766,10 @@ class Engine:
     def _rollback_or_pause(
         self, task: StoryTask, *, cause: str = "stopped", restart: bool = False
     ) -> None:
+        # A probe pass vouched for the tree this reset is about to rewind — a
+        # cwd-sensitive probe may have passed on config the failed attempt wrote —
+        # so the next dispatch re-probes the restored tree (DW-523).
+        self._env_probes_fresh_root = None
         self._recovery_flow.rollback_or_pause(task, cause=cause, restart=restart)
 
     def _accept_current_baseline(self, task: StoryTask) -> None:
@@ -1882,6 +1886,8 @@ class Engine:
         )
 
     def _safe_reset(self, task: StoryTask, *, preserve: tuple[str, ...] = ()) -> None:
+        # Same as `_rollback_or_pause`: the reset invalidates a probe pass (DW-523).
+        self._env_probes_fresh_root = None
         self._recovery_flow.safe_reset(task, preserve=preserve)
 
     def _restore_patch(self, task: StoryTask) -> None:
@@ -6305,7 +6311,9 @@ class Engine:
         one the pause found. Skipped when no probes are configured (the default —
         nothing spawns or journals) and when a probe pass already ran since the
         last session launch (``_env_probes_fresh_root``): a retry or fix dispatch
-        follows the failure-decision seam, which probed before charging it. Fresh
+        follows the failure-decision seam, which probed before charging it. A
+        rollback clears freshness: the pass vouched for the tree it rewound, so the
+        next gated dispatch (the next story after a rolled-back defer) re-probes. Fresh
         means fresh for THIS workspace root: a pass in another story's worktree
         (or in main) does not vouch for a cwd-sensitive probe here."""
         if not self.policy.environment.probes or self._env_probes_fresh_root == self.workspace.root:

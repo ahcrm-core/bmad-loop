@@ -13306,6 +13306,52 @@ def test_healthy_probes_leave_verify_retry_unchanged(project, tmp_path, monkeypa
     assert not _reclassified(engine)
 
 
+def test_rollback_invalidates_probe_freshness(project, tmp_path):
+    """A rollback rewinds the tree the decision seam's probe passed on, so the next
+    gated dispatch re-probes (DW-523). The probe is cwd-sensitive: after its first
+    pass it needs `envcfg` in the workspace, which only story A's crashed attempt
+    wrote — the seam passes on it, A defers and the rollback removes it, and story
+    B's dispatch pauses at the environment stage instead of launching. Ablation:
+    drop the freshness clear in `_rollback_or_pause` and B's dev session runs."""
+    write_sprint(project, {"1-1-a": "ready-for-dev", "1-1-b": "ready-for-dev"})
+    counter = tmp_path / "probe-count"
+    probe = _python_cmd(
+        tmp_path / "probe.py",
+        "import os, pathlib, sys\n"
+        f"p = pathlib.Path(r'{counter}')\n"
+        "n = int(p.read_text()) + 1 if p.exists() else 1\n"
+        "p.write_text(str(n))\n"
+        "sys.exit(0 if n == 1 or os.path.exists('envcfg') else 3)\n",
+    )
+    policy = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        environment=EnvironmentPolicy(probes=(probe,)),
+        limits=LimitsPolicy(max_dev_attempts=1),
+        scm=ScmPolicy(rollback_on_failure=True),
+    )
+
+    def crashes_after_writing_config(spec):
+        (project.project / "envcfg").write_text("cfg\n", encoding="utf-8")
+        return SessionResult(status="crashed")
+
+    engine, adapter = make_engine(
+        project, [crashes_after_writing_config, dev_effect(project, "1-1-b")], policy=policy
+    )
+    summary = engine.run()
+
+    assert summary.paused and summary.deferred == 1 and summary.escalated == 0
+    assert len(adapter.sessions) == 1  # story A's only; B never launched
+    assert not (project.project / "envcfg").exists()
+    assert engine.state.tasks["1-1-a"].phase == Phase.DEFERRED
+    assert engine.state.paused_stage == PAUSE_ENVIRONMENT
+    assert engine.state.paused_story_key == "1-1-b"
+    (failed,) = _rows(engine, "env-probe-failed")
+    assert failed["site"] == "probe:dispatch:dev" and failed["story_key"] == "1-1-b"
+    task_b = engine.state.tasks["1-1-b"]
+    assert task_b.attempt == 0 and task_b.sessions == []
+
+
 def test_failed_dev_session_with_failing_probe_pauses_not_retries(project, tmp_path):
     """A crashed dev session would RETRY (spending an attempt); a failing probe
     reclassifies it — no second dev session is launched. Ablation: drop the
