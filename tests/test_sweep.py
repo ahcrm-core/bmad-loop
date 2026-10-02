@@ -57,6 +57,7 @@ from bmad_loop.bmadconfig import ProjectPaths
 from bmad_loop.engine import RunPaused, _LedgerAnchor, _session_task_id
 from bmad_loop.journal import Journal, load_state, save_state
 from bmad_loop.model import (
+    PAUSE_ENVIRONMENT,
     PAUSE_ESCALATION,
     PAUSE_STORY_GATE,
     Phase,
@@ -71,6 +72,7 @@ from bmad_loop.plugins.model import LoadedPlugin
 from bmad_loop.policy import (
     AdapterPolicy,
     DevPolicy,
+    EnvironmentPolicy,
     GatesPolicy,
     LimitsPolicy,
     NotifyPolicy,
@@ -7929,6 +7931,46 @@ def test_generic_bundle_prompt_restore_branch_points_at_spec(project):
     fresh_prompt = engine._generic_bundle_prompt(task, None)
     assert "Implement the deferred-work bundle" in fresh_prompt
     assert "Resume review of the in-review spec" not in fresh_prompt
+
+
+def test_env_claim_clause_rides_bundle_prompts_only_with_probes(project, tmp_path):
+    """DW-523: every bundle leg closes its invocation sentence with the
+    environment-claim clause, ahead of the artifact-only paragraph, while probes
+    are configured; without probes each leg is byte-identical. Ablation: drop
+    `env_sentence` from a leg in `_generic_bundle_prompt` and that leg fails."""
+    plain, _ = make_sweep(project, [])
+    probed, _ = make_sweep(
+        project, [], policy=Policy(environment=EnvironmentPolicy(probes=("exit 0",)))
+    )
+    clause = probed._environment_claim_instruction()
+    assert clause
+    spec = project.implementation_artifacts / "spec-dw-fix.md"
+    write_spec(spec, "done", "abc")
+    feedback = tmp_path / "fb.md"
+    feedback.write_text("boom")
+    legs = [
+        (StoryTask(story_key="dw-fix", epic=0, bundle_file="/b/intent.md"), None),
+        (
+            StoryTask(
+                story_key="dw-fix",
+                epic=0,
+                bundle_file="/b/intent.md",
+                spec_file=str(spec),
+                restore_patch="/run/attempt.patch",
+            ),
+            None,
+        ),
+        (
+            StoryTask(story_key="dw-fix", epic=0, bundle_file="/b/intent.md", spec_file=str(spec)),
+            feedback,
+        ),
+    ]
+    for task, fb in legs:
+        before = plain._dev_prompt(task, fb)
+        after = probed._dev_prompt(task, fb)
+        assert clause not in before
+        assert after.replace(f" {clause}", "", 1) == before
+        assert after.index(clause) < after.index("Artifact-only receipt:")
 
 
 def test_bundle_dev_prompt_has_no_board_clause_but_the_review_prompt_does(project):
@@ -23844,6 +23886,116 @@ def test_interrupted_bundle_redrives_by_identity_after_triage_loss(project):
     assert ledger_entries(project)["DW-1"].status.startswith("done")
 
 
+def test_sweep_inflight_bundle_with_reverify_latch_escalates(project):
+    """DW-522: `resolve --reverify` refuses sweep runs, so a bundle carrying the
+    `reverify_from` latch is not one the gesture armed. The sweep recovery fails
+    closed: the bundle ESCALATES with the latch spent — no session, no restart
+    rollback of the kept work.
+
+    Ablation: drop the `task.reverify_from` guard in
+    `SweepEngine._finish_inflight_bundles` and the restart arm re-drives the bundle."""
+    engine = _run_to_dev_escalation(project)
+    state = load_state(engine.run_dir)
+    task = state.tasks["dw-fix"]
+    task.phase = Phase.DEV_VERIFY
+    task.reverify_from = "deferred"
+    save_state(engine.run_dir, state)
+
+    resumed, adapter = resume_sweep(project, engine, _redrive_script(project))
+    summary = resumed.run()
+
+    assert adapter.sessions == []
+    assert summary.paused and resumed.state.paused_stage == PAUSE_ESCALATION
+    assert resumed.state.paused_story_key == "dw-fix"
+    saved = load_state(engine.run_dir).tasks["dw-fix"]
+    assert saved.phase == Phase.ESCALATED and saved.reverify_from == ""
+    [escalated] = [
+        e
+        for e in resumed.journal.entries()
+        if e["kind"] == "story-escalated" and e["reason"].startswith("resolve --reverify")
+    ]
+    assert escalated["reason"] == "resolve --reverify is not supported for sweep runs"
+    journal = journal_text(resumed)
+    assert "resume-restart" not in journal and "rollback-auto" not in journal
+
+
+def test_bundle_dispatch_pause_resumes_without_restart(project, tmp_path):
+    """DW-523, sweep flavor: an `[environment]` probe failing at a bundle's dev
+    dispatch gate pauses the run at the `environment` stage before any session
+    launches — the task stays PENDING with attempt 0 and records the dispatch
+    site. A plain resume re-probes first, then dispatches the same dev session
+    WITHOUT the restart arm: nothing ran before the pause, so there is nothing
+    to roll back, and a commit the operator made while paused survives.
+
+    Ablation, performed: drop the `env_role == "dev"` arm in
+    `SweepEngine._recover_inflight_bundle` and the resume falls through to the
+    restart arm — this reds on `resume-env-dispatch` never being journaled (a
+    `resume-restart` row is written in its place). The operator-commit check
+    does NOT red under that ablation: the gate fires before `_dev_phase` stamps
+    `baseline_commit`, so the restart arm has no baseline to roll back to on a
+    first dispatch (pinned below as a premise). It guards the outcome, not the arm."""
+    write_ledger(project, {"DW-1": "open"})
+    rig = tmp_path / "env-rig"  # outside the repo: no rollback or commit touches it
+    rig.mkdir()
+    marker = rig / "up"
+    script = rig / "probe.py"
+    script.write_text(
+        f"import os, sys\nsys.exit(0 if os.path.exists(r'{marker}') else 3)\n",
+        encoding="utf-8",
+    )
+    probe = f'"{sys.executable}" "{script}"'
+    policy = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        scm=ScmPolicy(rollback_on_failure=True),
+        environment=EnvironmentPolicy(probes=(probe,)),
+    )
+    engine, adapter = make_sweep(
+        project, [triage_effect(bundle_plan()), *_redrive_script(project)], policy=policy
+    )
+    summary = engine.run()
+
+    assert summary.paused and engine.state.paused_stage == PAUSE_ENVIRONMENT
+    assert engine.state.paused_story_key == "dw-fix"
+    assert [s.role for s in adapter.sessions] == ["triage"]  # triage is not gated
+    task = engine.state.tasks["dw-fix"]
+    assert task.phase == Phase.PENDING and task.attempt == 0
+    assert task.env_fault_site == "probe:dispatch:dev"
+    assert task.baseline_commit is None  # premise: the gate ran before any baseline
+    saved = load_state(engine.run_dir)
+    assert saved.paused_stage == PAUSE_ENVIRONMENT
+    assert saved.tasks["dw-fix"].env_fault_site == "probe:dispatch:dev"
+    assert saved.tasks["dw-fix"].phase == Phase.PENDING and saved.tasks["dw-fix"].attempt == 0
+    (failed,) = _records(engine, "env-probe-failed")
+    assert failed["site"] == "probe:dispatch:dev" and failed["rc"] == 3
+
+    # the operator commits while the run waits, then fixes the environment
+    (project.project / "operator.txt").write_text("operator note\n", encoding="utf-8")
+    git(project.project, "add", "operator.txt")
+    git(project.project, "commit", "-q", "-m", "operator commit while paused")
+    operator_sha = git(project.project, "rev-parse", "HEAD")
+    marker.write_text("up\n", encoding="utf-8")
+
+    resumed, adapter = resume_sweep(project, engine, _redrive_script(project))
+    summary = resumed.run()
+
+    assert not summary.paused and not summary.crashed
+    assert [s.role for s in adapter.sessions] == ["dev", "review"]
+    task = resumed.state.tasks["dw-fix"]
+    assert task.phase == Phase.DONE and task.env_fault_site is None
+    (cleared,) = _records(resumed, "env-fault-cleared")
+    assert cleared["story_key"] == "dw-fix" and cleared["site"] == "probe:dispatch:dev"
+    (redispatch,) = _records(resumed, "resume-env-dispatch")
+    assert redispatch["story_key"] == "dw-fix" and redispatch["role"] == "dev"
+    assert [r for r in _records(resumed, "resume-restart") if r["story_key"] == "dw-fix"] == []
+    assert "rollback-auto" not in journal_kinds(resumed)
+    # the operator's commit is still in the history the bundle landed on
+    # (`git` checks the exit status: a non-ancestor raises CalledProcessError)
+    git(project.project, "merge-base", "--is-ancestor", operator_sha, "HEAD")
+    assert (project.project / "operator.txt").read_text(encoding="utf-8") == "operator note\n"
+    assert ledger_entries(project)["DW-1"].status.startswith("done")
+
+
 def test_resume_committing_bundle_finishes_commit(project):
     """#115, sweep flavor: a bundle whose host died in the commit window
     (COMMITTING persisted, DONE save never landed) is finished on resume —
@@ -24909,6 +25061,53 @@ def test_hard_stop_between_bundles_takes_hard_arm(project, monkeypatch):
     assert "graceful" not in stops[-1]
     entries = ledger_entries(project)
     assert entries["DW-1"].status.startswith("done") and entries["DW-2"].open
+
+
+def test_isolated_bundle_dispatch_pause_reprobes_the_replacement_unit(project, tmp_path):
+    """DW-523, isolated sweep: the resume re-probe runs in the kept unit, which the
+    sweep then discards for a fresh one (`_run_story` always mounts anew). That
+    pass vouched for the discarded tree, so the replacement's own dispatch gate
+    must probe again before the dev session launches — even at the same path.
+
+    Ablation, performed: drop the freshness reset in `_discard_unit_for_restart`
+    and the dev session launches after the resume re-probe alone (1, not 2)."""
+    write_ledger(project, {"DW-1": "open"})
+    rig = tmp_path / "env-rig"  # outside the repo: no rollback or commit touches it
+    rig.mkdir()
+    marker = rig / "up"
+    log = rig / "probes"
+    script = rig / "probe.py"
+    script.write_text(
+        "import os, sys\n"
+        f"open(r'{log}', 'a', encoding='utf-8').write(os.getcwd() + '\\n')\n"
+        f"sys.exit(0 if os.path.exists(r'{marker}') else 3)\n",
+        encoding="utf-8",
+    )
+    policy = isolated_seeded_policy(project)
+    policy = replace(
+        policy, environment=EnvironmentPolicy(probes=(f'"{sys.executable}" "{script}"',))
+    )
+    engine, _ = make_sweep(project, [triage_effect(bundle_plan())], policy=policy)
+    assert engine.run().paused and engine.state.paused_stage == PAUSE_ENVIRONMENT
+    paused_unit = Path(engine.state.tasks["dw-fix"].worktree_path).resolve()
+    before = len(log.read_text(encoding="utf-8").splitlines())
+
+    seen_at_launch: list[list[str]] = []
+    dev = wt_bundle_dev(project)
+
+    def dev_after_probes(spec):
+        seen_at_launch.append(log.read_text(encoding="utf-8").splitlines()[before:])
+        return dev(spec)
+
+    marker.write_text("up\n", encoding="utf-8")
+    resumed, adapter = resume_sweep(project, engine, [dev_after_probes, wt_bundle_review(project)])
+    summary = resumed.run()
+
+    assert not summary.paused and not summary.crashed
+    assert resumed.state.tasks["dw-fix"].phase == Phase.DONE
+    (probed,) = seen_at_launch
+    assert len(probed) == 2  # the resume re-probe, then the replacement's gate
+    assert Path(probed[0]).resolve() == paused_unit
 
 
 def test_bundle_dispatch_does_not_pin_expected_spec(project, tmp_path):

@@ -43,9 +43,11 @@ from .escalation import (
     Decision,
     critical_session_reason,
     decide_dev,
+    decide_reverify,
     decide_review_session,
     display_critical_reason,
     display_pause_reason,
+    env_fault_claim,
     env_fault_pause_reason,
     parked_pause_reason,
     preference_escalations,
@@ -57,6 +59,8 @@ from .frontmatter import FrontmatterWriteError
 from .install import dev_primitive_or_default
 from .journal import SELF_MINTED_FIELDS, Journal, save_state
 from .model import (
+    ENV_FAULT_SITE_DISPATCH_PREFIX,
+    PAUSE_ENVIRONMENT,
     PAUSE_EPIC_BOUNDARY,
     PAUSE_ESCALATION,
     PAUSE_SPEC_APPROVAL,
@@ -69,6 +73,7 @@ from .model import (
     SessionRecord,
     StoryTask,
     VerifyOutcome,
+    env_fault_site_reverifiable,
     result_mapping,
 )
 from .mountpaths import rebased_project
@@ -89,9 +94,11 @@ from .runs import (
     StateRootError,
     clear_graceful_stop,
     consume_stop_request,
+    deferred_stash_path,
     events_dir_for,
     graceful_stop_requested,
     kill_session,
+    latest_completed_dev_record,
     mount_root_identity,
     owner_run_dir,
     pinned_state_env,
@@ -949,6 +956,14 @@ class Engine:
         # so a gate that fails before reaching its commands publishes "no pass
         # ran", never a previous gate's records.
         self._review_verify_records: VerifyCommandRecords = NO_VERIFY_COMMANDS
+        # The workspace root `[environment] probes` last passed in since the last
+        # session launch (DW-523), or None. Transient on purpose — never
+        # persisted: a resumed process has not probed anything yet. Set by
+        # `_run_environment_probes` on a healthy pass, reset at the top of every
+        # `_run_session`, because a session may have changed the environment the
+        # pass vouched for. A root, not a flag: probes may be cwd-sensitive, so a
+        # pass in one worktree vouches for nothing in another.
+        self._env_probes_fresh_root: Path | None = None
         # Per-unit worktree isolation + integration flow (issue #244 F-3/F-9a).
         # Built from narrow deps + engine callbacks; the same-name Engine._* worktree
         # methods below delegate to it. `emit` is late-bound (a lambda, not the bound
@@ -1751,6 +1766,10 @@ class Engine:
     def _rollback_or_pause(
         self, task: StoryTask, *, cause: str = "stopped", restart: bool = False
     ) -> None:
+        # A probe pass vouched for the tree this reset is about to rewind — a
+        # cwd-sensitive probe may have passed on config the failed attempt wrote —
+        # so the next dispatch re-probes the restored tree (DW-523).
+        self._env_probes_fresh_root = None
         self._recovery_flow.rollback_or_pause(task, cause=cause, restart=restart)
 
     def _accept_current_baseline(self, task: StoryTask) -> None:
@@ -1823,6 +1842,9 @@ class Engine:
         attempt's to remove", and the same one `sweep`'s migration refusal already uses.
         """
         discard_worktree(self.paths.repo_root, task.worktree_path, "", run_dir=self.run_dir)
+        # A probe pass vouched for the discarded tree, not the replacement a later
+        # mount may open at the same path (DW-523).
+        self._env_probes_fresh_root = None
         # before the clears below: the relativization is measured against this field's
         # mount project (DW-379)
         task.release_mount_owned_state(self._mount_project(task))
@@ -1864,6 +1886,8 @@ class Engine:
         )
 
     def _safe_reset(self, task: StoryTask, *, preserve: tuple[str, ...] = ()) -> None:
+        # Same as `_rollback_or_pause`: the reset invalidates a probe pass (DW-523).
+        self._env_probes_fresh_root = None
         self._recovery_flow.safe_reset(task, preserve=preserve)
 
     def _restore_patch(self, task: StoryTask) -> None:
@@ -2191,6 +2215,18 @@ class Engine:
                 # release ownership before it can begin in main or a replacement
                 # worktree.
                 task.rebase_spec_paths_on(self._mount_project(task))
+            if (
+                task.env_fault_site == f"{ENV_FAULT_SITE_DISPATCH_PREFIX}dev"
+                and task.phase == Phase.PENDING
+            ):
+                # The resumed dispatch is a start, so it gets the start's story-gate
+                # question — asked BEFORE the dispatch site clears: a gated refusal
+                # then keeps the site, and the next resume still lands on the
+                # no-rollback arm below instead of the restart arm.
+                self._refuse_gated_story(task.story_key)
+            # DW-523: re-probe a dispatch-site environment pause first (re-pauses
+            # unchanged while the environment is still down).
+            env_role = self._take_env_dispatch_pause(task)
             mounted = bool(task.worktree_path)
             restart_isolated = self._isolated and mounted
             if mounted and task.defer_reason is not None:
@@ -2209,6 +2245,27 @@ class Engine:
                 finally:
                     self.workspace = prev
                 self._integrate_unit(task, unit)
+            elif task.reverify_from and task.phase == Phase.DEV_VERIFY:
+                # `resolve --reverify` (DW-522) re-armed a DEFERRED or env-fault
+                # ESCALATED story onto its kept attempt product. Ahead of the
+                # spec-approval arm below, which matches the same DEV_VERIFY +
+                # spec_file shape and would review and commit WITHOUT the verify
+                # replay this latch exists to run.
+                self.journal.append(
+                    "resume-reverify", story_key=task.story_key, origin=task.reverify_from
+                )
+                if mounted:
+                    unit = self._reopen_unit(task)
+                    prev = self.workspace
+                    self.workspace = unit.workspace
+                    try:
+                        self._resume_reverify(task)
+                    finally:
+                        self.workspace = prev
+                    self._integrate_unit(task, unit)
+                else:
+                    self._release_orphaned_mount(task)
+                    self._resume_reverify(task)
             elif task.phase == Phase.DEV_VERIFY and task.spec_file:
                 # paused at the spec-approval gate (or, in stories mode, a
                 # plan-checkpoint awaiting implementation — _resume_after_dev_verify
@@ -2295,6 +2352,27 @@ class Engine:
                 else:
                     self._release_orphaned_mount(task)
                     self._finalize_commit_phase(task)
+            elif env_role == "dev" and task.phase == Phase.PENDING:
+                # DW-523: the run paused at the dev dispatch gate, before the
+                # attempt, the baseline, or anything else moved — so NO rollback:
+                # the tree (and any commit the operator made while paused) is the
+                # one the story starts from. The story gate was asked above, before
+                # the site cleared. A review-dispatch pause needs no arm of its own:
+                # it sits at DEV_VERIFY + spec_file (first cycle) or at
+                # REVIEW_VERIFY with the completed pass on record (later cycles).
+                self.journal.append("resume-env-dispatch", story_key=task.story_key, role=env_role)
+                if mounted:
+                    unit = self._reopen_unit(task)
+                    prev = self.workspace
+                    self.workspace = unit.workspace
+                    try:
+                        self._drive_story(task)
+                    finally:
+                        self.workspace = prev
+                    self._integrate_unit(task, unit)
+                else:
+                    self._release_orphaned_mount(task)
+                    self._drive_story(task)
             else:
                 # This arm is the one that does not finish work: it discards the
                 # worktree or resets the tree to baseline and re-runs the story
@@ -2716,11 +2794,34 @@ class Engine:
                         task,
                         parked_pause_reason(f"blocking workflow {wf.name!r} ({lp.name})", result),
                     )
-                self._defer(
-                    task,
-                    session_failure_reason(f"blocking workflow {wf.name!r} ({lp.name})", result),
+                reason = session_failure_reason(
+                    f"blocking workflow {wf.name!r} ({lp.name})", result
                 )
+                # The defer charges the story for the workflow's failure: re-probe
+                # the environment first (DW-523).
+                gated = self._env_gate_decision(
+                    task,
+                    Decision(Action.DEFER, reason),
+                    role="workflow",
+                    result_json=result.result_json,
+                )
+                if gated.action == Action.PAUSE:
+                    self._escalate_decision(task, gated)
+                self._defer(task, reason)
                 return True
+            if wf.blocking:
+                # A completed blocking workflow's "Environment fault:" claim still
+                # forces a probe (DW-523) — at `pre_commit_gate` nothing else may
+                # probe before the commit. A PROCEED carrying no claim returns
+                # unchanged without spawning anything.
+                gated = self._env_gate_decision(
+                    task,
+                    Decision(Action.PROCEED, ""),
+                    role="workflow",
+                    result_json=result.result_json,
+                )
+                if gated.action == Action.PAUSE:
+                    self._escalate_decision(task, gated)
         return False
 
     def _run_story(self, task: StoryTask) -> None:
@@ -2971,6 +3072,9 @@ class Engine:
 
     def _dev_phase(self, task: StoryTask, resume_result: SessionResult | None = None) -> bool:
         if resume_result is None:
+            # DW-523: probe before anything below mutates the task, so an
+            # `environment` pause leaves nothing to roll back on resume.
+            self._gate_dispatch(task, "dev")
             # A fresh invocation cannot consume a snapshot armed by an earlier,
             # non-replayable invocation. Keep crash replay's snapshot intact.
             self._disarm_ledger_snapshot(task)
@@ -3200,30 +3304,21 @@ class Engine:
                 verification_stage=verified.stage,
                 verification_sequence=verified.sequence,
             )
-            decision = decide_dev(task, result, outcome, self.policy)
-            self.journal.append(
-                "dev-decision",
-                story_key=task.story_key,
-                attempt=task.attempt,
-                session_status=result.status,
-                action=str(decision.action),
-                reason=decision.reason,
-                # env_fault from EITHER the verify path (rc 126/127) or the
-                # session-transport classification (#194); decide_dev PAUSEs on
-                # the latter, so the fall-through below preserves the worktree.
-                env_fault=bool((outcome is not None and outcome.env_fault) or result.env_fault),
-                # The all-roles greppable record rides session-end via
-                # `_session_end_extras` (#489); here the flag pairs the
-                # diagnosis with the decision it fed.
-                session_vanished=result.session_vanished,
-                # Whether the session did anything before it ended (#727); False
-                # is what routed a non-completed result to the no-work PAUSE.
-                produced_work=result.produced_work,
-                # Parked on a human prompt (DW-348/DW-350); True is what routed a
-                # non-completed result to the parked PAUSE.
-                parked=result.parked,
-                parked_evidence=result.parked_evidence,
+            # env_fault from EITHER the verify path (a probe, a declared rc,
+            # rc 126/127) or the session-transport classification (#194);
+            # decide_dev PAUSEs on both, so the fall-through below preserves the
+            # worktree.
+            env_fault = bool((outcome is not None and outcome.env_fault) or result.env_fault)
+            # Re-probe the environment before a failure is charged (DW-523) —
+            # ahead of the journal, so `dev-decision` records the routing taken.
+            decision = self._env_gate_decision(
+                task,
+                decide_dev(task, result, outcome, self.policy),
+                role="dev",
+                result_json=result.result_json,
+                already_env_fault=env_fault,
             )
+            self._journal_dev_decision(task, result, decision, env_fault=env_fault)
             if decision.action == Action.PROCEED:
                 # DEV_VERIFY + spec_file is not itself proof of acceptance: this
                 # save also precedes every rejecting decision branch. Persist an
@@ -3342,7 +3437,62 @@ class Engine:
                 self._defer(task, decision.reason)
                 return False
             self._record_dev_spec(task, result.result_json)
-            self._escalate(task, decision.reason)
+            if decision.env_site is not None:
+                self._escalate_env(task, decision.reason, site=decision.env_site)
+            elif (
+                outcome is not None
+                and outcome.env_fault
+                # a session's own CRITICAL outranks the verify env fault in
+                # `decide_dev`, and is not an environment fault to re-verify past
+                and critical_session_reason("dev", result.result_json) is None
+            ):
+                self._escalate_env(task, decision.reason, site="verify:dev")
+            else:
+                self._escalate(task, decision.reason)
+
+    def _journal_dev_decision(
+        self, task: StoryTask, result: SessionResult, decision: Decision, *, env_fault: bool
+    ) -> None:
+        """Journal the dev leg's routing (``dev-decision``). Two literal writes
+        rather than a conditional `**` splat, so the journal field guard reads
+        every name; ``env_fault_site`` appears only on a decision the environment
+        seam reclassified (DW-523)."""
+        if decision.env_site is None:
+            self.journal.append(
+                "dev-decision",
+                story_key=task.story_key,
+                attempt=task.attempt,
+                session_status=result.status,
+                action=str(decision.action),
+                reason=decision.reason,
+                env_fault=env_fault,
+                # The all-roles greppable record rides session-end via
+                # `_session_end_extras` (#489); here the flag pairs the
+                # diagnosis with the decision it fed.
+                session_vanished=result.session_vanished,
+                # Whether the session did anything before it ended (#727); False
+                # is what routed a non-completed result to the no-work PAUSE.
+                produced_work=result.produced_work,
+                # Parked on a human prompt (DW-348/DW-350); True is what routed a
+                # non-completed result to the parked PAUSE.
+                parked=result.parked,
+                parked_evidence=result.parked_evidence,
+            )
+        else:
+            self.journal.append(
+                "dev-decision",
+                story_key=task.story_key,
+                attempt=task.attempt,
+                session_status=result.status,
+                action=str(decision.action),
+                reason=decision.reason,
+                env_fault=env_fault,
+                session_vanished=result.session_vanished,
+                produced_work=result.produced_work,
+                parked=result.parked,
+                parked_evidence=result.parked_evidence,
+                env_fault_site=decision.env_site,
+            )
 
     def _record_dev_spec(self, task: StoryTask, result_json: dict | None) -> None:
         """Capture the spec the dev session produced when the session escalates or
@@ -3433,6 +3583,10 @@ class Engine:
         # follow-up wording (issue #160). None until a pass reaches the parse below
         # (a crash/stall that DEFERs never gets there).
         last_status: str | None = None
+        # A damping grant a completed pass earned, not yet spent: applied only past
+        # the next cycle's dispatch gate (or at loop exit), so a dispatch pause
+        # never persists a spend the completed-pass replay re-derives (DW-523).
+        spend_pending = False
         # A resumed result must enter the loop even when the crash landed in the
         # post-session window of the *final* allowed cycle (review_cycle already
         # == max_review_cycles): its recorded pass was already counted, and the
@@ -3441,6 +3595,12 @@ class Engine:
         # iteration falls back to the normal budget guard.
         while resume_result is not None or task.review_cycle < self.policy.limits.max_review_cycles:
             if resume_result is None:
+                # DW-523: probe before the cycle is charged; a pause here resumes
+                # through the DEV_VERIFY or completed-pass replay arms.
+                self._gate_dispatch(task, "review")
+                if spend_pending:
+                    task.followup_reviews_spent += 1
+                    spend_pending = False
                 # a resumed result replays the cycle it was recorded under: the
                 # counter must not advance, or the replay burns a review-budget
                 # slot and mislabels its journal/session ids.
@@ -3478,12 +3638,18 @@ class Engine:
                 session_status=result.status,
                 result_json=result.result_json,
             )
-            decision = decide_review_session(task, result, self.policy)
+            decision = self._env_gate_decision(
+                task,
+                decide_review_session(task, result, self.policy),
+                role="review",
+                result_json=result.result_json,
+                already_env_fault=result.env_fault,
+            )
             if decision.action != Action.SALVAGE and task.salvage_refile_pending:
                 task.salvage_refile_pending = False
                 self._save()
             if decision.action == Action.PAUSE:
-                self._escalate(task, decision.reason)
+                self._escalate_decision(task, decision)
             if decision.action == Action.DEFER:
                 self._defer(task, decision.reason)
                 return
@@ -3503,11 +3669,15 @@ class Engine:
                     return
                 task.salvage_refile_pending = False
                 self._save()
-                fallback = review_retry_or_exhaust(
-                    task, self.policy, f"{decision.reason}; salvage not applicable"
+                fallback = self._env_gate_decision(
+                    task,
+                    review_retry_or_exhaust(
+                        task, self.policy, f"{decision.reason}; salvage not applicable"
+                    ),
+                    role="review",
                 )
                 if fallback.action == Action.PAUSE:
-                    self._escalate(task, fallback.reason)
+                    self._escalate_decision(task, fallback)
                 if fallback.action == Action.DEFER:
                     self._defer(task, fallback.reason)
                     return
@@ -3577,13 +3747,17 @@ class Engine:
                 # unread `deferred:` list and silently erase a finding. Route as
                 # exhausted without spending a session so a resolved CRITICAL
                 # re-drive re-escalates instead of being downgraded to a defer.
-                exhausted = review_exhausted(
+                exhausted = self._env_gate_decision(
                     task,
-                    "review deferral harvest remained unreadable after "
-                    f"{HARVEST_REPAIR_READ_ATTEMPTS} attempts: {harvest_outcome.reason}",
+                    review_exhausted(
+                        task,
+                        "review deferral harvest remained unreadable after "
+                        f"{HARVEST_REPAIR_READ_ATTEMPTS} attempts: {harvest_outcome.reason}",
+                    ),
+                    role="review",
                 )
                 if exhausted.action == Action.PAUSE:
-                    self._escalate(task, exhausted.reason)
+                    self._escalate_decision(task, exhausted)
                 self._defer(task, exhausted.reason)
                 return
             status = str(rj.get("status", "")).strip()
@@ -3647,7 +3821,14 @@ class Engine:
                     # review revoking the sprint sign-off): a repair session
                     # cannot fix it and another review cycle would replay it —
                     # pause the run instead of burning budget
-                    self._escalate(task, outcome.reason)
+                    self._escalate_outcome(task, outcome, role="review")
+                # Either path below charges the story — a fix session spends a dev
+                # attempt, another pass a review cycle — so re-probe first (DW-523).
+                gated = self._env_gate_decision(
+                    task, Decision(Action.RETRY, outcome.reason), role="review"
+                )
+                if gated.action == Action.PAUSE:
+                    self._escalate_decision(task, gated)
                 if outcome.fixable and task.review_cycle < self.policy.limits.max_review_cycles:
                     # failing verify commands are dev work, not review work: a
                     # re-review of the same tree cannot make them pass. Repair
@@ -3666,17 +3847,21 @@ class Engine:
             if refileable_followup:
                 # Spend one damping grant for honoring this pass's own follow-up
                 # recommendation. Deliberately AFTER the
-                # _run_workflows("post_review_result") gate: the increment is
+                # _run_workflows("post_review_result") gate, and applied only past
+                # the next cycle's dispatch gate (`spend_pending`): the increment is
                 # persisted only by the NEXT cycle's _save(), by which point
                 # _resumable_session can no longer replay this result — so a
-                # crash-replay re-derives the spend exactly once instead of
-                # double-counting it. (A non-terminal status or a non-followup
-                # done — the two other ways to reach here — never sets
-                # refileable_followup, so neither spends the cap.)
-                task.followup_reviews_spent += 1
+                # crash-replay or a dispatch-pause replay re-derives the spend
+                # exactly once instead of double-counting it. (A non-terminal status
+                # or a non-followup done — the two other ways to reach here — never
+                # sets refileable_followup, so neither spends the cap.)
+                spend_pending = True
             # still recommends a follow-up (or a non-terminal status): loop runs a
             # fresh review pass on the newly-patched tree, bounded by max_review_cycles
 
+        if spend_pending:
+            # the loop exhausted its cycles with the last pass's grant unspent
+            task.followup_reviews_spent += 1
         if not clean:
             # Budget exhausted. Before discarding work, distinguish two modes:
             #   (a) the last *completed* pass left the story finalized + verify-green
@@ -3718,16 +3903,19 @@ class Engine:
                     self._journal_review_budget_spent(task)
                     self._commit(task)
                     return
-                if rescue.contradiction:
+                if rescue.contradiction or rescue.env_fault:
                     # The rescue gate is the first place this story's sprint
                     # sign-off was re-read (every in-loop cycle recommended its own
                     # follow-up, so none of them verified). A defer here would roll
                     # the work back under a "did not converge" reason that names
                     # neither side of the disagreement — pause with both instead.
+                    # An environment fault likewise says nothing about the story:
+                    # deferring on it filed verify-green work as unconverged
+                    # (DW-523) — pause, recording the site, like the in-loop gates.
                     # Journaled under the same kind as the two in-loop gates so a
                     # consumer keying on `contradiction` sees all three escalating
-                    # paths. The non-contradiction arm keeps its existing silence:
-                    # its story is told by the defer reason below.
+                    # paths. The remaining arm keeps its existing silence: its
+                    # story is told by the defer reason below.
                     self.journal.append(
                         "review-verify-failed",
                         story_key=task.story_key,
@@ -3735,7 +3923,7 @@ class Engine:
                         env_fault=rescue.env_fault,
                         contradiction=rescue.contradiction,
                     )
-                    self._escalate(task, rescue.reason)
+                    self._escalate_outcome(task, rescue, role="review")
             # Name the last completed pass's real outcome (issue #160): the fixed
             # follow-up wording is only correct when a finalized pass actually left
             # a refileable recommendation. "did not converge" stays in every variant
@@ -3755,7 +3943,13 @@ class Engine:
                 )
             else:
                 detail = "no review pass completed"
-            self._defer(task, f"review did not converge within budget ({detail})")
+            reason = f"review did not converge within budget ({detail})"
+            gated = self._env_gate_decision(
+                task, Decision(Action.DEFER, reason, budget_exhausted=True), role="review"
+            )
+            if gated.action == Action.PAUSE:
+                self._escalate_decision(task, gated)
+            self._defer(task, reason)
             return
 
         self._commit(task)
@@ -3838,13 +4032,17 @@ class Engine:
             if not harvest_outcome.retryable:
                 self._escalate(task, harvest_outcome.reason)
         if harvest_outcome is not None:
-            exhausted = review_exhausted(
+            exhausted = self._env_gate_decision(
                 task,
-                "review timeout deferral harvest remained unreadable after "
-                f"{HARVEST_REPAIR_READ_ATTEMPTS} attempts: {harvest_outcome.reason}",
+                review_exhausted(
+                    task,
+                    "review timeout deferral harvest remained unreadable after "
+                    f"{HARVEST_REPAIR_READ_ATTEMPTS} attempts: {harvest_outcome.reason}",
+                ),
+                role="review",
             )
             if exhausted.action == Action.PAUSE:
-                self._escalate(task, exhausted.reason)
+                self._escalate_decision(task, exhausted)
             self._defer(task, exhausted.reason)
             return True
 
@@ -3863,7 +4061,7 @@ class Engine:
                 # escalate-grade failure (environment fault, git error): another
                 # review cycle would replay it — pause the run (mirrors the
                 # review loop's own verify-failed routing).
-                self._escalate(task, outcome.reason)
+                self._escalate_outcome(task, outcome, role="review")
             return False
         refiled: str | None = None
         if task.followup_review_recommended:
@@ -4127,6 +4325,12 @@ class Engine:
         # No review session ran on this path: session_status/result_json stay None.
         outcome = self._review_verify_gate(task)
         if not outcome.ok and outcome.fixable:
+            # The repair spends a dev attempt: re-probe first (DW-523).
+            gated = self._env_gate_decision(
+                task, Decision(Action.RETRY, outcome.reason), role="review"
+            )
+            if gated.action == Action.PAUSE:
+                self._escalate_decision(task, gated)
             fix = self._fix_phase(task, outcome.reason)
             if fix.action == Action.PAUSE:
                 self._escalate(task, fix.reason)
@@ -4151,8 +4355,12 @@ class Engine:
                 # escalate-grade failure (environment fault, git error, a review
                 # revoking the sprint sign-off): a defer would just replay it on
                 # the next story — pause the run
-                self._escalate(task, outcome.reason)
-            self._defer(task, f"verify failed with review disabled: {outcome.reason}")
+                self._escalate_outcome(task, outcome, role="review")
+            reason = f"verify failed with review disabled: {outcome.reason}"
+            gated = self._env_gate_decision(task, Decision(Action.DEFER, reason), role="review")
+            if gated.action == Action.PAUSE:
+                self._escalate_decision(task, gated)
+            self._defer(task, reason)
             return
         self._commit(task)
 
@@ -6029,13 +6237,300 @@ class Engine:
         "no pass ran" are different facts, and only the caller that never reaches
         here may publish the second one.
         """
+        if verify.preflight_required(self.policy):
+            # The environment preflight (DW-523): a failed probe is an env fault
+            # with cause "probe", returned BEFORE any command runs — so there are
+            # no command records, and the env fault rides the existing escalation
+            # path (`decide_dev` CRITICAL), which pauses without charging.
+            probe = self._run_environment_probes(task, site=f"verify:{verification_stage}")
+            if not probe.ok:
+                return verify.environment_preflight_outcome(probe), NO_VERIFY_COMMANDS
         results = tuple(verify.run_verify_commands(self.policy, self.workspace.root))
         sequence = self._journal_verify_command_results(task, verification_stage, results)
         self._stop_if_verify_interrupted(results)
-        outcome = verify.verify_command_results_outcome(list(results), self.workspace.root)
+        outcome = verify.verify_command_results_outcome(
+            list(results), self.workspace.root, env_fault_rc=self.policy.verify.env_fault_rc
+        )
         return outcome, VerifyCommandRecords(
             results=results, stage=verification_stage, sequence=sequence
         )
+
+    def _run_environment_probes(
+        self, task: StoryTask, *, site: str, root: Path | None = None
+    ) -> verify.ProbeOutcome:
+        """Run ``[environment] probes`` in ``root`` — by default the workspace root,
+        where the verify commands run — and record the result: a failed pass
+        journals ``env-probe-failed`` naming the ``site`` that asked; a healthy one
+        marks the probes fresh for that root until the next session launch. An
+        interrupted pass stops the run (DW-353) before anything decides on it."""
+        where = self.workspace.root if root is None else root
+        probe = verify.run_environment_probes(self.policy, where)
+        self._observe_environment_probes(task, probe, site=site, root=where)
+        return probe
+
+    def _observe_environment_probes(
+        self, task: StoryTask, probe: verify.ProbeOutcome, *, site: str, root: Path
+    ) -> None:
+        """The record-and-stop half of :meth:`_run_environment_probes`, shared
+        with the review gates' :meth:`_review_probe_sink` (whose pass core runs)."""
+        self._stop_if_verify_interrupted(probe.results)
+        failed = probe.failed
+        if failed is None:
+            self._env_probes_fresh_root = root
+            return
+        self._env_probes_fresh_root = None
+        # Two literal writes rather than a conditional `**` splat, so the journal
+        # field guard reads every name; `spawn_error` appears only when set.
+        if failed.spawn_error is None:
+            self.journal.append(
+                "env-probe-failed",
+                story_key=task.story_key,
+                site=site,
+                command=failed.command,
+                rc=failed.returncode,
+                output_tail=failed.output_tail,
+            )
+        else:
+            self.journal.append(
+                "env-probe-failed",
+                story_key=task.story_key,
+                site=site,
+                command=failed.command,
+                rc=failed.returncode,
+                output_tail=failed.output_tail,
+                spawn_error=failed.spawn_error,
+            )
+
+    def _gate_dispatch(self, task: StoryTask, role: str) -> None:
+        """Probe the environment before a ``role`` session launches (DW-523).
+
+        Called before ANY counter, phase, or baseline mutation of the dispatch
+        (the top of :meth:`_dev_phase`, and the review loop before
+        ``review_cycle`` advances), so a failed probe pauses with nothing to undo:
+        no session started, no attempt or cycle was charged, and the tree is the
+        one the pause found. Skipped when no probes are configured (the default —
+        nothing spawns or journals) and when a probe pass already ran since the
+        last session launch (``_env_probes_fresh_root``): a retry or fix dispatch
+        follows the failure-decision seam, which probed before charging it. A
+        rollback clears freshness: the pass vouched for the tree it rewound, so the
+        next gated dispatch (the next story after a rolled-back defer) re-probes. Fresh
+        means fresh for THIS workspace root: a pass in another story's worktree
+        (or in main) does not vouch for a cwd-sensitive probe here."""
+        if not self.policy.environment.probes or self._env_probes_fresh_root == self.workspace.root:
+            return
+        site = f"{ENV_FAULT_SITE_DISPATCH_PREFIX}{role}"
+        probe = self._run_environment_probes(task, site=site)
+        if not probe.ok:
+            self._pause_environment(task, site=site, probe=probe)
+
+    def _pause_environment(
+        self, task: StoryTask, *, site: str, probe: verify.ProbeOutcome
+    ) -> NoReturn:
+        """Pause the run at the ``environment`` stage over a failed dispatch probe.
+
+        Shaped like :meth:`_pause_for_ledger_repair`: notify, ``_save()``,
+        ``RunPaused`` — and the task's phase, attempt and review cycle stay exactly
+        where they were. NOT :meth:`_escalate`: nothing ran, so there is nothing
+        for ``resolve`` to adjudicate. ``env_fault_site`` records the dispatch site
+        so a plain ``bmad-loop resume`` re-probes first
+        (:meth:`_take_env_dispatch_pause`) and then dispatches the same session
+        without a rollback."""
+        failed = probe.failed
+        assert failed is not None  # only a failed pass pauses
+        role = site.removeprefix(ENV_FAULT_SITE_DISPATCH_PREFIX)
+        reason = (
+            f"environment fault before {role} session dispatch — probe failed "
+            f"({probe.reason}): {failed.command}\n"
+            "no session was started and nothing was charged; fix the environment, then run "
+            f"`bmad-loop resume {self.state.run_id}` (the probes re-run first)"
+        )
+        task.env_fault_site = site
+        gates.notify(self.policy, self.run_dir, f"environment fault: {task.story_key}", reason)
+        self._save()
+        raise RunPaused(reason, PAUSE_ENVIRONMENT, task.story_key)
+
+    def _take_env_dispatch_pause(self, task: StoryTask) -> str | None:
+        """Consume a dispatch-site environment pause on resume (DW-523).
+
+        Returns None unless ``task`` paused at a ``probe:dispatch:<role>`` site.
+        Then the probes re-run where the paused dispatch would have launched — the
+        task's recorded worktree when it has one (resume has not swapped the
+        workspace onto the unit yet, and a probe may be cwd-sensitive), else the
+        workspace root; a missing worktree falls back to the workspace root and is
+        escalated by the unit reopen that follows. Still failing re-pauses at
+        the same site with the task unchanged; healthy journals
+        ``env-fault-cleared``, clears the site, saves, and returns the role whose
+        dispatch the pause withheld — the caller dispatches it without a rollback,
+        because nothing ran before the pause."""
+        site = task.env_fault_site
+        if site is None or not site.startswith(ENV_FAULT_SITE_DISPATCH_PREFIX):
+            return None
+        mount = Path(task.worktree_path) if task.worktree_path else None
+        root = mount if mount is not None and mount.is_dir() else None
+        probe = self._run_environment_probes(task, site=site, root=root)
+        if not probe.ok:
+            self._pause_environment(task, site=site, probe=probe)
+        self.journal.append("env-fault-cleared", story_key=task.story_key, site=site)
+        task.env_fault_site = None
+        self._save()
+        return site.removeprefix(ENV_FAULT_SITE_DISPATCH_PREFIX)
+
+    def _env_gate_decision(
+        self,
+        task: StoryTask,
+        decision: Decision,
+        *,
+        role: str,
+        result_json: dict | None = None,
+        already_env_fault: bool = False,
+    ) -> Decision:
+        """The environment seam every failure decision passes through (DW-523).
+
+        A decision that would CHARGE the story — a RETRY (spends an attempt or a
+        review cycle), a DEFER, or any budget-exhausted action — or one whose
+        session claimed an environment fault, first re-runs ``[environment]
+        probes``. A failed probe means the failure may well be the environment's,
+        not the story's, so the charge is withheld: the decision is replaced by a
+        PAUSE carrying ``env_site`` (``probe:decision:<role>``, or
+        ``probe:claim:<role>`` for a claim-only trigger), and the caller escalates
+        through :meth:`_escalate_env`. A healthy pass returns ``decision``
+        unchanged.
+
+        The deciders in ``escalation`` stay pure; this post-filters their answer.
+        Nothing runs when no probes are configured, when ``already_env_fault``
+        says the failure was classified as an environment fault already (it
+        pauses without charging on its own), or when the decision charges nothing
+        (PROCEED, a non-exhausted PAUSE, SALVAGE).
+
+        A session's "Environment fault:" claim (``result_json``) is handled by
+        :meth:`_env_gate_claim` instead, whatever the decision: it forces a probe
+        but never decides on its own."""
+        if already_env_fault:
+            return decision
+        claim = env_fault_claim(result_json)
+        if claim is not None:
+            return self._env_gate_claim(task, decision, claim, role=role)
+        if not self.policy.environment.probes:
+            return decision
+        charges = decision.action in (Action.RETRY, Action.DEFER) or decision.budget_exhausted
+        if not charges:
+            return decision
+        site = f"probe:decision:{role}"
+        probe = self._run_environment_probes(task, site=site)
+        if probe.ok:
+            return decision
+        reason = self._env_decision_reason(decision, probe, role=role)
+        self.journal.append(
+            "env-fault-reclassified",
+            story_key=task.story_key,
+            site=site,
+            action=str(decision.action),
+            reason=reason,
+        )
+        return Decision(Action.PAUSE, reason, env_site=site)
+
+    def _env_gate_claim(
+        self, task: StoryTask, decision: Decision, claim: str, *, role: str
+    ) -> Decision:
+        """Check a session's "Environment fault:" claim against the probes (DW-523).
+
+        The claim is prose, so it decides nothing: it only makes the
+        orchestrator run its own ``[environment] probes`` (site
+        ``probe:claim:<role>``), whatever ``decision`` is — a PROCEED included.
+        A failed probe is the evidence that pauses: ``decision`` is replaced by a
+        PAUSE carrying that site. A passing probe, or no probes configured,
+        returns ``decision`` unchanged. Every claim journals one
+        ``env-fault-claim`` row naming the probe outcome and the action taken."""
+        if not self.policy.environment.probes:
+            self.journal.append(
+                "env-fault-claim",
+                story_key=task.story_key,
+                role=role,
+                reason=claim,
+                probe_outcome="not-configured",
+                action=str(decision.action),
+            )
+            return decision
+        site = f"probe:claim:{role}"
+        probe = self._run_environment_probes(task, site=site)
+        if probe.ok:
+            self.journal.append(
+                "env-fault-claim",
+                story_key=task.story_key,
+                role=role,
+                reason=claim,
+                probe_outcome="passed",
+                action=str(decision.action),
+            )
+            return decision
+        reason = self._env_claim_reason(decision, probe, claim, role=role)
+        self.journal.append(
+            "env-fault-claim",
+            story_key=task.story_key,
+            role=role,
+            reason=claim,
+            probe_outcome="failed",
+            action=str(Action.PAUSE),
+        )
+        self.journal.append(
+            "env-fault-reclassified",
+            story_key=task.story_key,
+            site=site,
+            action=str(decision.action),
+            reason=reason,
+        )
+        return Decision(Action.PAUSE, reason, env_site=site)
+
+    @staticmethod
+    def _env_claim_reason(
+        decision: Decision, probe: verify.ProbeOutcome, claim: str, *, role: str
+    ) -> str:
+        """The escalation reason for a claim a failed probe confirmed: the probe
+        that failed and why, the session's claim, the remedy, the withheld
+        decision (bounded), and the probe's output tail."""
+        failed = probe.failed
+        assert failed is not None  # only a failed pass confirms a claim
+        lines = [
+            f"environment fault: {role} session reported an environment fault and a probe "
+            f"confirmed it — probe failed ({probe.reason}): {failed.command}",
+            f"session claim: {claim}",
+            "the attempt is not charged: the orchestrator's own [environment] probe failed, "
+            "so the environment, not the story, is the likelier cause — fix the environment, "
+            "then re-arm the escalation (the attempt budget resets on re-arm), or keep the "
+            "attempt's work with `bmad-loop resolve <run> --reverify`",
+        ]
+        if decision.reason:
+            lines.append(f"withheld {decision.action}: {decision.reason[:500]}")
+        if failed.output_tail:
+            lines.append(failed.output_tail)
+        return "\n".join(lines)
+
+    @staticmethod
+    def _env_decision_reason(decision: Decision, probe: verify.ProbeOutcome, *, role: str) -> str:
+        """The escalation reason for a failure :meth:`_env_gate_decision`
+        reclassified: what was withheld, which probe failed and why, the remedy,
+        the original reason (bounded), and the probe's output tail."""
+        failed = probe.failed
+        assert failed is not None  # only a failed pass is reclassified
+        if decision.action == Action.RETRY:
+            withheld = "retry"
+        elif decision.action == Action.DEFER:
+            withheld = "defer"
+        else:
+            withheld = "re-escalation"
+        lines = [
+            f"environment fault: {role} {withheld} withheld — probe failed "
+            f"({probe.reason}): {failed.command}",
+            f"the attempt is not charged: an [environment] probe failed after the {role} "
+            "failure, so the environment, not the story, is the likelier cause — fix the "
+            "environment, then re-arm the escalation (the attempt budget resets on re-arm), "
+            "or keep the attempt's work with `bmad-loop resolve <run> --reverify`",
+        ]
+        if decision.reason:
+            lines.append(f"withheld {decision.action}: {decision.reason[:500]}")
+        if failed.output_tail:
+            lines.append(failed.output_tail)
+        return "\n".join(lines)
 
     @staticmethod
     def _stop_if_verify_interrupted(results: Sequence[verify.CommandResult]) -> None:
@@ -6223,6 +6718,88 @@ class Engine:
         self.journal.append("resume-review", story_key=task.story_key)
         self._finish_post_dev_accepted_sync(task)
         self._review_and_commit(task)
+
+    def _resume_reverify(self, task: StoryTask) -> None:
+        """Replay dev verification against the kept attempt product (DW-522).
+
+        `runs.rearm_for_reverify` moved a DEFERRED or env-fault ESCALATED story to
+        DEV_VERIFY with `reverify_from` latched; the tree (HEAD plus its dirty
+        state) is the attempt, and no dev session runs. The replay re-derives the
+        board from the latest completed dev result, re-runs the artifact gate and,
+        when it passes, the `[verify]` commands (environment preflight included),
+        then routes through the pure `decide_reverify`: PROCEED continues exactly
+        as an accepted dev leg does in `_drive_story` (post_dev_phase workflows,
+        the spec-approval gate, review per policy, commit); DEFER re-defers; PAUSE
+        escalates. Nothing is charged — the replay never retries.
+
+        The latch is cleared in memory BEFORE any decision acts, so the save each
+        action makes persists it cleared: a crash mid-defer then replays through
+        the defer arm, never through a second verify replay. The accepted-session
+        latch is deliberately not stamped: the generation the re-arm bumped means
+        no record matches the current attempt, and story runs never read it."""
+        origin = task.reverify_from
+        record = latest_completed_dev_record(task)
+        if record is None or record.result_json is None:
+            task.reverify_from = ""
+            self._escalate(task, "reverify: no completed dev result to re-verify")
+            return
+        result_json = record.result_json
+        self._disarm_ledger_snapshot(task)
+        # The replay-safe board writer (never-regress, latest-wins); a refused row
+        # escalates through `_escalate_board_refusal` as on the dev leg.
+        self._post_dev_state_sync(task, result_json)
+        outcome = self._verify_dev_artifacts(task, result_json)
+        verified = NO_VERIFY_COMMANDS
+        if outcome.ok:
+            outcome, verified = self._verify_commands_with_results(task, "dev")
+        self._emit(
+            "post_dev_verify",
+            task,
+            # no session ran: the replay verified a kept product
+            session_status=None,
+            result_json=result_json,
+            verify_reason=outcome.reason,
+            command_results=verified.results,
+            verification_stage=verified.stage,
+            verification_sequence=verified.sequence,
+        )
+        decision = decide_reverify(task, outcome)
+        self.journal.append(
+            "reverify-decision",
+            story_key=task.story_key,
+            origin=origin,
+            action=str(decision.action),
+            reason=decision.reason,
+            env_fault=outcome.env_fault,
+            verification_sequence=verified.sequence,
+        )
+        task.reverify_from = ""
+        if decision.action == Action.PROCEED:
+            self._save()
+            self._emit("post_dev_phase", task)
+            if self._run_workflows("post_dev_phase", task, task.attempt):
+                return
+            # parity with `_drive_story`'s accepted dev leg
+            if gates.pause_after_spec(self.policy):
+                gates.notify(
+                    self.policy,
+                    self.run_dir,
+                    f"spec ready for approval: {task.story_key}",
+                    f"review {self._operator_spec_path(task)}, then "
+                    f"`bmad-loop resume {self.state.run_id}`",
+                )
+                raise RunPaused(
+                    f"awaiting spec approval for {task.story_key}",
+                    PAUSE_SPEC_APPROVAL,
+                    task.story_key,
+                )
+            self._review_and_commit(task)
+        elif decision.action == Action.DEFER:
+            self._defer(task, decision.reason)
+        elif outcome.env_fault:
+            self._escalate_env(task, decision.reason, site="verify:dev")
+        else:
+            self._escalate(task, decision.reason)
 
     def _after_story(self, task: StoryTask) -> None:
         """Hook fired once a story is fully processed and (under isolation)
@@ -6978,6 +7555,20 @@ class Engine:
 
         return sink
 
+    def _review_probe_sink(self, task: StoryTask) -> verify.ProbeSink:
+        """The sink a review gate hands its environment preflight to (DW-523):
+        the pass core ran in ``paths.repo_root`` is recorded exactly as
+        :meth:`_run_environment_probes` records the dev side's — a failure
+        journals ``env-probe-failed`` with site ``"verify:review"``, a hard stop
+        raises ``RunStopped``, a healthy pass marks the probes fresh."""
+
+        def sink(probe: verify.ProbeOutcome) -> None:
+            self._observe_environment_probes(
+                task, probe, site="verify:review", root=self.workspace.root
+            )
+
+        return sink
+
     def _review_verify_gate(
         self,
         task: StoryTask,
@@ -7028,6 +7619,7 @@ class Engine:
             sprint_reached_done=not self._dev_review_enabled(),
             operator_park=self._operator_park_enabled(),
             on_results=self._review_command_sink(task),
+            on_probes=self._review_probe_sink(task),
         )
         if outcome.ok:
             self._accept_review_artifact_source(task)
@@ -7060,10 +7652,17 @@ class Engine:
         # "park"` (DW-383) — the one mode in which a review's `awaiting-operator`
         # finalization is accepted. It goes LAST, after the board clauses, the same
         # board-before-park order the dev seam keeps. Default prompt unchanged.
+        # The environment-claim clause (DW-523, only while probes are configured)
+        # sits just before it, as on the dev seam.
         park = self._operator_park_instruction() if self._review_demotion_parks() else ""
         clauses = [
             c
-            for c in (self._sprint_board_instruction(), self._board_handback_redirect(), park)
+            for c in (
+                self._sprint_board_instruction(),
+                self._board_handback_redirect(),
+                self._environment_claim_instruction(),
+                park,
+            )
             if c
         ]
         tail = " ".join(clauses)
@@ -7280,6 +7879,9 @@ class Engine:
         preserve_dispatched_spec_snapshot: bool = False,
         prelaunch_validator: Callable[[], None] | None = None,
     ) -> SessionResult:
+        # A session may change the environment a probe pass vouched for, so no
+        # pass survives a launch (DW-523).
+        self._env_probes_fresh_root = None
         # ``label`` names a non-standard session (a plugin-provided workflow) so
         # its task_id stays distinct from the role's own dev/review attempts.
         task_id = _session_task_id(task.story_key, label if label else role, seq, task.generation)
@@ -7611,6 +8213,7 @@ class Engine:
                         if resumable and result.result_json is not None
                         else None
                     ),
+                    label=label or "",
                 )
             )
             # Make the completed session durable before the usage read, post-session
@@ -7818,9 +8421,10 @@ class Engine:
         check, which would otherwise HALT `blocked` on the very diff
         `_restore_patch` just laid onto the tree. A bare story key takes the
         freeform/epic path instead, where that dirty-tree check runs first."""
-        # Both injected clauses ride every leg, in this order — the park clause
+        # The injected clauses ride every leg, in this order (the environment-claim
+        # clause only while probes are configured, DW-523) — the park clause
         # stays LAST because its docstring's backtick argument depends on nothing
-        # following it. Both are bare sentences, so this seam owns every separator:
+        # following it. All are bare sentences, so this seam owns every separator:
         # an em dash after the bare story key (the one leg whose text carries no
         # terminal punctuation), a plain space after a sentence. A full stop
         # followed by an em dash is punctuation noise and must never be assembled.
@@ -7830,7 +8434,13 @@ class Engine:
         # `_dev_prompt`), unlike the live guard on the review seam. Kept for
         # symmetry and pinned with a monkeypatch.
         clauses = [
-            c for c in (self._sprint_board_instruction(), self._operator_park_instruction()) if c
+            c
+            for c in (
+                self._sprint_board_instruction(),
+                self._environment_claim_instruction(),
+                self._operator_park_instruction(),
+            )
+            if c
         ]
         tail = " ".join(clauses)
         after_sentence = f" {tail}" if tail else ""
@@ -7988,6 +8598,34 @@ class Engine:
             "If the story cannot be finished without a human decision, finalize the "
             "spec to status: blocked and say why. That is the hand-back channel; "
             "the board is not."
+        )
+
+    def _environment_claim_instruction(self) -> str:
+        """The environment-fault claim contract (DW-523), injected while
+        ``[environment] probes`` is configured; "" otherwise, so a run without
+        probes keeps every prompt byte-identical.
+
+        It invites a session to name a broken run environment in its final Auto
+        Run Result. The line is a TRIGGER, not a verdict: ``devcontract`` reads it
+        into ``env_fault_claim`` and the engine answers it by running its own
+        probes (:meth:`_env_gate_claim`) — only a failed probe pauses, and a
+        passing one leaves the session's outcome to decide as usual. So the
+        clause also says the line changes nothing on its own, steering the
+        session away from reporting blocked for an outage the probes may not see.
+
+        Backtick-free and a bare sentence with no leading separator, for the
+        reasons :meth:`_operator_park_instruction` gives; every caller places it
+        BEFORE that clause, which stays last."""
+        if not self.policy.environment.probes:
+            return ""
+        return (
+            "If something outside the code blocks your work or its verification "
+            "(a database, container, or service the tests need is down or "
+            "unreachable), add one line reading Environment fault: followed by a "
+            "short description of what is broken to the final Auto Run Result. "
+            "The orchestrator answers that line by running its own environment "
+            "probes, and only their result counts: the line alone changes nothing, "
+            "so still report the story's real status."
         )
 
     def _operator_park_instruction(self) -> str:
@@ -8327,8 +8965,17 @@ class Engine:
                 # escalate-grade failure (environment fault): another repair
                 # session cannot fix the run environment — stop spending the
                 # dev budget and pause for a human instead
-                self._escalate(task, outcome.reason)
+                self._escalate_outcome(task, outcome, role="fix")
             if ok:
+                # A green repair charges nothing, but a session claiming an
+                # environment fault still forces a probe (DW-523) — ahead of the
+                # acceptance below, as on the dev leg, so a confirmed claim
+                # pauses without accepting the repair.
+                claimed = self._env_gate_decision(
+                    task, Decision(Action.PROCEED), role="fix", result_json=result.result_json
+                )
+                if claimed.action == Action.PAUSE:
+                    self._escalate_decision(task, claimed)
                 # A verify-green repair supersedes the original accepted dev
                 # record as the owner of the tree now parked at DEV_VERIFY. Make
                 # that receipt durable in the same save as the fix decision so a
@@ -8336,9 +8983,29 @@ class Engine:
                 self._accept_current_dev_session(task)
             self._save()
             if terminal is not None:
+                terminal = self._env_gate_decision(
+                    task, terminal, role="fix", result_json=result.result_json
+                )
+                if terminal.action == Action.PAUSE and terminal.env_site is not None:
+                    self._escalate_decision(task, terminal)
                 return terminal
             if ok:
                 return Decision(Action.PROCEED)
+            # A failed repair is charged — the next attempt, or the budget-spent
+            # DEFER below — so re-probe the environment first (DW-523).
+            budget_left = task.attempt < self.policy.limits.max_dev_attempts
+            gated = self._env_gate_decision(
+                task,
+                Decision(
+                    Action.RETRY if budget_left else Action.DEFER,
+                    session_failure or reason,
+                    budget_exhausted=not budget_left,
+                ),
+                role="fix",
+                result_json=result.result_json,
+            )
+            if gated.action == Action.PAUSE:
+                self._escalate_decision(task, gated)
         # Budget spent. Carry the last session's own failure so a repair the mux
         # destroyed is not filed as the verification failure that sent it here —
         # the callers substitute verify-centric text for an empty reason, which
@@ -8596,7 +9263,8 @@ class Engine:
                     reason,
                     note=" — the tree was NOT rolled back: the run paused for manual "
                     "recovery first (see the ACTION REQUIRED notice for where the "
-                    "attempt's work is)",
+                    "attempt's work is); if only the environment was broken, `bmad-loop "
+                    f"resolve {self.state.run_id} --reverify` re-verifies the kept work",
                 )
                 raise
             # The reset reverts a *tracked* ledger's uncommitted edits, so the
@@ -9676,9 +10344,9 @@ class Engine:
         spec_path = Path(task.spec_file)
         if not spec_path.is_file():
             return
-        dest = self.run_dir / "deferred" / safe_segment(task.story_key)
+        target = deferred_stash_path(self.run_dir, task.story_key, spec_path.name)
+        dest = target.parent
         dest.mkdir(parents=True, exist_ok=True)
-        target = dest / spec_path.name
         tmp = dest / (spec_path.name + ".tmp")
         shutil.copy2(spec_path, tmp)
         try:
@@ -9697,16 +10365,57 @@ class Engine:
     def _escalate(self, task: StoryTask, reason: str) -> None:
         advance(task, Phase.ESCALATED)
         task.adopt_pending = False  # an escalation spends any adoption (DW-386)
-        self.journal.append("story-escalated", story_key=task.story_key, reason=reason)
+        # Two literal writes rather than a conditional `**` splat, so the journal
+        # field guard reads every name; `env_fault_site` appears only when set.
+        if task.env_fault_site is None:
+            self.journal.append("story-escalated", story_key=task.story_key, reason=reason)
+        else:
+            self.journal.append(
+                "story-escalated",
+                story_key=task.story_key,
+                reason=reason,
+                env_fault_site=task.env_fault_site,
+            )
         displayed = display_critical_reason(reason, task.spec_file)
+        # An environment fault that left a verifiable product can keep it (DW-522).
+        reverify = (
+            f"; or fix the environment and keep the work with "
+            f"`bmad-loop resolve {self.state.run_id} --reverify`"
+            if env_fault_site_reverifiable(task)
+            else ""
+        )
         gates.notify(
             self.policy,
             self.run_dir,
             f"CRITICAL escalation: {task.story_key}",
-            f"{displayed} — resolve, then `bmad-loop resume {self.state.run_id}`",
+            f"{displayed} — resolve, then `bmad-loop resume {self.state.run_id}`{reverify}",
         )
         self._save()
         raise RunPaused(reason, PAUSE_ESCALATION, task.story_key)
+
+    def _escalate_env(self, task: StoryTask, reason: str, *, site: str) -> None:
+        """Escalate an environment fault, recording where it was detected
+        (``StoryTask.env_fault_site``, DW-523) before :meth:`_escalate` journals
+        and saves it. The site is set on the task rather than threaded through
+        ``_escalate`` so the sweep engine's override keeps its signature."""
+        task.env_fault_site = site
+        self._escalate(task, reason)
+
+    def _escalate_outcome(self, task: StoryTask, outcome: VerifyOutcome, *, role: str) -> None:
+        """Escalate a failed verify outcome: an environment fault records site
+        ``verify:<role>`` (DW-523); anything else escalates plainly."""
+        if outcome.env_fault:
+            self._escalate_env(task, outcome.reason, site=f"verify:{role}")
+        else:
+            self._escalate(task, outcome.reason)
+
+    def _escalate_decision(self, task: StoryTask, decision: Decision) -> None:
+        """Escalate a PAUSE decision, recording its ``env_site`` when the
+        environment seam (:meth:`_env_gate_decision`) produced it."""
+        if decision.env_site is not None:
+            self._escalate_env(task, decision.reason, site=decision.env_site)
+        else:
+            self._escalate(task, decision.reason)
 
     def _record_sweep_refusal(self, trigger: str, reason: str) -> None:
         """Record, durably, that this trigger's auto-sweep did not deliver.

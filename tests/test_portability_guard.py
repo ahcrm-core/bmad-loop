@@ -260,6 +260,7 @@ SAVE_STATE_CALLERS = {
     ("cli.py", "_prepare_resume_locked"),
     ("engine.py", "_save"),
     ("runs.py", "_rearm_escalation_locked"),
+    ("runs.py", "_rearm_for_reverify_locked"),
     ("runs.py", "adopt_escalated_branch"),
     ("runs.py", "restamp_code_root"),
     ("runs.py", "_stop_run_once"),
@@ -270,8 +271,10 @@ RUN_STATE_TRANSACTIONS = {
     ("cli.py", "_resume_paused_run"),
     ("cli.py", "cmd_resolve"),
     ("cli.py", "_resolve_adopt"),
+    ("cli.py", "_resolve_reverify"),
     ("journal.py", "save_state"),
     ("runs.py", "rearm_escalation"),
+    ("runs.py", "rearm_for_reverify"),
     ("runs.py", "adopt_escalated_branch"),
     ("runs.py", "restamp_code_root"),
     ("runs.py", "_stop_run_once"),
@@ -580,6 +583,10 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         "entries_now",
         "env_fault",
         "env_fault_evidence",
+        # DW-523: where an environment fault was detected — a closed
+        # `model.ENV_FAULT_SITES` slug (`verify:dev`, `probe:decision:review`, ...),
+        # never authored text, on `story-escalated` and `dev-decision`.
+        "env_fault_site",
         "epic",
         "errors",
         "expired_clock",
@@ -697,8 +704,15 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         # discriminated nothing; since DW-123 two lanes share the site, and since
         # DW-167 the re-apply walk is a third.
         "option_effect",
+        # DW-522: the phase a `story-reverify-armed` story was re-armed FROM — the
+        # closed pair `deferred` / `escalated`, never authored text.
+        "origin",
         "original",
         "owed_after_implement",
+        # DW-523: what the orchestrator's probe made of a session's environment-
+        # fault claim on `env-fault-claim` — the closed set passed / failed /
+        # not-configured, never authored text.
+        "probe_outcome",
         # Parked-session diagnosis (DW-348/DW-350) on `dev-decision`, `session-end`,
         # `workflow-end`, `migrate-decision` and `triage-decision`: whether the
         # adapter withheld the stall nudge because the CLI was waiting on a human
@@ -795,6 +809,9 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         "site",
         "skip",
         "spec_folder",
+        # DW-522: whether `story-reverify-armed` copied the stashed spec back (a
+        # bare boolean).
+        "spec_restored",
         "stage",
         "state_kind",
         "status",
@@ -1198,6 +1215,32 @@ JOURNAL_KINDS = frozenset(
         "deferred-close-skipped-out-of-tree",
         "deferred-close-unmatched",
         "dev-decision",
+        # DW-523. A failed `[environment]` probe pass, from
+        # `Engine._observe_environment_probes` (dev/fix verify, and the review
+        # gates through `_review_probe_sink`): `site` names the asking seam.
+        "env-probe-failed",
+        # DW-523. A charging failure decision (retry / defer / budget-exhausted)
+        # replaced by a PAUSE because a re-probe failed, from
+        # `Engine._env_gate_decision`: `site` is the `env_fault_site` recorded.
+        "env-fault-reclassified",
+        # DW-522. A DEFERRED or environment-fault ESCALATED story re-armed for a
+        # verify replay of its kept tree, from `runs._rearm_for_reverify_locked`.
+        "story-reverify-armed",
+        # DW-522. The engine's `_finish_inflight` reverify arm entering the replay
+        # (`resume-reverify`), and the replay's `decide_reverify` routing
+        # (`reverify-decision`), from `Engine._resume_reverify`.
+        "resume-reverify",
+        "reverify-decision",
+        # DW-523. A dispatch-site `environment` pause whose resume re-probe passed
+        # (`env-fault-cleared`, from `Engine._take_env_dispatch_pause`), and the
+        # no-rollback dev re-dispatch that follows (`resume-env-dispatch`, from
+        # `Engine._finish_inflight` and `SweepEngine._recover_inflight_bundle`).
+        "env-fault-cleared",
+        "resume-env-dispatch",
+        # DW-523. A session's "Environment fault:" claim and what the
+        # orchestrator's own probe made of it (`probe_outcome`), from
+        # `Engine._env_gate_claim` — journaled for every claim, confirmed or not.
+        "env-fault-claim",
         "epic-boundary",
         "fix-decision",
         "fix-harvest-failed",
@@ -4376,6 +4419,88 @@ def test_verify_command_results_outcome_called_only_from_its_two_compositions():
         "repo_root (#695):\n"
         + "\n".join(f"  {rel}:{ln}: {txt.strip()}" for rel, ln, txt in offenders)
     )
+
+
+# DW-523: every composition that runs `[verify] commands` runs the environment
+# preflight first. `(file, class or None, function)` -> where it must call one of
+# `ENV_PREFLIGHT_CALLS`. A new composition is a decision to add a row here.
+ENV_PREFLIGHT_COMPOSITIONS = (
+    ("verify.py", None, "verify_commands_outcome"),
+    ("engine.py", "Engine", "_verify_commands_with_results"),
+    ("cli.py", None, "_reverify"),
+)
+ENV_PREFLIGHT_CALLS = frozenset({"run_environment_probes", "_run_environment_probes"})
+
+
+def _calls_env_preflight(tree: ast.Module, cls: str | None, name: str) -> bool | None:
+    """Whether ``cls.name`` (or module-level ``name``) calls a preflight runner;
+    None when the function is not found at all (a rename must not read as a pass)."""
+    scope: list[ast.stmt] = tree.body
+    if cls is not None:
+        owner = next((n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == cls), None)
+        if owner is None:
+            return None
+        scope = owner.body
+    fn = next(
+        (
+            n
+            for n in scope
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == name
+        ),
+        None,
+    )
+    if fn is None:
+        return None
+    for node in ast.walk(fn):
+        if isinstance(node, ast.Call):
+            callee = node.func
+            called = callee.id if isinstance(callee, ast.Name) else getattr(callee, "attr", None)
+            if called in ENV_PREFLIGHT_CALLS:
+                return True
+    return False
+
+
+def test_every_verify_composition_runs_the_environment_preflight():
+    """`verify_commands_outcome` (the three review gates), the engine's dev/fix
+    composition, and `cli._reverify` each run `[environment] probes` before any
+    `[verify]` command (DW-523). A composition that skipped it would run the
+    commands in an environment the operator declared a check for, and charge a
+    story for an outage. Ablation: delete the probe call from any of the three
+    and its row is named here."""
+    offenders = []
+    for rel, cls, name in ENV_PREFLIGHT_COMPOSITIONS:
+        tree = ast.parse((SRC / rel).read_text(encoding="utf-8"), filename=rel)
+        found = _calls_env_preflight(tree, cls, name)
+        if found is not True:
+            where = f"{cls}.{name}" if cls else name
+            offenders.append(f"{rel}:{where}: {'not found' if found is None else 'no preflight'}")
+    assert not offenders, (
+        "a [verify] composition no longer runs the environment preflight "
+        "(run_environment_probes / Engine._run_environment_probes):\n  " + "\n  ".join(offenders)
+    )
+
+
+def test_env_preflight_detector_sees_a_missing_call():
+    """The guard above asserts a PRESENCE per row; feed its detector the three
+    shapes it must tell apart, so a detector that always answered True (or never
+    found the function) cannot pass it."""
+    with_call = ast.parse(
+        "class Engine:\n"
+        "    def _verify_commands_with_results(self):\n"
+        "        self._run_environment_probes(task, site='x')\n"
+        "def _reverify():\n"
+        "    verify.run_environment_probes(pol, cwd)\n"
+    )
+    without = ast.parse(
+        "class Engine:\n"
+        "    def _verify_commands_with_results(self):\n"
+        "        verify.run_verify_commands(self.policy, root)\n"
+    )
+    assert _calls_env_preflight(with_call, "Engine", "_verify_commands_with_results") is True
+    assert _calls_env_preflight(with_call, None, "_reverify") is True
+    assert _calls_env_preflight(without, "Engine", "_verify_commands_with_results") is False
+    assert _calls_env_preflight(without, None, "_reverify") is None
+    assert _calls_env_preflight(without, "Missing", "_verify_commands_with_results") is None
 
 
 def test_spec_path_resolved_only_through_the_anchor():

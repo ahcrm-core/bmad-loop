@@ -2595,6 +2595,13 @@ class SweepEngine(Engine):
                 phase=str(task.phase),
                 rearmed=task.rearmed,  # read before the recovery clears the latch
             )
+            if task.reverify_from:
+                # DW-522: `runs.reverify_refusal` refuses sweep runs, so a latch here
+                # was not set by `resolve --reverify`. Fail closed rather than let the
+                # restart arm roll the kept work back under it; the latch is spent
+                # first so the escalation's save persists it cleared.
+                task.reverify_from = ""
+                self._escalate(task, "resolve --reverify is not supported for sweep runs")
             if self._recover_inflight_bundle(task):
                 continue
             self._ensure_bundle_intent(task)  # every refusal raises RunPaused
@@ -3248,10 +3255,16 @@ class SweepEngine(Engine):
         to dispatch it. A bare DEV_VERIFY + spec_file shape is insufficient: the
         pre-action decision save has the same shape for rejected decisions.
 
-        Deliberately narrower than the base _finish_inflight: no
+        Deliberately narrower than the base _finish_inflight: no general
         `_resumable_session` arm, so a bundle whose host died in the
         post-session window still restarts rather than replaying its recorded
-        result. Lifting that is a resume-fidelity change of its own. The
+        result. Lifting that is a resume-fidelity change of its own. The one
+        replay it does run is an `environment` dispatch pause's (DW-523), which
+        `_take_env_dispatch_pause` consumes first: nothing ran after the pause, so
+        a review-dispatch pause at REVIEW_VERIFY replays its completed pass
+        (returns True), and a dev-dispatch pause at PENDING returns False WITHOUT
+        the rollback — an isolated unit is untouched and is discarded for the
+        fresh mount, an in-place tree is the one the bundle starts from. The
         COMMITTING window IS recovered, though — same as the base engine's
         resume-commit arm (#115). The base's `_pending_salvage_session` replay
         (DW-278) is not mirrored either: a bundle whose review-timeout salvage
@@ -3280,8 +3293,37 @@ class SweepEngine(Engine):
             # regardless of live policy; restart is the only path allowed to release
             # or discard its ownership before future work begins.
             task.rebase_spec_paths_on(self._mount_project(task))
+        env_role = self._take_env_dispatch_pause(task)
         mounted = bool(task.worktree_path)
         restart_isolated = self._isolated and mounted
+        if env_role == "review" and task.phase == Phase.REVIEW_VERIFY:
+            resumable = self._resumable_session(task)
+            if resumable is not None and resumable[0] == "review":
+                self.journal.append("resume-env-dispatch", story_key=task.story_key, role=env_role)
+                # deliberate reset to the legal pre-review phase, as the base
+                # engine's replay arm does
+                task.phase = Phase.DEV_VERIFY
+                if mounted:
+                    unit = self._reopen_unit(task)
+                    prev = self.workspace
+                    self.workspace = unit.workspace
+                    try:
+                        self._review_and_commit(task, resume_result=resumable[1])
+                    finally:
+                        self.workspace = prev
+                    self._integrate_unit(task, unit)
+                else:
+                    self._review_and_commit(task, resume_result=resumable[1])
+                return True
+        if env_role == "dev" and task.phase == Phase.PENDING:
+            # Paused at the dev dispatch gate: no session ran, nothing to roll back.
+            self.journal.append("resume-env-dispatch", story_key=task.story_key, role=env_role)
+            if restart_isolated:
+                # the untouched unit; _run_story mounts a fresh one
+                self._discard_unit_for_restart(task)
+            elif mounted:
+                self._release_orphaned_mount(task)
+            return False
         if task.phase == Phase.COMMITTING:
             # the gate+advance save landed pre-death; finish the commit
             # instead of rolling verified bundle work back (see
@@ -8613,6 +8655,11 @@ class SweepEngine(Engine):
             "conflicting main-checkout changes pause publication and retain source "
             "artifacts for recovery. Accepting the receipt alone does not publish files."
         )
+        # The environment-claim clause (DW-523) closes each leg's invocation
+        # sentence, ahead of the artifact-only paragraph — "" without probes, so
+        # the default prompt is unchanged. This engine has no park clause.
+        env_claim = self._environment_claim_instruction()
+        env_sentence = f" {env_claim}" if env_claim else ""
         if feedback is None:
             if task.restore_patch and task.spec_file:
                 return (
@@ -8621,7 +8668,7 @@ class SweepEngine(Engine):
                     f"The attempted change was restored onto the working tree after "
                     f"an intent-gap resolution; review it against the amended spec. "
                     f"Do NOT edit the deferred-work ledger; the orchestrator records "
-                    f"resolution.{artifact_only_guidance}"
+                    f"resolution.{env_sentence}{artifact_only_guidance}"
                 )
             # A retry after a rolled-back attempt names its verified parked work
             # (#777); a superseded bundle's ref is suppressed by the shared builder.
@@ -8630,7 +8677,7 @@ class SweepEngine(Engine):
                 f"/{self._dev_skill()} Implement the deferred-work bundle described in "
                 f"`{bundle_ref}` — it carries the intent and the verbatim ledger "
                 f"entries to resolve. Do NOT edit the deferred-work ledger; the "
-                f"orchestrator records resolution.{artifact_only_guidance}"
+                f"orchestrator records resolution.{env_sentence}{artifact_only_guidance}"
             ) + (f"\n\n{preserved}" if preserved else "")
         self._reset_spec_for_repair(task)
         spec_ref = task.spec_file or bundle_ref
@@ -8640,7 +8687,7 @@ class SweepEngine(Engine):
             f"previous session's work failed deterministic verification; repair the "
             f"working tree so verification passes without changing the frozen intent "
             f"contract or editing the deferred-work ledger. Verification evidence is "
-            f"in `{feedback}`.{artifact_only_guidance}"
+            f"in `{feedback}`.{env_sentence}{artifact_only_guidance}"
         )
 
     def _post_dev_state_sync(self, task: StoryTask, result_json: dict | None) -> None:
@@ -9007,6 +9054,7 @@ class SweepEngine(Engine):
             self.workspace.paths,
             self.policy,
             on_results=self._review_command_sink(task),
+            on_probes=self._review_probe_sink(task),
         )
         if outcome.ok:
             self._accept_review_artifact_source(task)

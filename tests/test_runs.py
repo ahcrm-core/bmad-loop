@@ -17,6 +17,10 @@ from unittest import mock
 
 import pytest
 from conftest import (
+    _REVERIFY_KEY,
+    _REVERIFY_SPEC_BYTES,
+    _REVERIFY_SPEC_REL,
+    _reverify_run,
     assert_run_state_lock_held,
     escalated_run,
     git,
@@ -3956,6 +3960,41 @@ def test_rearm_clears_a_stale_adopt_latch(tmp_path):
     assert task.adopt_pending is False
 
 
+def test_rearm_clears_env_fault_site(tmp_path):
+    """DW-523: a re-armed story starts with no environment fault on record.
+
+    Ablation, performed: drop the `env_fault_site = None` in
+    `_rearm_escalation_locked` and this reddens."""
+    run_dir, _spec = _escalated_run(tmp_path, _SPEC_WITH_ARR)
+    state = load_state(run_dir)
+    state.tasks["1-1-a"].env_fault_site = "probe:decision:dev"
+    save_state(run_dir, state)
+
+    runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
+
+    assert load_state(run_dir).tasks["1-1-a"].env_fault_site is None
+
+
+def test_adopt_clears_env_fault_site(tmp_path):
+    """DW-523: adopting the escalated branch commits it as-is, so no environment
+    fault stays on record.
+
+    Ablation, performed: drop the `env_fault_site = None` in
+    `adopt_escalated_branch` and this reddens."""
+    from bmad_loop.model import Phase
+
+    run_dir, _wt = _adoptable(tmp_path)
+    state = load_state(run_dir)
+    state.tasks["1-1-a"].env_fault_site = "verify:review"
+    save_state(run_dir, state)
+
+    runs.adopt_escalated_branch(run_dir)
+
+    task = load_state(run_dir).tasks["1-1-a"]
+    assert task.phase == Phase.COMMITTING and task.adopt_pending is True
+    assert task.env_fault_site is None
+
+
 def _adoptable(tmp_path):
     """An escalation-paused run whose ESCALATED task keeps a worktree + branch + spec."""
     wt = tmp_path / "wt"
@@ -4448,6 +4487,24 @@ def test_rearm_resets_followup_reviews_spent(tmp_path):
     task = load_state(run_dir).tasks["1-1-a"]
     assert task.followup_reviews_spent == 0
     assert task.review_cycle == 0  # reset in lockstep with the counter
+
+
+def test_rearm_clears_a_stale_reverify_latch(tmp_path):
+    """A verify replay that escalated before its decision (a refused board write)
+    leaves `reverify_from` on the escalated task. A plain re-arm re-implements from
+    the baseline, so it spends the latch; left set, the fresh attempt's next
+    DEV_VERIFY pause would resume through the verify-replay arm.
+
+    Ablation, performed: drop the clear in `_rearm_escalation_locked` and this
+    reddens on the surviving latch."""
+    run_dir, _ = _escalated_run(tmp_path, _SPEC_WITH_ARR)
+    state = load_state(run_dir)
+    state.tasks["1-1-a"].reverify_from = "deferred"
+    save_state(run_dir, state)
+
+    runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
+
+    assert load_state(run_dir).tasks["1-1-a"].reverify_from == ""
 
 
 # --------------------------------------------- #90: abandoned restore-latch residue
@@ -9286,3 +9343,340 @@ def test_nested_live_stories_root_follows_a_project_move_to_the_mount_project(tm
     live_mount_project.mkdir(parents=True)
 
     assert runs.live_stories_root(run.task, run.state, live_app) == live_mount_project
+
+
+# ----------------------------------------------- rearm_for_reverify (DW-522)
+
+
+def _edit_reverify_state(run_dir, edit):
+    state = load_state(run_dir)
+    edit(state, state.tasks[_REVERIFY_KEY])
+    save_state(run_dir, state)
+
+
+def _reverify_rows(run_dir):
+    return [e for e in Journal(run_dir).entries() if e["kind"] == "story-reverify-armed"]
+
+
+def test_rearm_for_reverify_moves_deferred_to_dev_verify_keeping_baseline(tmp_path):
+    from bmad_loop.model import Phase
+
+    run_dir, spec_path = _reverify_run(tmp_path)
+    project = spec_path.parents[2]
+    head_before = git(project, "rev-parse", "HEAD")
+    before = load_state(run_dir).tasks[_REVERIFY_KEY]
+
+    outcome = runs.rearm_for_reverify(run_dir, project_root=project)
+
+    assert outcome.story_key == _REVERIFY_KEY
+    assert outcome.hold_resume is False
+    state = load_state(run_dir)
+    task = state.tasks[_REVERIFY_KEY]
+    assert task.phase == Phase.DEV_VERIFY
+    assert task.reverify_from == "deferred"
+    assert task.defer_reason is None
+    assert task.generation == before.generation + 1
+    assert task.review_cycle == 0 and task.followup_reviews_spent == 0
+    assert task.salvage_refile_pending is False
+    assert task.adopt_pending is False and task.rearmed is False
+    # the attempt product is the tree: nothing about it moves
+    assert task.baseline_commit == before.baseline_commit
+    assert task.attempt == 2
+    assert [s.task_id for s in task.sessions] == ["1-1-a-dev-2"]
+    assert task.board_advance_intended == "review"
+    assert git(project, "rev-parse", "HEAD") == head_before
+    # the pause is the caller's to clear
+    assert state.paused_stage == "escalation"
+    rows = _reverify_rows(run_dir)
+    assert len(rows) == 1
+    assert rows[0]["story_key"] == _REVERIFY_KEY
+    assert rows[0]["origin"] == "deferred"
+    assert rows[0]["baseline"] == before.baseline_commit
+    assert rows[0]["spec_restored"] is False
+
+
+def test_rearm_for_reverify_accepts_a_verify_env_fault_escalation(tmp_path):
+    from bmad_loop.model import Phase
+
+    run_dir, spec_path = _reverify_run(tmp_path, phase="escalated", env_fault_site="verify:dev")
+
+    runs.rearm_for_reverify(run_dir, project_root=spec_path.parents[2])
+
+    task = load_state(run_dir).tasks[_REVERIFY_KEY]
+    assert task.phase == Phase.DEV_VERIFY
+    assert task.reverify_from == "escalated"
+    assert task.env_fault_site is None
+    assert _reverify_rows(run_dir)[0]["origin"] == "escalated"
+
+
+def test_rearm_for_reverify_skips_plugin_workflow_sessions(tmp_path):
+    """A plugin workflow declaring `role = "dev"` (a post_dev_phase or
+    pre_commit_gate gate) is recorded under the dev role with no result payload;
+    it is not the attempt, so neither the dev-result lookup nor the latest-session
+    check reads it. Ablation, performed: drop the `not s.label` filter from
+    `latest_completed_dev_record` (or from the `last_dev` lookup) and this refuses."""
+    from bmad_loop.model import Phase, SessionRecord
+
+    run_dir, spec_path = _reverify_run(tmp_path)
+
+    def edit(_state, task):
+        task.sessions.append(
+            SessionRecord(
+                task_id="1-1-a-tea.gate-1",
+                role="dev",
+                status="completed",
+                label="tea.gate",
+            )
+        )
+
+    _edit_reverify_state(run_dir, edit)
+
+    runs.rearm_for_reverify(run_dir, project_root=spec_path.parents[2])
+
+    assert load_state(run_dir).tasks[_REVERIFY_KEY].phase == Phase.DEV_VERIFY
+
+
+def test_rearm_for_reverify_restores_the_stashed_spec_byte_exact(tmp_path):
+    run_dir, spec_path = _reverify_run(tmp_path, spec="stashed")
+    stash = runs.deferred_stash_path(run_dir, _REVERIFY_KEY, spec_path.name)
+    assert not spec_path.exists()
+
+    runs.rearm_for_reverify(run_dir, project_root=spec_path.parents[2])
+
+    assert spec_path.read_bytes() == _REVERIFY_SPEC_BYTES  # CRLF and all
+    assert stash.read_bytes() == _REVERIFY_SPEC_BYTES  # the stash is kept
+    row = _reverify_rows(run_dir)[0]
+    assert row["spec_restored"] is True
+    assert row["spec_file"] == str(spec_path)
+
+
+def test_rearm_for_reverify_keeps_an_operator_restored_spec(tmp_path):
+    """A spec the operator already put back wins over the stash: it may carry their
+    own edits, and the replay verifies what is on the tree."""
+    run_dir, spec_path = _reverify_run(tmp_path)
+    stash = runs.deferred_stash_path(run_dir, _REVERIFY_KEY, spec_path.name)
+    stash.parent.mkdir(parents=True)
+    stash.write_bytes(b"---\nstatus: in-review\n---\nthe older stashed copy\n")
+
+    runs.rearm_for_reverify(run_dir, project_root=spec_path.parents[2])
+
+    assert spec_path.read_bytes() == _REVERIFY_SPEC_BYTES
+    assert _reverify_rows(run_dir)[0]["spec_restored"] is False
+
+
+def test_rearm_for_reverify_spec_restore_fault_is_a_rearm_error(tmp_path, monkeypatch):
+    """A spec-restore I/O fault (stash unreadable, disk full, an unconfined write)
+    surfaces as an actionable RearmError the CLI reports, not a bare OSError for
+    `main()`'s backstop; nothing is persisted.
+
+    Ablation, performed: drop the `except OSError` wrap in
+    `_rearm_for_reverify_locked` and this reddens on the bare OSError."""
+    from bmad_loop.journal import STATE_FILE
+
+    run_dir, spec_path = _reverify_run(tmp_path, spec="stashed")
+    state_before = (run_dir / STATE_FILE).read_bytes()
+
+    def disk_full(*_args, **_kwargs):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(runs, "atomic_write_bytes_confined", disk_full)
+
+    with pytest.raises(runs.RearmError, match="re-run resolve --reverify") as exc:
+        runs.rearm_for_reverify(run_dir, project_root=spec_path.parents[2])
+
+    assert isinstance(exc.value.__cause__, OSError)
+    assert not spec_path.exists()
+    assert (run_dir / STATE_FILE).read_bytes() == state_before
+    assert _reverify_rows(run_dir) == []
+
+
+def test_rearm_for_reverify_rolls_back_the_restored_spec_when_save_fails(tmp_path, monkeypatch):
+    """An interrupt before the commit point leaves the tree as the re-arm found it:
+    the spec copy this call created is removed again, the stash and state untouched.
+
+    Ablation, performed: drop the `retrying_unlink(spec_path)` undo in
+    `_rearm_for_reverify_locked` and this reddens on the leftover spec."""
+    from bmad_loop.journal import STATE_FILE
+
+    run_dir, spec_path = _reverify_run(tmp_path, spec="stashed")
+    stash = runs.deferred_stash_path(run_dir, _REVERIFY_KEY, spec_path.name)
+    state_before = (run_dir / STATE_FILE).read_bytes()
+
+    def interrupted_save(_run_dir, _state):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(runs, "save_state", interrupted_save)
+
+    with pytest.raises(KeyboardInterrupt):
+        runs.rearm_for_reverify(run_dir, project_root=spec_path.parents[2])
+
+    assert not spec_path.exists()
+    assert stash.read_bytes() == _REVERIFY_SPEC_BYTES
+    assert (run_dir / STATE_FILE).read_bytes() == state_before
+    assert _reverify_rows(run_dir) == []
+
+
+def _git_reset_to_baseline(run_dir, project):
+    git(project, "reset", "-q", "--hard", load_state(run_dir).tasks[_REVERIFY_KEY].baseline_commit)
+
+
+def _baseline_off_head(run_dir, project):
+    git(project, "commit", "-q", "--allow-empty", "-m", "side")
+    side = git(project, "rev-parse", "HEAD")
+    git(project, "reset", "-q", "--hard", "HEAD~1")
+
+    def edit(_state, task):
+        task.baseline_commit = side
+
+    _edit_reverify_state(run_dir, edit)
+
+
+def _mounted(run_dir, project):
+    mount = project.parent / "wt"
+    mount.mkdir()
+
+    def edit(_state, task):
+        task.worktree_path = str(mount)
+        task.branch = "bmad-loop/r1/1-1-a"
+
+    _edit_reverify_state(run_dir, edit)
+
+
+def _later_story(run_dir, _project):
+    def edit(state, _task):
+        state.tasks["1-2-b"] = StoryTask(story_key="1-2-b", epic=1)
+
+    _edit_reverify_state(run_dir, edit)
+
+
+def _state_edit(fn):
+    return lambda run_dir, _project: _edit_reverify_state(run_dir, fn)
+
+
+def _crashed_fix_after_dev(run_dir, _project):
+    from bmad_loop.model import SessionRecord
+
+    def edit(_state, task):
+        task.sessions.append(SessionRecord(task_id="1-1-a-dev-2", role="dev", status="crashed"))
+
+    _edit_reverify_state(run_dir, edit)
+
+
+def _spec_gone(_run_dir, project):
+    (project / _REVERIFY_SPEC_REL).unlink()
+
+
+# Each row: (id, phase, env_fault_site, arrange, expected refusal fragment). Every row
+# was ablated by deleting its gating check in `runs.reverify_refusal` (the test then
+# re-arms instead of refusing).
+_REVERIFY_REFUSALS = [
+    (
+        "sweep_run",
+        "deferred",
+        None,
+        _state_edit(lambda s, _t: setattr(s, "run_type", "sweep")),
+        "not supported for sweep runs",
+    ),
+    (
+        "pause_names_another_story",
+        "deferred",
+        None,
+        _state_edit(lambda s, _t: setattr(s, "paused_story_key", "9-9-z")),
+        "is not paused on story 1-1-a",
+    ),
+    ("later_story_picked", "deferred", None, _later_story, "a later story was picked"),
+    ("tree_at_baseline", "deferred", None, None, "holds nothing above"),
+    (
+        "no_completed_dev_result",
+        "deferred",
+        None,
+        _state_edit(lambda _s, t: setattr(t.sessions[0], "result_json", None)),
+        "no completed dev session result",
+    ),
+    # a fix session (recorded under the dev role) crashed after the completed dev
+    # pass: the tree holds its partial work, which the earlier result does not describe
+    ("latest_dev_session_failed", "deferred", None, _crashed_fix_after_dev, "ended crashed"),
+    ("missing_spec_no_stash", "deferred", None, _spec_gone, "neither at"),
+    (
+        "escalation_without_reverifiable_site",
+        "escalated",
+        None,
+        None,
+        "a verify replay cannot clear",
+    ),
+    (
+        "dispatch_site_escalation",
+        "escalated",
+        "probe:dispatch:dev",
+        None,
+        "a verify replay cannot clear",
+    ),
+    (
+        "plan_review_owed",
+        "deferred",
+        None,
+        _state_edit(lambda _s, t: setattr(t, "plan_review_owed", True)),
+        "still owes a plan review",
+    ),
+    (
+        "moved_repo_root",
+        "deferred",
+        None,
+        _state_edit(lambda s, _t: setattr(s, "repo_root", str(Path(s.project).parent / "was"))),
+        "code root in the BMAD config has changed",
+    ),
+    ("baseline_not_ancestor_of_head", "deferred", None, _baseline_off_head, "is not an ancestor"),
+    # a mount directory that is not (or no longer) a registered worktree of the code root
+    ("unregistered_mount", "deferred", None, _mounted, "is no longer a worktree of"),
+]
+
+
+@pytest.mark.parametrize(
+    ("phase", "site", "arrange", "fragment"),
+    [pytest.param(*row[1:], id=row[0]) for row in _REVERIFY_REFUSALS],
+)
+def test_rearm_for_reverify_refuses(tmp_path, phase, site, arrange, fragment):
+    """Every refusal is raised before anything is written: state.json byte-identical,
+    no journal row, the spec where it was."""
+    from bmad_loop.journal import STATE_FILE
+
+    run_dir, spec_path = _reverify_run(tmp_path, phase=phase, env_fault_site=site)
+    project = spec_path.parents[2]
+    if arrange is None and fragment == "holds nothing above":
+        arrange = _git_reset_to_baseline
+    if arrange is not None:
+        arrange(run_dir, project)
+    state_before = (run_dir / STATE_FILE).read_bytes()
+
+    # the story is named explicitly, as `--story` would: with no key the call targets
+    # the paused story, so the pause-names-another-story row is reachable only so
+    with pytest.raises(runs.RearmError, match=re.escape(fragment)):
+        runs.rearm_for_reverify(run_dir, _REVERIFY_KEY, project_root=project)
+
+    assert (run_dir / STATE_FILE).read_bytes() == state_before
+    assert _reverify_rows(run_dir) == []
+
+
+def test_rearm_for_reverify_refusal_names_the_preserve_ref(tmp_path):
+    run_dir, spec_path = _reverify_run(tmp_path)
+    project = spec_path.parents[2]
+    _git_reset_to_baseline(run_dir, project)
+    _edit_reverify_state(
+        run_dir, lambda _s, t: setattr(t, "preserve_ref", "refs/bmad-loop/preserve/r1/1-1-a")
+    )
+
+    with pytest.raises(runs.RearmError, match="parked at refs/bmad-loop/preserve/r1/1-1-a"):
+        runs.rearm_for_reverify(run_dir, project_root=project)
+
+
+def test_rearm_for_reverify_locked_body_holds_the_run_lock_through_save(tmp_path, monkeypatch):
+    run_dir, spec_path = _reverify_run(tmp_path)
+    real_save = runs.save_state
+
+    def checked_save(target, state):
+        assert_run_state_lock_held(target)
+        real_save(target, state)
+
+    monkeypatch.setattr(runs, "save_state", checked_save)
+
+    runs.rearm_for_reverify(run_dir, project_root=spec_path.parents[2])

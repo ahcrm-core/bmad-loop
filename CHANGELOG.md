@@ -7,6 +7,38 @@ breaking changes may land in a minor release.
 
 ## [Unreleased]
 
+### Added
+
+- Add `[environment] probes` (+ `probe_timeout_s`): operator health checks run
+  before `[verify]` commands, before each dev and review session launch, and
+  before a failed attempt is charged; a failing, hanging or unrunnable probe
+  pauses the run as an environment fault and charges nothing (DW-523).
+- Add `[verify] env_fault_rc` (0 = disabled, 75 suggested): a verify command
+  exiting with it declares an environment fault, not a code failure (DW-523).
+- Add the `environment` pause stage: a probe failing before a session launch
+  pauses there, and a plain `bmad-loop resume` re-probes and launches the same
+  session with no rollback (DW-523).
+- Treat an `Environment fault: <text>` line in a session's Auto Run Result as a
+  probe trigger: the run pauses only when a probe confirms it (DW-523).
+- Add `bmad-loop resolve <run> --reverify`: replay `[verify]` on a DEFERRED
+  story's kept work, or an environment-fault escalated one's when the fault left
+  finished work to verify — HEAD in place, or the kept
+  worktree unit — then review per policy and commit or merge, with no dev
+  session and no resolve agent; a worktree unit is accepted under any pause
+  when `--story` names it, and sweep runs are refused (DW-522).
+
+### Changed
+
+- Reword the rc 126/127 environment-fault pause to name the shell convention
+  instead of asserting "command not found / not executable" (DW-523).
+- Point deferred-story and environment-fault pause notices, and the TUI `R`/`p`
+  gestures on a deferred story, at `bmad-loop resolve <run> --reverify` (DW-522).
+
+### Fixed
+
+- Escalate an environment fault at the review-budget rescue gate instead of
+  deferring the story as unconverged (DW-523).
+
 ## [0.13.1] — 2026-10-01
 
 ### Added

@@ -2746,3 +2746,116 @@ def test_atomic_write_spec_external_arm_writes_through_an_intact_pinned_root(tmp
         spec, "in-progress", confine_root=mount, root_identity=os.lstat(mount)
     )
     assert "status: in-progress" in spec.read_text(encoding="utf-8")
+
+
+# ---------------------------------- the session's environment-fault claim (DW-523)
+
+
+def _env_fault_spec(tmp_path, *, line: str | None, extra: str = ""):
+    """A done spec whose genuine marker carries (or omits) an environment-fault line."""
+    marker = "\n## Auto Run Result\n\n- Status: done\n"
+    if line is not None:
+        marker += f"{line}\n"
+    marker += extra
+    return _spec(tmp_path / "s.md", status="done", auto_run=None, body_extra=marker)
+
+
+@pytest.mark.parametrize(
+    ("line", "claim"),
+    [
+        ("Environment fault: postgres container is down", "postgres container is down"),
+        ("- Environment fault: postgres container is down", "postgres container is down"),
+        ("- **Environment fault:** postgres down", "postgres down"),
+        ("**Environment fault: postgres down**", "postgres down"),
+        ("environment_fault: postgres down", "postgres down"),
+        ("Environment fault: postgres down  ", "postgres down"),
+    ],
+    ids=["prose", "bullet", "bold-label", "bold-line", "snake", "nbsp-trailing-space"],
+)
+def test_environment_fault_line_synthesizes_claim(tmp_path, line, claim):
+    """A genuine marker's `Environment fault:` line becomes ``env_fault_claim``
+    — bullet/bold tolerant like the artifact-only line — and the claim changes
+    nothing else in the result: status and escalations stay the session's own.
+    No authorship proof is needed (the claim only triggers a probe).
+
+    Ablation: drop the ``env_fault_claim`` write in ``synthesize_result`` and
+    every parameter fails."""
+    sp = _env_fault_spec(tmp_path, line=line)
+
+    rj = devcontract.synthesize_result(sp, story_key="1-1-a").result_json
+
+    assert rj is not None
+    assert rj["env_fault_claim"] == claim
+    assert rj["status"] == "done"
+    assert rj["escalations"] == []
+
+
+def test_environment_fault_claim_is_bounded(tmp_path):
+    sp = _env_fault_spec(tmp_path, line="Environment fault: " + "x" * 2000)
+
+    rj = devcontract.synthesize_result(sp, story_key="1-1-a").result_json
+
+    assert rj is not None
+    assert rj["env_fault_claim"] == "x" * devcontract.ENV_FAULT_CLAIM_LIMIT
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        "\n```\nEnvironment fault: postgres down\n```\n",
+        f"Environment fault: postgres down\n\n{devcontract.ORCHESTRATOR_SYNTH_NOTE}\n",
+    ],
+    ids=["fenced", "orchestrator-synth"],
+)
+def test_fenced_or_orchestrator_env_fault_line_is_not_a_claim(tmp_path, extra):
+    """A fenced example inside the marker is documentation, and a marker the
+    orchestrator synthesized speaks for no session — neither is a claim.
+
+    Ablation: drop the ``_fenced`` skip in ``_env_fault_claim_of`` (fenced) or
+    the ``ORCHESTRATOR_SYNTH_NOTE`` guard in ``synthesize_result``
+    (orchestrator-synth) and that parameter fails."""
+    sp = _env_fault_spec(tmp_path, line=None, extra=extra)
+
+    rj = devcontract.synthesize_result(sp, story_key="1-1-a").result_json
+
+    assert rj is not None
+    assert "env_fault_claim" not in rj
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "Environment fault:",
+        "Environment fault:   ",
+        "- **Environment fault:** ****",
+        "Environment fault:\npostgres down",
+        "Environment fault:\x0bpostgres down",
+    ],
+    ids=["bare", "spaces", "bold-only", "next-line", "vertical-tab"],
+)
+def test_blank_env_fault_line_is_not_a_claim(tmp_path, line):
+    """A label with no text on its own line claims nothing — the text is never
+    borrowed from the following line.
+
+    Ablation: drop the ``if text`` check in ``_env_fault_claim_of`` and the
+    blank parameters fail."""
+    sp = _env_fault_spec(tmp_path, line=line)
+
+    rj = devcontract.synthesize_result(sp, story_key="1-1-a").result_json
+
+    assert rj is not None
+    assert "env_fault_claim" not in rj
+
+
+def test_env_fault_claim_reads_only_the_last_real_marker(tmp_path):
+    """A claim in an earlier marker is a previous session's word, not this one's."""
+    body = (
+        "\n## Auto Run Result\n\nStatus: blocked\nEnvironment fault: db down\n"
+        "\n## Auto Run Result\n\nStatus: done\n"
+    )
+    sp = _spec(tmp_path / "s.md", status="done", auto_run=None, body_extra=body)
+
+    rj = devcontract.synthesize_result(sp, story_key="1-1-a").result_json
+
+    assert rj is not None
+    assert "env_fault_claim" not in rj

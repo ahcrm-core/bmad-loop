@@ -57,6 +57,18 @@ if TYPE_CHECKING:
 PRESERVE_REF_PROBE_LIMIT = 100
 
 
+def deferred_reverify_hint(run_id: str) -> str:
+    """The pointer every pause on a DEFERRED story appends (DW-522): when only the
+    environment failed, `resolve --reverify` keeps the attempt's work and replays
+    verification on it instead of the steps that discard it."""
+    return (
+        "If the attempt's work is good and only the environment was broken (a service, "
+        f"container or database was down), fix the environment and run `bmad-loop resolve "
+        f"{run_id} --reverify` instead of resetting: it replays verification on the kept "
+        "work and, when it passes, reviews and commits it without a new dev session."
+    )
+
+
 def attempt_preserve_ref_name(run_id: str, tip: str) -> str:
     """Canonical commits-only recovery branch for one run and pinned tip."""
     return f"attempt-preserve/{safe_ref_segment(run_id)}-{tip[:8]}"
@@ -968,6 +980,8 @@ class RecoveryFlow:
             "intent, failed-session output, and any rollback already completed.\n"
             f"{contract}{steps}"
         )
+        if task.phase == Phase.DEFERRED:
+            notice += f"\n{deferred_reverify_hint(self.state.run_id)}"
         self.journal.append(
             "rollback-owned-spec-manual-required",
             story_key=task.story_key,
@@ -2532,6 +2546,8 @@ class RecoveryFlow:
                 "`[scm] rollback_on_failure` (it discards the attempt's uncommitted "
                 "work but never deletes pre-existing untracked files)."
             )
+        if task.phase == Phase.DEFERRED:
+            notice += f"\n{deferred_reverify_hint(self.state.run_id)}"
         self.journal.append(
             "rollback-manual-required",
             story_key=task.story_key,

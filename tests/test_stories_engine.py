@@ -33,6 +33,7 @@ from bmad_loop.install import (
 )
 from bmad_loop.journal import Journal, load_state, save_state
 from bmad_loop.model import (
+    PAUSE_ENVIRONMENT,
     PAUSE_ESCALATION,
     PAUSE_PLAN_CHECKPOINT,
     PAUSE_SPEC_APPROVAL,
@@ -46,6 +47,7 @@ from bmad_loop.model import (
 from bmad_loop.plugins import PluginRegistry
 from bmad_loop.plugins.model import LoadedPlugin, PluginManifest, WorkflowSpec
 from bmad_loop.policy import (
+    EnvironmentPolicy,
     GatesPolicy,
     NotifyPolicy,
     OperatorPolicy,
@@ -860,6 +862,34 @@ def test_review_prompt_carries_no_sprint_board_clause(project):
     assert prompt.endswith("the orchestrator owns their status and resolution.")
 
 
+def test_env_claim_clause_rides_stories_dev_prompts_only_with_probes(project, tmp_path):
+    """DW-523: the environment-claim clause ends the invocation line on both
+    stories legs (after `Halt after planning.`, before `invoke_dev_with`) while
+    probes are configured, and is absent — the prompt byte-identical — without.
+    Ablation: drop `env_sentence` from `_stories_dev_prompt` and the probed
+    prompts lose the clause."""
+    setup_stories(project, [entry("1", invoke_dev_with="Use Redis.")])
+    plain, _ = make_engine(project, [])
+    probed, _ = make_engine(
+        project, [], policy=Policy(environment=EnvironmentPolicy(probes=("exit 0",)))
+    )
+    clause = probed._environment_claim_instruction()
+    assert clause
+    task = StoryTask(story_key="1", epic=0)
+    fresh = probed._dev_prompt(task, None)
+    assert fresh == plain._dev_prompt(task, None).replace(
+        "Story id: 1.\n", f"Story id: 1. {clause}\n", 1
+    )
+    task.spec_file = str(story_spec(project, "1"))
+    story_spec(project, "1").parent.mkdir(parents=True, exist_ok=True)
+    write_spec(story_spec(project, "1"), "done", "abc")
+    feedback = tmp_path / "fb.md"
+    feedback.write_text("boom")
+    before = plain._dev_prompt(task, feedback)
+    assert clause not in before
+    assert probed._dev_prompt(task, feedback) == f"{before} {clause}"
+
+
 def test_dev_prompt_repair_leg_is_explicit_spec_resume(project, tmp_path):
     """A Stories repair remains its pre-sprint-routing explicit-spec invocation.
 
@@ -1140,6 +1170,84 @@ def test_plan_checkpoint_pause_then_resume_implements(project):
     leg2 = next(s for s in radapter.sessions if s.role == "dev")
     assert "Halt after planning" not in leg2.prompt
     assert "BMAD_LOOP_PLAN_HALT" not in leg2.env
+
+
+def test_leg2_dispatch_pause_keeps_the_plan(project, tmp_path):
+    """DW-523 x spec_checkpoint: the plan-checkpoint resume dispatches leg 2 (the
+    implement leg) through the dev dispatch gate. A failing probe there pauses at
+    `environment` with the task at PENDING — but `baseline_commit` is still leg 1's,
+    so the next resume must take the no-rollback `resume-env-dispatch` arm, not the
+    restart arm that resets to that baseline and throws the reviewed plan away.
+
+    The operator commits the reviewed (edited) plan while paused — the shape that
+    makes a rollback observable: the spec folder is under output_folder, so an
+    UNTRACKED plan would survive the reset either way, while a committed one is
+    reverted by it (and the re-drive would then be a plan-halt leg again).
+
+    Ablation, performed: delete the `env_role == "dev" and task.phase ==
+    Phase.PENDING` arm of `Engine._finish_inflight` and the final resume falls
+    through to `resume-restart` (rollback_on_failure=True, the `_stories_policy`
+    default): the reset reverts the operator's plan commit, so leg 2 dispatches as
+    a plan-halt leg on a missing spec and this test reds on the captured plan."""
+    setup_stories(project, [entry("1", spec_checkpoint=True)])
+    marker = tmp_path / "env-up"
+    marker.write_text("", encoding="utf-8")
+    script = tmp_path / "probe.py"
+    script.write_text(
+        f"import os, sys\nsys.exit(0 if os.path.exists(r'{marker}') else 7)\n", encoding="utf-8"
+    )
+    policy = _stories_policy(
+        environment=EnvironmentPolicy(probes=(f'"{sys.executable}" "{script}"',))
+    )
+    engine, _ = make_engine(project, [stories_checkpoint_effect()], policy=policy)
+
+    # leg 1: probes healthy, plans, pauses for the plan review
+    assert engine.run().paused
+    assert load_state(engine.run_dir).paused_stage == PAUSE_PLAN_CHECKPOINT
+    spec = story_spec(project, "1")
+    assert status_of(read_frontmatter(spec)) == "ready-for-dev"
+    # the operator reviews + edits the plan and commits it
+    spec.write_text(spec.read_text(encoding="utf-8") + "\nOperator: approved.\n", encoding="utf-8")
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "reviewed plan")
+    plan = spec.read_text(encoding="utf-8")
+
+    # resume 1: the environment is down — leg 2's dispatch gate pauses
+    marker.unlink()
+    resumed, radapter = resume_engine(project, engine, [stories_checkpoint_effect()])
+    rsummary = resumed.run()
+    assert rsummary.paused and rsummary.done == 0
+    assert radapter.sessions == []  # no leg-2 session ran
+    persisted = load_state(resumed.run_dir)
+    assert persisted.paused_stage == PAUSE_ENVIRONMENT
+    task = persisted.tasks["1"]
+    assert task.phase == Phase.PENDING
+    assert task.env_fault_site == "probe:dispatch:dev"
+    assert task.plan_checkpoint_pending is False
+    assert task.baseline_commit  # leg 1's baseline is still set — the rollback target
+    assert spec.read_text(encoding="utf-8") == plan
+
+    # resume 2: environment restored — leg 2 runs on the reviewed plan, no rollback
+    marker.write_text("", encoding="utf-8")
+    seen: list[str | None] = []
+    implement = stories_checkpoint_effect()
+
+    def leg2(session) -> SessionResult:
+        seen.append(spec.read_text(encoding="utf-8") if spec.exists() else None)
+        return implement(session)
+
+    final, fadapter = resume_engine(project, resumed, [leg2])
+    fsummary = final.run()
+    assert seen == [plan]  # the leg-1 plan (as reviewed) is what leg 2 started from
+    (dev,) = [s for s in fadapter.sessions if s.role == "dev"]
+    assert "Halt after planning" not in dev.prompt
+    assert "BMAD_LOOP_PLAN_HALT" not in dev.env
+    assert fsummary.done == 1 and not fsummary.paused
+    assert load_state(final.run_dir).tasks["1"].phase == Phase.DONE
+    kinds = [e["kind"] for e in final.journal.entries()]
+    assert "env-fault-cleared" in kinds
+    assert "resume-env-dispatch" in kinds
+    assert "resume-restart" not in kinds
 
 
 @pytest.mark.parametrize(

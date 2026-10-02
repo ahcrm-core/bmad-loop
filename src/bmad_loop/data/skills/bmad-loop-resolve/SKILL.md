@@ -38,6 +38,7 @@ These environment variables are set:
   "redrive_base_ref": "<branch the re-drive reads, or HEAD>",
   "baseline_commit": "<sha>",
   "paused_reason": "CRITICAL escalation from review session: ...",
+  "env_fault_site": null,
   "escalations": [
     {
       "type": "<kind>",
@@ -238,6 +239,37 @@ Use the patch two ways:
 
 If the attempted reading was wrong (the common case), omit `restore_patch`
 entirely: the orchestrator re-drives from scratch against the corrected intent.
+
+## Special case: an environment-fault escalation
+
+When `env_fault_site` in the context is **not** `null`, the run paused because the
+**environment** failed, not the story: an operator `[environment]` probe failed (or
+a verify command declared or hit an environment fault) at the site it names —
+`verify:<role>`, `probe:decision:<role>`, `probe:claim:<role>` or
+`probe:dispatch:<role>`. The attempt was **not** charged.
+
+A `probe:claim:<role>` site means the dev, fix, review or workflow session wrote an
+`Environment fault: <what is broken>` line in its final `## Auto Run Result` and
+the orchestrator's own probe then failed. The line only triggered that probe — a
+claim the probes did not confirm never pauses the run, so the failed probe, not
+the session's prose, is the evidence. `paused_reason` quotes the claim on its
+`session claim:` line.
+
+- **No spec change is needed.** Do not clarify the intent or reinterpret the
+  story to explain the failure; `paused_reason` names the probe or command that
+  failed and its output tail.
+- Tell the human to **fix the environment** (start the stopped service, container,
+  emulator or database the probe checks) and confirm the probe passes by hand.
+- Then **re-arm the escalation** as usual (record a resolution that says the
+  environment was repaired); the attempt budget resets on re-arm. A plain re-arm
+  re-drives a dev session from the baseline. When the attempt's work should be
+  kept, the human can instead exit this session and run
+  `bmad-loop resolve <run> --reverify`: it keeps the tree at HEAD (in place, or
+  the story's kept worktree unit), replays verification on it and, when that
+  passes, reviews and commits it (a unit merges) with no dev session. A
+  `probe:dispatch:<role>` pause is not an escalation at all — no session ran, so
+  the human fixes the environment and runs `bmad-loop resume <run>` (the probes
+  re-run first); `resolve` refuses that pause.
 
 ## What you MUST NOT do
 

@@ -3316,6 +3316,7 @@ def test_build_context_keeps_the_withheld_count_out_of_the_payload(tmp_path):
         "spec_file",
         "baseline_commit",
         "paused_reason",
+        "env_fault_site",
         "escalations",
         "resolution_path",
         "restore_supported",

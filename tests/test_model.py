@@ -9,6 +9,9 @@ import pytest
 from conftest import refuse_to_resolve
 
 from bmad_loop.model import (
+    ENV_FAULT_SITE_DISPATCH_PREFIX,
+    ENV_FAULT_SITES,
+    PAUSE_ENVIRONMENT,
     SWEEP_REFUSED_DIRTY,
     SWEEP_REFUSED_NOT_STARTED,
     Phase,
@@ -17,6 +20,7 @@ from bmad_loop.model import (
     StoryTask,
     TokenUsage,
     VerifyOutcome,
+    env_fault_site_reverifiable,
     result_mapping,
 )
 
@@ -362,6 +366,15 @@ def test_session_record_adapter_identity_defaults_for_legacy_state():
     assert back.model == ""
 
 
+def test_session_record_label_round_trips_and_defaults_for_legacy_state():
+    record = SessionRecord(task_id="1-1-a-tea.gate-1", role="dev", status="completed")
+    record.label = "tea.gate"
+    assert SessionRecord.from_dict(record.to_dict()).label == "tea.gate"
+    doc = record.to_dict()
+    del doc["label"]  # state.json from before the field existed
+    assert SessionRecord.from_dict(doc).label == ""
+
+
 def test_followup_review_recommended_round_trips():
     task = StoryTask(story_key="1-1-a", epic=1, followup_review_recommended=True)
     assert StoryTask.from_dict(task.to_dict()).followup_review_recommended is True
@@ -534,6 +547,109 @@ def test_escalations_resolved_upto_defaults_zero_for_legacy_state():
 def test_resolved_redrive_round_trips():
     task = StoryTask(story_key="1-1-a", epic=1, resolved_redrive=True)
     assert StoryTask.from_dict(task.to_dict()).resolved_redrive is True
+
+
+def test_env_fault_site_round_trips_and_defaults_none():
+    task = StoryTask(story_key="1-1-a", epic=1, env_fault_site="probe:decision:dev")
+    restored = StoryTask.from_dict(json.loads(json.dumps(task.to_dict())))
+    assert restored.env_fault_site == "probe:decision:dev"
+    assert StoryTask(story_key="1-1-a", epic=1).env_fault_site is None
+    doc = StoryTask(story_key="1-1-a", epic=1).to_dict()
+    del doc["env_fault_site"]  # state.json from before the field existed
+    assert StoryTask.from_dict(doc).env_fault_site is None
+
+
+def test_env_fault_sites_vocabulary():
+    assert ENV_FAULT_SITES == {
+        "verify:dev",
+        "verify:fix",
+        "verify:review",
+        "probe:decision:dev",
+        "probe:decision:fix",
+        "probe:decision:review",
+        "probe:decision:workflow",
+        "probe:claim:dev",
+        "probe:claim:fix",
+        "probe:claim:review",
+        "probe:claim:workflow",
+        "probe:dispatch:dev",
+        "probe:dispatch:review",
+    }
+    dispatch = {s for s in ENV_FAULT_SITES if s.startswith(ENV_FAULT_SITE_DISPATCH_PREFIX)}
+    assert dispatch == {"probe:dispatch:dev", "probe:dispatch:review"}
+    assert PAUSE_ENVIRONMENT == "environment"
+
+
+def test_reverify_from_round_trips():
+    task = StoryTask(story_key="1-1-a", epic=1, reverify_from="deferred")
+    restored = StoryTask.from_dict(json.loads(json.dumps(task.to_dict())))
+    assert restored.reverify_from == "deferred"
+
+
+def test_reverify_from_defaults_empty_for_legacy_state():
+    doc = StoryTask(story_key="1-1-a", epic=1).to_dict()
+    del doc["reverify_from"]  # state.json from before the field existed
+    assert StoryTask.from_dict(doc).reverify_from == ""
+    doc["reverify_from"] = None  # a null is not a pending replay either
+    assert StoryTask.from_dict(doc).reverify_from == ""
+
+
+def test_reverify_from_unknown_value_is_kept_not_dropped():
+    """Any non-empty latch means a replay is pending, so a value this version does
+    not know (a newer writer's) must survive the read rather than silently turning
+    the replay into a dev re-drive."""
+    doc = StoryTask(story_key="1-1-a", epic=1).to_dict()
+    doc["reverify_from"] = "from-the-future"
+    assert StoryTask.from_dict(doc).reverify_from == "from-the-future"
+
+
+def _dev_record(status: str) -> SessionRecord:
+    return SessionRecord(task_id="1-1-a-dev-1", role="dev", status=status)
+
+
+@pytest.mark.parametrize(
+    ("site", "latest_dev_status", "expected"),
+    [
+        (None, "completed", False),
+        ("not-a-site", "completed", False),
+        ("verify:dev", None, True),
+        ("verify:fix", None, True),
+        ("verify:review", None, True),
+        ("probe:decision:review", None, True),
+        ("probe:decision:workflow", None, True),
+        ("probe:claim:review", None, True),
+        ("probe:claim:workflow", None, True),
+        ("probe:dispatch:dev", "completed", False),
+        ("probe:dispatch:review", "completed", False),
+        ("probe:decision:dev", "completed", True),
+        ("probe:decision:dev", "crashed", False),
+        ("probe:decision:dev", None, False),
+        ("probe:decision:fix", "completed", True),
+        ("probe:decision:fix", "timeout", False),
+        ("probe:claim:dev", "completed", True),
+        ("probe:claim:dev", "crashed", False),
+        ("probe:claim:dev", None, False),
+        ("probe:claim:fix", "completed", True),
+        ("probe:claim:fix", "timeout", False),
+    ],
+)
+def test_env_fault_site_reverifiable_matrix(site, latest_dev_status, expected):
+    """Dispatch sites fired before any session ran, and a decision- or claim-site
+    fault after a crashed/timed-out dev (or fix — recorded under the dev role)
+    session left no product: neither is reverifiable. Every other site in the closed vocabulary is.
+
+    Ablation, performed: drop the latest-record status check and the `crashed` /
+    `timeout` / no-record rows redden; drop the dispatch-prefix check and both
+    dispatch rows redden."""
+    task = StoryTask(story_key="1-1-a", epic=1, env_fault_site=site)
+    if latest_dev_status is not None:
+        # an older completed record must not vouch for the latest attempt
+        task.sessions.append(_dev_record("completed"))
+        task.sessions.append(
+            SessionRecord(task_id="1-1-a-review-1", role="review", status="crashed")
+        )
+        task.sessions.append(_dev_record(latest_dev_status))
+    assert env_fault_site_reverifiable(task) is expected
 
 
 def test_resolved_redrive_defaults_false_for_legacy_state():

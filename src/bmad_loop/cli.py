@@ -3945,10 +3945,13 @@ def cmd_resolve(args: argparse.Namespace) -> int:
         )
         return 1
     state = load_state(run_dir)
-    if state.paused_stage != PAUSE_ESCALATION:
+    # DW-522: `--reverify --story <key>` may name a worktree unit under ANY pause
+    # stage (an isolated defer never pauses the run); `reverify_refusal` decides
+    # whether the named story qualifies. Everything else needs the escalation pause.
+    reverify_named = bool(getattr(args, "reverify", False) and args.story)
+    if not _resolve_pause_admits(state.paused_stage, reverify_named=reverify_named):
         print(
-            f"run {args.run_id} is not paused at an escalation "
-            f"(stage: {state.paused_stage or 'none'})",
+            runs.not_escalation_pause_message(args.run_id, state.paused_stage),
             file=sys.stderr,
         )
         return 1
@@ -3977,7 +3980,21 @@ def cmd_resolve(args: argparse.Namespace) -> int:
         )
     story_key = args.story or state.paused_story_key
     task = state.tasks.get(story_key) if story_key else None
-    if story_key is None or task is None or task.phase != Phase.ESCALATED:
+    reverify = getattr(args, "reverify", False)
+    if story_key is not None and task is not None and task.phase == Phase.DEFERRED and not reverify:
+        # DW-522: a deferred story has nothing to resolve, but its kept work may be
+        # re-verifiable — point at the flag instead of a bare refusal.
+        print(
+            f"story {story_key} is deferred, not escalated — to re-verify its kept "
+            f"work: bmad-loop resolve {args.run_id} --reverify",
+            file=sys.stderr,
+        )
+        return 1
+    if (
+        story_key is None
+        or task is None
+        or task.phase not in ((Phase.ESCALATED, Phase.DEFERRED) if reverify else (Phase.ESCALATED,))
+    ):
         print(f"no escalated story to resolve in run {args.run_id}", file=sys.stderr)
         return 1
 
@@ -3993,6 +4010,11 @@ def cmd_resolve(args: argparse.Namespace) -> int:
     if (refusal := runs.unreadable_sweep_ledger(project, run_dir)) is not None:
         print(refusal, file=sys.stderr)
         return ExitCode.FAILURE
+
+    # DW-522: re-verify the kept attempt instead of re-arming. Behind the same gates
+    # as --adopt-branch, and likewise ahead of the interactive session it never runs.
+    if reverify:
+        return _resolve_reverify(args, project, run_dir, state, task, story_key)
 
     # DW-386: adopt the kept branch instead of re-arming. Behind every gate above —
     # the same gates, in the same order, as the re-arm path — and ahead of the
@@ -4258,8 +4280,7 @@ def cmd_resolve(args: argparse.Namespace) -> int:
             fresh_state = load_state(run_dir)
             if fresh_state.paused_stage != PAUSE_ESCALATION:
                 print(
-                    f"run {args.run_id} is not paused at an escalation "
-                    f"(stage: {fresh_state.paused_stage or 'none'})",
+                    runs.not_escalation_pause_message(args.run_id, fresh_state.paused_stage),
                     file=sys.stderr,
                 )
                 return 1
@@ -4390,8 +4411,7 @@ def _resolve_adopt(
             fresh_state = load_state(run_dir)
             if fresh_state.paused_stage != PAUSE_ESCALATION:
                 print(
-                    f"run {args.run_id} is not paused at an escalation "
-                    f"(stage: {fresh_state.paused_stage or 'none'})",
+                    runs.not_escalation_pause_message(args.run_id, fresh_state.paused_stage),
                     file=sys.stderr,
                 )
                 return 1
@@ -4423,6 +4443,152 @@ def _resolve_adopt(
         print(f"error: {e}", file=sys.stderr)
         return 1
     print(f"adopted {branch} for {story_key} — it commits and merges on resume")
+    if args.resume is False:
+        print(f"resume when ready: bmad-loop resume {args.run_id}")
+        return 0
+    from .tui import launch  # import-safe: launch.py has no textual imports
+
+    if launch.in_ctl_session():
+        print(
+            f"✓ resuming run {args.run_id} in the background — "
+            f"watch it in the TUI, or: bmad-loop attach {args.run_id}"
+        )
+        launch.detach_client()
+    return _resume_paused_run(project, run_dir)
+
+
+def _resolve_pause_admits(paused_stage: str | None, *, reverify_named: bool) -> bool:
+    """Whether `resolve` may act on a run paused at ``paused_stage``: the escalation
+    pause always; any pause for `--reverify --story <key>` (DW-522), whose
+    `runs.reverify_refusal` then admits only a worktree unit off the escalation pause.
+    One rule for `cmd_resolve`'s entry gate and `_resolve_reverify`'s locked re-check."""
+    from .model import PAUSE_ESCALATION
+
+    if reverify_named:
+        return paused_stage is not None
+    return paused_stage == PAUSE_ESCALATION
+
+
+def _resolve_reverify(
+    args: argparse.Namespace,
+    project: Path,
+    run_dir: Path,
+    state: RunState,
+    task: StoryTask,
+    story_key: str,
+) -> int:
+    """`resolve --reverify` (DW-522): re-verify a DEFERRED or environment-fault
+    ESCALATED story's kept attempt instead of re-driving it.
+
+    `cmd_resolve` has already run the shared gates (alias, paused-at-escalation — or
+    paused at all for a named `--story`, `_resolve_pause_admits` — liveness,
+    deferred-or-escalated story, sweep ledger). This adds the kept-work
+    preconditions (`runs.reverify_refusal`), states what the replay will claim,
+    confirms, re-checks everything under the run lock and hands the state
+    transaction to `runs.rearm_for_reverify`; the resumed engine's reverify arm then
+    replays verify on the tree and reviews and commits it on a pass. No dev session
+    and no resolve agent run. The code root is deliberately NOT re-stamped: a moved
+    root means the kept attempt lives in the other tree, which the refusal names."""
+    from .model import Phase
+
+    explicit_story = bool(args.story)
+    refusal = runs.reverify_refusal(
+        state,
+        task,
+        story_key,
+        run_dir=run_dir,
+        project_root=project,
+        explicit_story=explicit_story,
+    )
+    if refusal is not None:
+        print(f"error: {refusal}", file=sys.stderr)
+        return 1
+    mounted = bool(task.worktree_path)
+    root = Path(task.worktree_path) if mounted else Path(state.code_root)
+    try:
+        head = verify.rev_parse_head(root)
+    except verify.GitError as e:
+        print(f"error: cannot read HEAD of {root} ({e})", file=sys.stderr)
+        return 1
+    where = (
+        f"in its kept worktree: the attempt is branch {task.branch} at {root}"
+        if mounted
+        else f"in place: the attempt is the tree at {root}"
+    )
+    lands = (
+        "the unit merges into the target branch on a pass"
+        if mounted
+        else "the story commits on a pass"
+    )
+    print(
+        f"re-verifying {story_key} {where} — HEAD "
+        f"{head[:12]} above baseline {(task.baseline_commit or '')[:12]}, plus any "
+        "uncommitted changes. Commits/changes made since the pause are included in the "
+        "story's squashed commit. No dev session and no resolve agent run: the [verify] "
+        f"commands are replayed, then review follows policy and {lands}",
+        file=sys.stderr,
+    )
+    if args.resume is None and not _confirm(
+        f"re-verify the kept work of {story_key} and resume run {args.run_id}?"
+    ):
+        print("cancelled — run is still paused")
+        return 0
+    before_entries = runs.journal_entries_or_none(run_dir)
+    outcome: runs.RearmOutcome | None = None
+    try:
+        with state_lock(run_dir):
+            # Same mutation-boundary re-check as the re-arm path: the checks above
+            # ran lock-free, so repeat them against the state left by the last writer.
+            fresh_state = load_state(run_dir)
+            if not _resolve_pause_admits(fresh_state.paused_stage, reverify_named=explicit_story):
+                print(
+                    runs.not_escalation_pause_message(args.run_id, fresh_state.paused_stage),
+                    file=sys.stderr,
+                )
+                return 1
+            fresh_live = runs.engine_liveness(run_dir)
+            if fresh_live == "alive":
+                print(f"run {args.run_id} is still live — stop it first", file=sys.stderr)
+                return 1
+            if fresh_live == "unknown" and not args.force:
+                print(
+                    f"run {args.run_id}: engine may still be live (unverifiable pid) — "
+                    "refusing to re-verify. Confirm the engine process is gone, then re-run "
+                    "with --force (`stop` cannot verify or clear an unverifiable pid).",
+                    file=sys.stderr,
+                )
+                return 1
+            fresh_task = fresh_state.tasks.get(story_key)
+            if (
+                fresh_task is None
+                or fresh_task.phase != task.phase
+                or fresh_task.phase not in (Phase.DEFERRED, Phase.ESCALATED)
+            ):
+                print(
+                    f"no deferred or escalated story to re-verify in run {args.run_id}",
+                    file=sys.stderr,
+                )
+                return 1
+            if fresh_task.generation != task.generation:
+                print(
+                    f"story {story_key} changed while resolve was in progress — not re-arming",
+                    file=sys.stderr,
+                )
+                return 1
+            outcome = runs.rearm_for_reverify(
+                run_dir, story_key, project_root=project, explicit_story=explicit_story
+            )
+    except runs.RearmError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    finally:
+        # as the re-arm path: a re-arm that aborted after journaling still owes its
+        # records to the operator
+        if outcome is None:
+            _echo_rearm_events(run_dir, before_entries)
+    assert outcome is not None
+    _echo_rearm_notices(outcome.notices)
+    print(f"re-armed {story_key} for re-verification — verify replays on resume")
     if args.resume is False:
         print(f"resume when ready: bmad-loop resume {args.run_id}")
         return 0
@@ -4476,10 +4642,26 @@ def _reverify(project: Path, cwd: Path) -> str | None:
     if not pol.verify.commands:
         print("note: --reverify: no [verify] commands are configured — nothing to re-run")
         return None
+    # The environment preflight (DW-523), same gate as every other composition:
+    # a failed probe means the environment, not the story, so no command runs.
+    probe = verify.run_environment_probes(pol, cwd)
+    if probe.failed is not None:
+        return (
+            f"environment probe {probe.failed.command!r} failed ({probe.reason}) — the run "
+            "environment, not the story; fix it and re-run"
+        )
     print(f"re-running {len(pol.verify.commands)} verify command(s)...")
+    env_fault_rc = pol.verify.env_fault_rc
     for result in verify.run_verify_commands(pol, cwd):
-        fault = verify.env_fault_reason(result, cwd)
+        fault = verify.env_fault_reason(result, cwd, env_fault_rc=env_fault_rc)
         if fault is not None:
+            if result.spawn_error is None and env_fault_rc and result.returncode == env_fault_rc:
+                # The command RAN and said so on purpose; "could not run" would
+                # misreport it (same order as verify's cause: spawn, then declared).
+                return (
+                    f"{result.command!r} reported an environment fault "
+                    f"(rc={result.returncode}, [verify] env_fault_rc)"
+                )
             return f"{result.command!r} could not run: {fault}"
         if result.returncode != 0:
             return f"{result.command!r} failed (rc {result.returncode}):\n{result.output_tail}"
@@ -6349,6 +6531,17 @@ def main(argv: list[str] | None = None) -> int:
         "resume. Skips the resolve agent and does NOT re-run review, [verify] commands or "
         "pre_commit_gate workflows for the story "
         "(worktree isolation only; not for sweep runs)",
+    )
+    resolve_mode.add_argument(
+        "--reverify",
+        action="store_true",
+        help="keep a DEFERRED (or environment-fault escalated) story's attempt as it "
+        "stands at HEAD — in place, or in its kept worktree unit — plus any uncommitted "
+        "changes, and resume by replaying its verification: the [verify] commands "
+        "re-run on that work and, when they pass, it is reviewed per policy and "
+        "committed (a unit merged) — no dev session and no resolve agent. Fix the "
+        "environment first. With --story, a worktree unit is accepted under any pause "
+        "(not for sweep runs)",
     )
     resolve_p.add_argument(
         "--resume",

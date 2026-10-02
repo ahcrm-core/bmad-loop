@@ -13,7 +13,7 @@ from typing import Any
 
 from .adapters.base import SessionResult
 from .gates import NOTICE_FULL_DETAIL_SOURCE, NOTICE_TRUNCATION_MARKER, notice_line
-from .model import PAUSE_ESCALATION, RunState, StoryTask, VerifyOutcome
+from .model import ENV_FAULT_CLAIM_LIMIT, PAUSE_ESCALATION, RunState, StoryTask, VerifyOutcome
 from .policy import Policy
 
 SEVERITY_CRITICAL = "CRITICAL"
@@ -48,6 +48,14 @@ REVIEW_TIMEOUT_STATUSES = frozenset({"timeout", "stalled", "over_budget"})
 class Decision:
     action: Action
     reason: str = ""
+    # The action was driven by a spent budget (`_exhausted_action`): a DEFER, or
+    # a PAUSE re-escalating a resolved-CRITICAL re-drive (DW-523). The engine's
+    # environment seam re-probes before such a decision lands, exactly as it
+    # does before a RETRY, because both charge the story for the failure.
+    budget_exhausted: bool = False
+    # Set only by the engine's environment seam (DW-523), never by a decider: the
+    # `StoryTask.env_fault_site` a PAUSE it produced must record on escalation.
+    env_site: str | None = None
 
 
 def _escalation_list(result_json: dict[str, Any] | None) -> list[Any]:
@@ -326,7 +334,7 @@ def decide_dev(
         reason = session_failure_reason("dev", result)
         if budget_left:
             return Decision(Action.RETRY, reason)
-        return Decision(exhausted, _exhaust_reason(task, reason))
+        return Decision(exhausted, _exhaust_reason(task, reason), budget_exhausted=True)
 
     assert outcome is not None
     if outcome.ok:
@@ -335,7 +343,36 @@ def decide_dev(
         return Decision(Action.PAUSE, outcome.reason)
     if budget_left:
         return Decision(Action.RETRY, outcome.reason)
-    return Decision(exhausted, _exhaust_reason(task, outcome.reason))
+    return Decision(exhausted, _exhaust_reason(task, outcome.reason), budget_exhausted=True)
+
+
+REVERIFY_REASON_PREFIX = "reverify failed: "
+
+
+def decide_reverify(task: StoryTask, outcome: VerifyOutcome) -> Decision:
+    """After a `resolve --reverify` replay of verify against the kept attempt product
+    (DW-522). No session ran, so there is no session verdict to read and no budget to
+    charge: the decision is the outcome's alone, and it never RETRYs — a retry would
+    be a dev session, which is exactly what the operator chose to avoid.
+
+    * passed → PROCEED to review and commit.
+    * an environment fault, a non-retryable (severity-carrying) failure, or a
+      contradiction → PAUSE: the environment is still broken, or the failure is one
+      no further session may silently absorb.
+    * any other failure of a story re-armed from DEFERRED (`task.reverify_from ==
+      "deferred"`) → DEFER it again, as it was before the gesture — unless it is a
+      resolved-escalation re-drive (`resolved_redrive`), which must never downgrade
+      to deferred work (see `_exhausted_action`).
+    * any other failure → PAUSE: an escalated origin goes back to the operator.
+    """
+    if outcome.ok:
+        return Decision(Action.PROCEED)
+    reason = f"{REVERIFY_REASON_PREFIX}{outcome.reason}"
+    if outcome.env_fault or outcome.severity or outcome.contradiction:
+        return Decision(Action.PAUSE, reason)
+    if task.reverify_from == "deferred" and not task.resolved_redrive:
+        return Decision(Action.DEFER, reason)
+    return Decision(Action.PAUSE, reason)
 
 
 def decide_review_session(task: StoryTask, result: SessionResult, policy: Policy) -> Decision:
@@ -364,6 +401,7 @@ def decide_review_session(task: StoryTask, result: SessionResult, policy: Policy
                 return Decision(
                     _exhausted_action(task),
                     _exhaust_reason(task, f"{reason} (review.on_timeout=defer)"),
+                    budget_exhausted=True,
                 )
             if mode == "salvage-if-done":
                 return Decision(Action.SALVAGE, reason)
@@ -388,7 +426,7 @@ def review_exhausted(task: StoryTask, reason: str) -> Decision:
     retry bound and launching another reviewer would be unsafe. It preserves the
     same resolved-CRITICAL re-drive rule as ordinary review-budget exhaustion.
     """
-    return Decision(_exhausted_action(task), _exhaust_reason(task, reason))
+    return Decision(_exhausted_action(task), _exhaust_reason(task, reason), budget_exhausted=True)
 
 
 def _exhausted_action(task: StoryTask) -> Action:
@@ -408,3 +446,22 @@ def _exhaust_reason(task: StoryTask, reason: str) -> str:
             f"instead of deferring: {reason}"
         )
     return reason
+
+
+def env_fault_claim(result_json: Any) -> str | None:
+    """The agent's "Environment fault:" claim in a session result, or ``None``.
+
+    A claim never decides anything on its own — it only makes the engine run
+    the operator's ``[environment] probes`` (DW-523). Total on any input: only a
+    mapping's ``env_fault_claim`` string counts (``devcontract.synthesize_result``
+    writes it from the session's last genuine ``## Auto Run Result``), stripped
+    and bounded to ``ENV_FAULT_CLAIM_LIMIT`` characters; a missing, non-string,
+    or blank value — or a document that is not a mapping at all — is no claim.
+    """
+    if not isinstance(result_json, dict):
+        return None
+    claim = result_json.get("env_fault_claim")
+    if not isinstance(claim, str):
+        return None
+    claim = claim.strip()
+    return claim[:ENV_FAULT_CLAIM_LIMIT] if claim else None

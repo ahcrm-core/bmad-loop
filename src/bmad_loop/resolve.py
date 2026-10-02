@@ -400,6 +400,10 @@ def build_context(
         "spec_file": context_spec_path.as_posix() if context_spec_path is not None else None,
         "baseline_commit": task.baseline_commit if task else None,
         "paused_reason": state.paused_reason,
+        # Where the escalation's environment fault was detected (DW-523), a closed
+        # `model.ENV_FAULT_SITES` slug; None when the escalation is not one. Set,
+        # it tells the session the spec needs no change: the environment does.
+        "env_fault_site": task.env_fault_site if task else None,
         "escalations": escalations,
         # as_posix so the context contract is the same string on every OS (the
         # path is consumed by the agent, and Python/tools accept '/' on Windows).

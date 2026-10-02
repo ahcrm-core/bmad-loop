@@ -200,6 +200,23 @@ class VerifyPolicy:
     # lands with null pointers and the full byte counts, so the journal keeps
     # saying what the command emitted even when none of it is retained.
     stream_capture_kb: int = 256
+    # env_fault_rc is the exit status a [verify] command uses to declare "the
+    # environment is broken, not the code" (DW-523): a command exiting with it is
+    # an environment fault — the run pauses and the attempt is not charged —
+    # instead of an ordinary, budget-burning verify failure. 0 = disabled. 75
+    # (EX_TEMPFAIL) is the documented suggestion: no common tool exits with it.
+    env_fault_rc: int = 0
+
+
+@dataclass(frozen=True)
+class EnvironmentPolicy:
+    # Operator-declared health checks (DW-523), run by the orchestrator in the
+    # project root before any [verify] command. A failing probe (nonzero exit,
+    # timeout, or a command that cannot be started) is an environment fault:
+    # the run pauses and the attempt is not charged. Empty = nothing spawns.
+    probes: tuple[str, ...] = ()
+    # Wall-clock bound on each probe; a probe that runs past it is a failure.
+    probe_timeout_s: int = 60
 
 
 @dataclass(frozen=True)
@@ -663,6 +680,7 @@ class Policy:
     gates: GatesPolicy = field(default_factory=GatesPolicy)
     limits: LimitsPolicy = field(default_factory=LimitsPolicy)
     verify: VerifyPolicy = field(default_factory=VerifyPolicy)
+    environment: EnvironmentPolicy = field(default_factory=EnvironmentPolicy)
     notify: NotifyPolicy = field(default_factory=NotifyPolicy)
     review: ReviewPolicy = field(default_factory=ReviewPolicy)
     stories: StoriesPolicy = field(default_factory=StoriesPolicy)
@@ -880,6 +898,7 @@ def loads(text: str, plugin_schemas: dict[str, Any] | None = None) -> Policy:
     gates_d = _section(doc, "gates")
     limits_d = _section(doc, "limits")
     verify_d = _section(doc, "verify")
+    environment_d = _section(doc, "environment")
     notify_d = _section(doc, "notify")
     review_d = _section(doc, "review")
     stories_d = _section(doc, "stories")
@@ -1038,9 +1057,31 @@ def loads(text: str, plugin_schemas: dict[str, Any] | None = None) -> Policy:
         stream_capture_kb=_typed_int(
             verify_d, "verify", "stream_capture_kb", VerifyPolicy.stream_capture_kb
         ),
+        env_fault_rc=_typed_int(verify_d, "verify", "env_fault_rc", VerifyPolicy.env_fault_rc),
     )
     if verify.stream_capture_kb < 0:
         raise PolicyError(f"verify.stream_capture_kb must be >= 0: got {verify.stream_capture_kb}")
+    if not 0 <= verify.env_fault_rc <= 255:
+        raise PolicyError(
+            "verify.env_fault_rc must be 0 (disabled) or an exit status 1-255: "
+            f"got {verify.env_fault_rc}"
+        )
+    environment = EnvironmentPolicy(
+        probes=_typed_str_tuple(environment_d, "environment", "probes") or (),
+        probe_timeout_s=_typed_int(
+            environment_d, "environment", "probe_timeout_s", EnvironmentPolicy.probe_timeout_s
+        ),
+    )
+    # A blank probe is `sh -c ""`, which exits 0: it would read as a healthy
+    # environment while checking nothing, so it is refused rather than run.
+    if any(not probe.strip() for probe in environment.probes):
+        raise PolicyError(
+            f"environment.probes entries must be non-blank commands: got {list(environment.probes)!r}"
+        )
+    if environment.probe_timeout_s < 1:
+        raise PolicyError(
+            f"environment.probe_timeout_s must be >= 1: got {environment.probe_timeout_s}"
+        )
     notify = NotifyPolicy(
         desktop=_typed_bool(notify_d, "notify", "desktop", NotifyPolicy.desktop),
         file=_typed_bool(notify_d, "notify", "file", NotifyPolicy.file),
@@ -1323,6 +1364,7 @@ def loads(text: str, plugin_schemas: dict[str, Any] | None = None) -> Policy:
         gates=gates,
         limits=limits,
         verify=verify,
+        environment=environment,
         notify=notify,
         review=review,
         stories=stories,
@@ -1399,6 +1441,15 @@ session_budget_grace_s = 240 # enforce mode: seconds a tripped session gets to w
 # Deterministic gates run by the orchestrator after a clean review, before commit.
 commands = []                # e.g. ["pytest -q", "ruff check ."]
 stream_capture_kb = 256      # per-stream cap (KiB) on the verifier stdout/stderr retained under the run's verify/ directory; the TAIL is kept and the journal records the full byte count plus a truncation flag. 0 = capture nothing (records still land, with null pointers)
+env_fault_rc = 0             # exit status a [verify] command uses to declare an environment fault (pause, attempt not charged) instead of a code failure. 0 = disabled; 75 (EX_TEMPFAIL) is a good choice
+
+[environment]
+# Orchestrator-run health checks (e.g. a local container or database). They run
+# before [verify] commands, before session launches, and before a failed attempt
+# is charged. A failing probe (nonzero exit, timeout, unrunnable) is an
+# environment fault: the run pauses and the attempt is not charged.
+probes = []                  # e.g. ["pg_isready -h localhost", "curl -fsS http://localhost:54321/health"]
+probe_timeout_s = 60         # per-probe wall-clock bound; running past it is a failure
 
 [notify]
 desktop = true               # notify-send (Linux) / osascript (macOS) / PowerShell toast (Windows), best-effort

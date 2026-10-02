@@ -65,6 +65,41 @@ PAUSE_STORY_GATE = "story-gate"
 # commit (skip-if-last). Both re-arm through the same resume path.
 PAUSE_PLAN_CHECKPOINT = "plan-checkpoint"
 PAUSE_STORY_CHECKPOINT = "story-checkpoint"
+# An `[environment] probe` failed right before a session dispatch (DW-523): the
+# environment, not the story, blocks the run, so nothing was charged or rolled
+# back and resume re-probes before dispatching. Reserved for the dispatch gate.
+PAUSE_ENVIRONMENT = "environment"
+
+# Where an environment fault was detected (DW-523), as recorded in
+# `StoryTask.env_fault_site`. A CLOSED vocabulary: `verify:<role>` — a verify
+# pass reported the env fault itself (a failed preflight probe, a declared
+# `[verify] env_fault_rc`, rc 126/127); `probe:decision:<role>` — a failure the
+# deciders would have charged (retry / defer) was re-probed and a probe failed;
+# `probe:claim:<role>` — a session claimed an environment fault and a probe
+# confirmed it; `probe:dispatch:<role>` — a probe failed before a session launch.
+ENV_FAULT_SITE_DISPATCH_PREFIX = "probe:dispatch:"
+ENV_FAULT_SITES = frozenset(
+    {
+        "verify:dev",
+        "verify:fix",
+        "verify:review",
+        "probe:decision:dev",
+        "probe:decision:fix",
+        "probe:decision:review",
+        "probe:decision:workflow",
+        "probe:claim:dev",
+        "probe:claim:fix",
+        "probe:claim:review",
+        "probe:claim:workflow",
+        f"{ENV_FAULT_SITE_DISPATCH_PREFIX}dev",
+        f"{ENV_FAULT_SITE_DISPATCH_PREFIX}review",
+    }
+)
+
+# The bound on a session's "Environment fault:" claim (DW-523): synthesized under
+# it by `devcontract` and re-applied by `escalation.env_fault_claim`, because a
+# third-party adapter's result document is not bound by the first-party writer.
+ENV_FAULT_CLAIM_LIMIT = 500
 
 # Reasons recorded in RunState.sweeps_refused (trigger -> reason). A CLOSED
 # vocabulary of short slugs, deliberately not a formatted exception: `bmad-loop
@@ -146,6 +181,12 @@ class SessionRecord:
     # the session's parsed result payload, persisted so a durably-saved
     # completed session is actionable on resume, not just forensics
     result_json: dict[str, Any] | None = None
+    # the plugin workflow (``<plugin>.<workflow>``) an injected workflow session
+    # ran; "" for the primary dev/fix/review sessions. A workflow declares its
+    # own role, so a `role="dev"` record is not necessarily the story's dev or
+    # fix session — lookups of the attempt's own result skip labeled records
+    # (DW-522). "" also for every record written before the field existed.
+    label: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -158,6 +199,7 @@ class SessionRecord:
             "transcript_path": self.transcript_path,
             "usage": self.usage.to_dict() if self.usage else None,
             "result_json": self.result_json,
+            "label": self.label,
         }
 
     @classmethod
@@ -173,6 +215,7 @@ class SessionRecord:
             transcript_path=d.get("transcript_path"),
             usage=TokenUsage.from_dict(usage) if usage else None,
             result_json=d.get("result_json"),
+            label=str(d.get("label", "") or ""),
         )
 
 
@@ -479,6 +522,16 @@ class StoryTask:
     # gone).
     operator_actions: list[str] = field(default_factory=list)
     defer_reason: str | None = None
+    # where the environment fault behind this task's escalation was detected
+    # (DW-523), one of `ENV_FAULT_SITES`; None = the escalation (if any) is not an
+    # environment fault. Set by `Engine._escalate_env` (directly, or through
+    # `Engine._escalate_outcome` for a verify env fault) and, for a
+    # `probe:dispatch:<role>` site on a NON-escalated task paused at
+    # `PAUSE_ENVIRONMENT`, by `Engine._pause_environment`; cleared by
+    # `runs.rearm_escalation` and `runs.adopt_escalated_branch` — a re-armed
+    # story starts with no fault on record — and by a resume whose re-probe
+    # passes (`Engine._take_env_dispatch_pause`). Survives the resume round-trip.
+    env_fault_site: str | None = None
     # the recovery ref this attempt's work was parked on by the last auto-rollback
     # — an `attempt-preserve/*` branch (commits above baseline) or, when the tree
     # was also dirty, the `refs/attempt-preserve-dirty/*` snapshot, which is
@@ -573,6 +626,17 @@ class StoryTask:
     # Survives the resume serialization round-trip; deliberately absent from
     # `documents.py`'s `--json` projection (schema 1).
     adopt_pending: bool = False
+    # Latched by runs.rearm_for_reverify (`bmad-loop resolve --reverify`, DW-522): the
+    # operator fixed the environment and asked for the kept attempt product (HEAD plus
+    # the dirty tree) to be re-verified, so the task was moved straight to DEV_VERIFY
+    # without a dev session. The value names the phase the story was re-armed FROM —
+    # "deferred" or "escalated" — which `escalation.decide_reverify` reads to choose
+    # between DEFER and PAUSE on a failing replay. Any non-empty value means a replay
+    # is pending: an unknown value is kept raw rather than dropped, so a state.json
+    # from a newer version fails closed (replay, never a silent dev re-drive). ""
+    # = no reverify pending. Survives the resume serialization round-trip;
+    # deliberately absent from `documents.py`'s `--json` projection (schema 1).
+    reverify_from: str = ""
     # sweep bundles only: the deferred-work ids this task closes and the
     # rendered intent file handed to dev sessions
     dw_ids: list[str] = field(default_factory=list)
@@ -694,6 +758,7 @@ class StoryTask:
             "commit_sha": self.commit_sha,
             "operator_actions": self.operator_actions,
             "defer_reason": self.defer_reason,
+            "env_fault_site": self.env_fault_site,
             "preserve_ref": self.preserve_ref,
             "preserve_partial": self.preserve_partial,
             "preserve_from_attempt": self.preserve_from_attempt,
@@ -704,6 +769,7 @@ class StoryTask:
             "sentinel_kind": self.sentinel_kind,
             "restore_patch": self.restore_patch,
             "adopt_pending": self.adopt_pending,
+            "reverify_from": self.reverify_from,
             "dw_ids": self.dw_ids,
             "bundle_file": self.bundle_file,
             "worktree_path": self.worktree_path,
@@ -973,6 +1039,7 @@ class StoryTask:
             commit_sha=d.get("commit_sha"),
             operator_actions=[str(a) for a in d.get("operator_actions", [])],
             defer_reason=d.get("defer_reason"),
+            env_fault_site=d.get("env_fault_site"),
             preserve_ref=d.get("preserve_ref"),
             preserve_partial=bool(d.get("preserve_partial", False)),
             preserve_from_attempt=bool(d.get("preserve_from_attempt", False)),
@@ -983,6 +1050,7 @@ class StoryTask:
             sentinel_kind=str(d.get("sentinel_kind", "")),
             restore_patch=d.get("restore_patch"),
             adopt_pending=bool(d.get("adopt_pending", False)),
+            reverify_from=str(d.get("reverify_from", "") or ""),
             dw_ids=[str(i) for i in d.get("dw_ids", [])],
             bundle_file=d.get("bundle_file"),
             worktree_path=str(d.get("worktree_path", "")),
@@ -992,6 +1060,46 @@ class StoryTask:
             tokens=TokenUsage.from_dict(d.get("tokens", {})),
             token_budget_warned=bool(d.get("token_budget_warned", False)),
         )
+
+
+# Sites whose fault fired AFTER a session's own verdict: the decision seam re-probed a
+# failure the deciders were about to charge, or a session's claim was confirmed —
+# both reached for crashed and timed-out sessions too (a third-party adapter's
+# non-completed result can carry a claim). Only a COMPLETED session left a product
+# worth re-verifying there; a crashed or timed-out one did not, so its escalation
+# needs a plain re-arm (a dev re-drive), not a replay over an earlier record. All map
+# to the `dev` record role: `Engine._fix_phase` dispatches its repair sessions under
+# the dev adapter, so a fix session is recorded as `role="dev"` like the attempt it
+# repairs.
+_REVERIFY_DECISION_SITE_ROLES = {
+    "probe:decision:dev": "dev",
+    "probe:decision:fix": "dev",
+    "probe:claim:dev": "dev",
+    "probe:claim:fix": "dev",
+}
+
+
+def env_fault_site_reverifiable(task: StoryTask) -> bool:
+    """Whether an ESCALATED task's recorded environment fault leaves a product that
+    `resolve --reverify` can replay verify against (DW-522).
+
+    True for every site in `ENV_FAULT_SITES` except the dispatch sites
+    (`probe:dispatch:*`): those fired before a session ran, so there is nothing to
+    re-verify. `probe:decision:dev` / `probe:decision:fix` and `probe:claim:dev` /
+    `probe:claim:fix` additionally require the role's LATEST session record (plugin
+    workflow sessions excluded) to be `completed` — the seam re-probes crashed and timed-out sessions too, and those
+    produced no verifiable attempt. False for no
+    site, and for any value outside the closed vocabulary (fail closed)."""
+    site = task.env_fault_site
+    if site is None or site not in ENV_FAULT_SITES:
+        return False
+    if site.startswith(ENV_FAULT_SITE_DISPATCH_PREFIX):
+        return False
+    role = _REVERIFY_DECISION_SITE_ROLES.get(site)
+    if role is None:
+        return True
+    latest = next((s for s in reversed(task.sessions) if s.role == role and not s.label), None)
+    return latest is not None and latest.status == "completed"
 
 
 @dataclass
@@ -1350,8 +1458,9 @@ class VerifyOutcome:
     # fixable failures carry concrete evidence (failing command output) that a
     # feedback-driven repair session can act on; non-fixable retries start over
     fixable: bool = False
-    # the failure is the run environment's, not the story's (verify command
-    # not found / not executable): no repair session can fix it and every
+    # the failure is the run environment's, not the story's (a probe failed, a
+    # verify command could not run or declared one — `env_fault_cause` says
+    # which): no repair session can fix it and every
     # story shares the same commands, so it must never charge attempt budgets
     env_fault: bool = False
     # a session deliberately contradicted a state the orchestrator had already
@@ -1435,6 +1544,13 @@ class VerifyOutcome:
     # (`bundle-artifact-only-accepted`'s `count`). `None` whenever no receipt was
     # accepted, including on every non-bundle leg.
     artifact_only_residue: int | None = None
+    # WHY an `env_fault` outcome is one (DW-523), so the pause text can name the
+    # cause instead of guessing it. "" whenever `env_fault` is False. Vocabulary:
+    # "probe" (an [environment] probe failed, no [verify] command ran),
+    # "declared-rc" (a command exited with `[verify] env_fault_rc`), "shell-rc"
+    # (rc 126/127), "cmd" (win32 cmd.exe could not run the command), "spawn"
+    # (the command could not be started at all).
+    env_fault_cause: str = ""
 
     @classmethod
     def passed(
@@ -1466,6 +1582,7 @@ class VerifyOutcome:
         severity: str = "CRITICAL",
         env_fault: bool = False,
         contradiction: bool = False,
+        env_fault_cause: str = "",
     ) -> "VerifyOutcome":
         return cls(
             ok=False,
@@ -1473,6 +1590,7 @@ class VerifyOutcome:
             severity=severity,
             env_fault=env_fault,
             contradiction=contradiction,
+            env_fault_cause=env_fault_cause,
         )
 
     @property

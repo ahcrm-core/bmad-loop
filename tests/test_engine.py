@@ -12,7 +12,9 @@ import signal
 import subprocess
 import sys
 import time
+from collections.abc import Sequence
 from pathlib import Path
+from typing import NamedTuple
 
 import pytest
 from conftest import (
@@ -36,6 +38,7 @@ from conftest import (
     fault_read_text,
     generic_dev_effect,
     git,
+    install_bmad_config,
     nested_repo_root_paths,
     plant_root_markers,
     refuse_to_resolve,
@@ -67,6 +70,7 @@ from bmad_loop.engine import (
 )
 from bmad_loop.journal import LOGS_DIR, VERIFY_DIR, Journal, load_state, save_state
 from bmad_loop.model import (
+    PAUSE_ENVIRONMENT,
     PAUSE_EPIC_BOUNDARY,
     PAUSE_ESCALATION,
     PAUSE_SPEC_APPROVAL,
@@ -84,6 +88,7 @@ from bmad_loop.model import (
 from bmad_loop.policy import (
     AdapterPolicy,
     DevPolicy,
+    EnvironmentPolicy,
     GatesPolicy,
     LimitsPolicy,
     NotifyPolicy,
@@ -3636,9 +3641,9 @@ def test_dev_stage_verify_commands_run_in_the_code_tree(project, monkeypatch, ma
     classify_cwds: list[Path] = []
     real_classify = verify.verify_command_results_outcome
 
-    def classify_in(results, cwd):
+    def classify_in(results, cwd, **kwargs):
         classify_cwds.append(cwd)
-        return real_classify(results, cwd)
+        return real_classify(results, cwd, **kwargs)
 
     monkeypatch.setattr(verify, "verify_command_results_outcome", classify_in)
 
@@ -3737,9 +3742,9 @@ def test_fix_stage_verify_commands_run_in_the_code_tree(project, monkeypatch, ma
     classify_cwds: list[Path] = []
     real_classify = verify.verify_command_results_outcome
 
-    def classify_in(results, cwd):
+    def classify_in(results, cwd, **kwargs):
         classify_cwds.append(cwd)
-        return real_classify(results, cwd)
+        return real_classify(results, cwd, **kwargs)
 
     monkeypatch.setattr(verify, "verify_command_results_outcome", classify_in)
 
@@ -13051,6 +13056,872 @@ def test_verify_env_fault_pauses_dev_without_burning_budget(project):
     assert decision["env_fault"] is True
 
 
+def _python_cmd(script: Path, body: str) -> str:
+    """A command running `body` under this interpreter — honored by sh and cmd."""
+    script.write_text(body, encoding="utf-8")
+    return f'"{sys.executable}" "{script}"'
+
+
+def test_dev_preflight_probe_failure_pauses_without_running_commands(project, tmp_path):
+    """DW-523: a failed `[environment]` probe at the dev gate is an env fault with
+    cause "probe" — the run pauses through the existing escalation path, the
+    attempt is not charged, and no `[verify]` command runs (so none is recorded).
+    The environment dies during the session (the dispatch gate saw it up).
+    Ablation: drop the preflight block from `_verify_commands_with_results` and
+    the marker command runs and the story commits."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    rig = _env_rig(tmp_path)
+    marker = project.project / "verify-ran"
+    command = _python_cmd(project.project / "mark.py", f"open(r'{marker}', 'w').close()\n")
+    policy = _env_policy(rig, command)
+    # only one dev session scripted: a repair session must never be requested
+    engine, adapter = make_engine(
+        project, [rig.dies_during(dev_effect(project, "1-1-a"))], policy=policy
+    )
+    summary = engine.run()
+
+    assert summary.paused and summary.escalated == 1 and summary.deferred == 0
+    assert [s.role for s in adapter.sessions] == ["dev"]
+    task = engine.state.tasks["1-1-a"]
+    assert task.phase == Phase.ESCALATED and task.attempt == 1
+    assert engine.state.paused_stage == PAUSE_ESCALATION
+    assert "environment probe rc=3" in engine.state.paused_reason
+    assert "no [verify] command was run" in engine.state.paused_reason
+    assert not marker.exists()
+    entries = engine.journal.entries()
+    assert not [e for e in entries if e["kind"] == "verify-command-result"]
+    (failed,) = [e for e in entries if e["kind"] == "env-probe-failed"]
+    assert failed["site"] == "verify:dev" and failed["command"] == rig.probe
+    assert failed["rc"] == 3 and failed["story_key"] == "1-1-a"
+    assert "spawn_error" not in failed
+    decision = [e for e in entries if e["kind"] == "dev-decision"][-1]
+    assert decision["env_fault"] is True
+
+
+def test_review_gate_preflight_failure_escalates_instead_of_fix_session(project):
+    """The review gate's preflight (the reported case: the environment dies after
+    dev verified) pauses the run — no fix session, no review cycle burned — and
+    is journaled with site "verify:review". The probe passes twice (the dev
+    dispatch gate, then the dev verify preflight — which leaves the probes fresh,
+    so the review dispatch gate does not re-run them), then fails."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    counter = project.project / "probe-count"
+    probe = _python_cmd(
+        project.project / "probe.py",
+        "import pathlib, sys\n"
+        f"p = pathlib.Path(r'{counter}')\n"
+        "n = int(p.read_text()) + 1 if p.exists() else 1\n"
+        "p.write_text(str(n))\n"
+        "sys.exit(0 if n <= 2 else 9)\n",
+    )
+    policy = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        verify=VerifyPolicy(commands=(_OK,)),
+        environment=EnvironmentPolicy(probes=(probe,)),
+    )
+    engine, adapter = make_engine(
+        project,
+        [dev_effect(project, "1-1-a"), review_effect(project, "1-1-a", clean=True)],
+        policy=policy,
+    )
+    summary = engine.run()
+
+    assert summary.paused and summary.escalated == 1 and summary.deferred == 0
+    assert [s.role for s in adapter.sessions] == ["dev", "review"]  # no fix session
+    task = engine.state.tasks["1-1-a"]
+    assert task.phase == Phase.ESCALATED and task.attempt == 1 and task.review_cycle == 1
+    assert "environment probe rc=9" in engine.state.paused_reason
+    entries = engine.journal.entries()
+    (failed,) = [e for e in entries if e["kind"] == "env-probe-failed"]
+    assert failed["site"] == "verify:review" and failed["rc"] == 9
+    # the dev gate's pass ran its command; the review gate's never did
+    stages = [e["verification_stage"] for e in entries if e["kind"] == "verify-command-result"]
+    assert stages == ["dev"]
+    review_failed = [e for e in entries if e["kind"] == "review-verify-failed"][-1]
+    assert review_failed["env_fault"] is True
+
+
+def test_declared_env_fault_rc_pauses_dev_without_burning_budget(project):
+    """`[verify] env_fault_rc`: a command exiting with the declared code pauses
+    the run like rc 127 does, and the pause text names the declared code rather
+    than the shell's convention."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    policy = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        verify=VerifyPolicy(commands=("exit 75",), env_fault_rc=75),
+    )
+    engine, adapter = make_engine(project, [dev_effect(project, "1-1-a")], policy=policy)
+    summary = engine.run()
+
+    assert summary.paused and summary.escalated == 1 and summary.deferred == 0
+    assert [s.role for s in adapter.sessions] == ["dev"]
+    task = engine.state.tasks["1-1-a"]
+    assert task.phase == Phase.ESCALATED and task.attempt == 1
+    assert "rc=75, [verify] env_fault_rc" in engine.state.paused_reason
+    assert "configured environment-fault code" in engine.state.paused_reason
+    decision = [e for e in engine.journal.entries() if e["kind"] == "dev-decision"][-1]
+    assert decision["env_fault"] is True
+
+
+# ------------------------------------- DW-523: the failure-decision environment seam
+
+
+class _EnvRig(NamedTuple):
+    """An environment the tests can kill: `probe` passes while `up` exists. Lives
+    in a tmp dir OUTSIDE the repo, so no rollback or commit ever touches it."""
+
+    up: Path
+    probe: str
+    root: Path
+
+    def verify(self, codes: Sequence[int], *, kill_from: int | None = None) -> str:
+        """A verify command whose Nth run (1-based) exits ``codes[N-1]`` (the last
+        code repeats) and, from run ``kill_from`` on, deletes ``up`` first — the
+        container dying under the verify pass."""
+        counter = self.root / "verify-count"
+        return _python_cmd(
+            self.root / "verify.py",
+            "import os, pathlib, sys\n"
+            f"p = pathlib.Path(r'{counter}')\n"
+            "n = int(p.read_text()) + 1 if p.exists() else 1\n"
+            "p.write_text(str(n))\n"
+            f"codes = {list(codes)!r}\n"
+            f"kill_from = {kill_from!r}\n"
+            f"if kill_from is not None and n >= kill_from and os.path.exists(r'{self.up}'):\n"
+            f"    os.remove(r'{self.up}')\n"
+            "sys.exit(codes[min(n, len(codes)) - 1])\n",
+        )
+
+    def dies_during(self, entry):
+        """A session script entry that takes the environment down while the
+        session runs. The dispatch gate (DW-523) probed it healthy before the
+        launch, so the failure first shows at verify or at the decision seam."""
+
+        def run(spec):
+            self.up.unlink(missing_ok=True)
+            return entry(spec) if callable(entry) else entry
+
+        return run
+
+
+def _env_rig(tmp_path: Path, *, up: bool = True) -> _EnvRig:
+    root = tmp_path / "env-rig"
+    root.mkdir()
+    marker = root / "up"
+    if up:
+        marker.write_text("up\n", encoding="utf-8")
+    probe = _python_cmd(
+        root / "probe.py",
+        f"import os, sys\nsys.exit(0 if os.path.exists(r'{marker}') else 3)\n",
+    )
+    return _EnvRig(up=marker, probe=probe, root=root)
+
+
+def _env_policy(rig: _EnvRig, *commands: str, **kw) -> Policy:
+    return Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        verify=VerifyPolicy(commands=tuple(commands)),
+        environment=EnvironmentPolicy(probes=(rig.probe,)),
+        **kw,
+    )
+
+
+def _reclassified(engine) -> list[dict]:
+    return [e for e in engine.journal.entries() if e["kind"] == "env-fault-reclassified"]
+
+
+def _fix_session_effect(spec):
+    """A completed repair session that changes nothing the verify pass reads."""
+    return SessionResult(
+        status="completed", result_json={"workflow": "auto-dev", "escalations": []}
+    )
+
+
+def test_container_death_mid_verify_pauses_instead_of_deferring(project, tmp_path):
+    """The reported case (DW-523): the environment dies DURING the dev verify pass
+    (the preflight probe passed, then the command failed as the container went
+    down). With the budget spent, `decide_dev` says DEFER — the seam re-probes,
+    the probe fails, and the story ESCALATES with the attempt uncharged instead.
+    Ablation: drop the dev-leg `_env_gate_decision` and the story is DEFERRED."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    rig = _env_rig(tmp_path)
+    policy = _env_policy(rig, rig.verify([1], kill_from=1), limits=LimitsPolicy(max_dev_attempts=1))
+    engine, adapter = make_engine(project, [dev_effect(project, "1-1-a")], policy=policy)
+    summary = engine.run()
+
+    assert summary.paused and summary.escalated == 1 and summary.deferred == 0
+    assert [s.role for s in adapter.sessions] == ["dev"]
+    task = engine.state.tasks["1-1-a"]
+    assert task.phase == Phase.ESCALATED
+    assert task.env_fault_site == "probe:decision:dev"
+    assert load_state(engine.run_dir).tasks["1-1-a"].env_fault_site == "probe:decision:dev"
+    assert engine.state.paused_stage == PAUSE_ESCALATION
+    reason = engine.state.paused_reason
+    assert reason.startswith("environment fault: dev defer withheld — probe failed (rc=3)")
+    assert "the attempt is not charged" in reason
+    (reclassified,) = _reclassified(engine)
+    assert reclassified["action"] == "defer" and reclassified["site"] == "probe:decision:dev"
+    entries = engine.journal.entries()
+    (probe_failed,) = [e for e in entries if e["kind"] == "env-probe-failed"]
+    assert probe_failed["site"] == "probe:decision:dev"
+    decision = [e for e in entries if e["kind"] == "dev-decision"][-1]
+    assert decision["action"] == "pause" and decision["env_fault_site"] == "probe:decision:dev"
+    escalated = [e for e in entries if e["kind"] == "story-escalated"][-1]
+    assert escalated["env_fault_site"] == "probe:decision:dev"
+    assert "story-deferred" not in {e["kind"] for e in entries}
+
+
+def test_healthy_probes_leave_verify_retry_unchanged(project, tmp_path, monkeypatch):
+    """A healthy re-probe returns the decision untouched: the ordinary failing
+    story retries then defers exactly as it does without probes — and the seam
+    did probe at each charging decision."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    rig = _env_rig(tmp_path)
+    policy = _env_policy(rig, _FAIL, limits=LimitsPolicy(max_dev_attempts=2))
+    engine, adapter = make_engine(
+        project, [dev_effect(project, "1-1-a"), dev_effect(project, "1-1-a")], policy=policy
+    )
+    sites: list[str] = []
+    real = engine._run_environment_probes
+
+    def spy(task, *, site):
+        sites.append(site)
+        return real(task, site=site)
+
+    monkeypatch.setattr(engine, "_run_environment_probes", spy)
+    summary = engine.run()
+
+    assert summary.deferred == 1 and summary.escalated == 0
+    assert [s.role for s in adapter.sessions] == ["dev", "dev"]
+    task = engine.state.tasks["1-1-a"]
+    assert task.phase == Phase.DEFERRED and task.env_fault_site is None
+    # the retry's dispatch is not re-gated: the decision seam's probe is fresh
+    assert sites == ["probe:dispatch:dev"] + ["verify:dev", "probe:decision:dev"] * 2
+    decisions = [e for e in engine.journal.entries() if e["kind"] == "dev-decision"]
+    assert [d["action"] for d in decisions] == ["retry", "defer"]
+    assert all("env_fault_site" not in d for d in decisions)
+    assert not _reclassified(engine)
+
+
+def test_rollback_invalidates_probe_freshness(project, tmp_path):
+    """A rollback rewinds the tree the decision seam's probe passed on, so the next
+    gated dispatch re-probes (DW-523). The probe is cwd-sensitive: after its first
+    pass it needs `envcfg` in the workspace, which only story A's crashed attempt
+    wrote — the seam passes on it, A defers and the rollback removes it, and story
+    B's dispatch pauses at the environment stage instead of launching. Ablation:
+    drop the freshness clear in `_rollback_or_pause` and B's dev session runs."""
+    write_sprint(project, {"1-1-a": "ready-for-dev", "1-1-b": "ready-for-dev"})
+    counter = tmp_path / "probe-count"
+    probe = _python_cmd(
+        tmp_path / "probe.py",
+        "import os, pathlib, sys\n"
+        f"p = pathlib.Path(r'{counter}')\n"
+        "n = int(p.read_text()) + 1 if p.exists() else 1\n"
+        "p.write_text(str(n))\n"
+        "sys.exit(0 if n == 1 or os.path.exists('envcfg') else 3)\n",
+    )
+    policy = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        environment=EnvironmentPolicy(probes=(probe,)),
+        limits=LimitsPolicy(max_dev_attempts=1),
+        scm=ScmPolicy(rollback_on_failure=True),
+    )
+
+    def crashes_after_writing_config(spec):
+        (project.project / "envcfg").write_text("cfg\n", encoding="utf-8")
+        return SessionResult(status="crashed")
+
+    engine, adapter = make_engine(
+        project, [crashes_after_writing_config, dev_effect(project, "1-1-b")], policy=policy
+    )
+    summary = engine.run()
+
+    assert summary.paused and summary.deferred == 1 and summary.escalated == 0
+    assert len(adapter.sessions) == 1  # story A's only; B never launched
+    assert not (project.project / "envcfg").exists()
+    assert engine.state.tasks["1-1-a"].phase == Phase.DEFERRED
+    assert engine.state.paused_stage == PAUSE_ENVIRONMENT
+    assert engine.state.paused_story_key == "1-1-b"
+    (failed,) = _rows(engine, "env-probe-failed")
+    assert failed["site"] == "probe:dispatch:dev" and failed["story_key"] == "1-1-b"
+    task_b = engine.state.tasks["1-1-b"]
+    assert task_b.attempt == 0 and task_b.sessions == []
+
+
+def test_failed_dev_session_with_failing_probe_pauses_not_retries(project, tmp_path):
+    """A crashed dev session would RETRY (spending an attempt); a failing probe
+    reclassifies it — no second dev session is launched. Ablation: drop the
+    dev-leg gate and a second dev session runs."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    rig = _env_rig(tmp_path)
+    policy = _env_policy(rig, limits=LimitsPolicy(max_dev_attempts=3))
+    engine, adapter = make_engine(
+        project,
+        [rig.dies_during(SessionResult(status="crashed")), dev_effect(project, "1-1-a")],
+        policy=policy,
+    )
+    summary = engine.run()
+
+    assert summary.paused and summary.escalated == 1
+    assert [s.role for s in adapter.sessions] == ["dev"]
+    task = engine.state.tasks["1-1-a"]
+    assert task.phase == Phase.ESCALATED and task.attempt == 1
+    assert task.env_fault_site == "probe:decision:dev"
+    assert engine.state.paused_reason.startswith("environment fault: dev retry withheld")
+    assert "withheld retry: dev session crashed" in engine.state.paused_reason
+    (reclassified,) = _reclassified(engine)
+    assert reclassified["action"] == "retry"
+
+
+def test_review_session_failure_with_failing_probe_pauses(project, tmp_path):
+    """A crashed review session would RETRY (spending a review cycle); the seam
+    re-probes and pauses instead. The dev leg PROCEEDed, so the seam never probed
+    it (only the dispatch gates did, healthy)."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    rig = _env_rig(tmp_path)
+    engine, adapter = make_engine(
+        project,
+        [
+            dev_effect(project, "1-1-a"),
+            rig.dies_during(SessionResult(status="crashed")),
+            review_effect(project, "1-1-a", clean=True),
+        ],
+        policy=_env_policy(rig),
+    )
+    summary = engine.run()
+
+    assert summary.paused and summary.escalated == 1 and summary.done == 0
+    assert [s.role for s in adapter.sessions] == ["dev", "review"]
+    task = engine.state.tasks["1-1-a"]
+    assert task.phase == Phase.ESCALATED and task.review_cycle == 1
+    assert task.env_fault_site == "probe:decision:review"
+    assert engine.state.paused_reason.startswith("environment fault: review retry withheld")
+    (failed,) = [e for e in engine.journal.entries() if e["kind"] == "env-probe-failed"]
+    assert failed["site"] == "probe:decision:review"
+
+
+def test_review_gate_failure_reclassified_before_fix_dispatch(project, tmp_path):
+    """The review gate's preflight passes, then its command fails as the
+    environment dies: the failure would dispatch a fix session (charging a dev
+    attempt) — the seam re-probes first and pauses, so no fix session runs.
+    Ablation: drop the review-gate `_env_gate_decision` and a fix session runs."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    rig = _env_rig(tmp_path)
+    engine, adapter = make_engine(
+        project,
+        [
+            dev_effect(project, "1-1-a"),
+            review_effect(project, "1-1-a", clean=True),
+            _fix_session_effect,
+        ],
+        policy=_env_policy(rig, rig.verify([0, 1], kill_from=2)),
+    )
+    summary = engine.run()
+
+    assert summary.paused and summary.escalated == 1 and summary.deferred == 0
+    assert [s.role for s in adapter.sessions] == ["dev", "review"]  # no fix session
+    task = engine.state.tasks["1-1-a"]
+    assert task.phase == Phase.ESCALATED and task.attempt == 1
+    assert task.env_fault_site == "probe:decision:review"
+    (reclassified,) = _reclassified(engine)
+    assert reclassified["action"] == "retry"
+
+
+def test_fix_failure_reclassified_before_next_attempt(project, tmp_path):
+    """A fix session's verify fails as the environment dies: the next repair
+    attempt is withheld. The review-gate failure before it re-probed healthy, so
+    exactly one fix session ran. Ablation: drop the `_fix_phase` gate and a
+    second fix session is requested."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    rig = _env_rig(tmp_path)
+    engine, adapter = make_engine(
+        project,
+        [
+            dev_effect(project, "1-1-a"),
+            review_effect(project, "1-1-a", clean=True),
+            _fix_session_effect,
+            _fix_session_effect,
+        ],
+        policy=_env_policy(
+            rig, rig.verify([0, 1], kill_from=3), limits=LimitsPolicy(max_dev_attempts=3)
+        ),
+    )
+    summary = engine.run()
+
+    assert summary.paused and summary.escalated == 1 and summary.deferred == 0
+    assert [s.role for s in adapter.sessions] == ["dev", "review", "dev"]
+    task = engine.state.tasks["1-1-a"]
+    assert task.phase == Phase.ESCALATED and task.attempt == 2
+    assert task.env_fault_site == "probe:decision:fix"
+    assert engine.state.paused_reason.startswith("environment fault: fix retry withheld")
+    (reclassified,) = _reclassified(engine)
+    assert reclassified["site"] == "probe:decision:fix" and reclassified["action"] == "retry"
+
+
+def test_skip_review_failure_reclassified_not_deferred(project, tmp_path):
+    """review.enabled = false: the commit gate's failure would dispatch a repair
+    (and ultimately defer); a failing re-probe escalates instead. Ablation: drop
+    the skip-review gates and the story is DEFERRED."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    rig = _env_rig(tmp_path)
+    policy = _env_policy(
+        rig,
+        rig.verify([0, 1], kill_from=2),
+        review=ReviewPolicy(enabled=False),
+        limits=LimitsPolicy(max_dev_attempts=1),
+    )
+    engine, adapter = make_engine(project, [dev_effect(project, "1-1-a")], policy=policy)
+    summary = engine.run()
+
+    assert summary.paused and summary.escalated == 1 and summary.deferred == 0
+    assert [s.role for s in adapter.sessions] == ["dev"]
+    task = engine.state.tasks["1-1-a"]
+    assert task.phase == Phase.ESCALATED
+    assert task.env_fault_site == "probe:decision:review"
+    assert "story-deferred" not in {e["kind"] for e in engine.journal.entries()}
+
+
+def test_review_nonconvergence_defer_reclassified(project, tmp_path):
+    """A review loop that spends its budget without converging would defer; the
+    seam re-probes that budget-exhausted DEFER and escalates on a failed probe.
+    Ablation: drop the non-converged gate and the story is DEFERRED."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    rig = _env_rig(tmp_path)
+    engine, adapter = make_engine(
+        project,
+        [
+            dev_effect(project, "1-1-a"),
+            review_effect(project, "1-1-a", clean=False, finalized=False),
+            rig.dies_during(review_effect(project, "1-1-a", clean=False, finalized=False)),
+        ],
+        policy=_env_policy(rig, limits=LimitsPolicy(max_review_cycles=2)),
+    )
+    summary = engine.run()
+
+    assert summary.paused and summary.escalated == 1 and summary.deferred == 0
+    assert [s.role for s in adapter.sessions] == ["dev", "review", "review"]
+    task = engine.state.tasks["1-1-a"]
+    assert task.phase == Phase.ESCALATED and task.env_fault_site == "probe:decision:review"
+    (reclassified,) = _reclassified(engine)
+    assert reclassified["action"] == "defer"
+    assert "review did not converge within budget" in engine.state.paused_reason
+
+
+def test_blocking_workflow_failure_reclassified(project, tmp_path):
+    """A failed blocking workflow would defer the story; with a failing probe
+    the seam escalates with site `probe:decision:workflow` instead. Ablation:
+    drop the workflow gate and the story is DEFERRED."""
+    from bmad_loop.plugins import PluginRegistry
+    from bmad_loop.plugins.model import LoadedPlugin, PluginManifest, WorkflowSpec
+
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    rig = _env_rig(tmp_path)
+    manifest = PluginManifest(
+        name="wf",
+        api_version=1,
+        workflows=(
+            WorkflowSpec(
+                name="doc",
+                stage="post_dev_phase",
+                role="review",
+                prompt="/doc {story_key}",
+                blocking=True,
+            ),
+        ),
+    )
+    engine, adapter = make_engine(
+        project,
+        [
+            dev_effect(project, "1-1-a"),
+            rig.dies_during(SessionResult(status="error", result_json={})),
+        ],
+        policy=_env_policy(rig),
+        registry=PluginRegistry([LoadedPlugin(manifest=manifest)]),
+    )
+    summary = engine.run()
+
+    assert summary.paused and summary.escalated == 1 and summary.deferred == 0
+    assert len(adapter.sessions) == 2
+    task = engine.state.tasks["1-1-a"]
+    assert task.phase == Phase.ESCALATED
+    assert task.env_fault_site == "probe:decision:workflow"
+    assert engine.state.paused_reason.startswith("environment fault: workflow defer withheld")
+
+
+@pytest.mark.parametrize("env_up", [False, True])
+def test_completed_blocking_workflow_claim_is_probed(project, tmp_path, env_up):
+    """A COMPLETED blocking workflow's "Environment fault:" claim forces a probe
+    too (DW-523): at `pre_commit_gate` nothing else probes before the commit. A
+    failing probe escalates at `probe:claim:workflow` instead of committing; a
+    passing one journals the claim and the story commits as before.
+
+    Ablation, performed: drop the completed-workflow gate in `_run_workflows` and
+    the dead-environment case commits with no `env-fault-claim` row."""
+    from bmad_loop.plugins import PluginRegistry
+    from bmad_loop.plugins.model import LoadedPlugin, PluginManifest, WorkflowSpec
+
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    rig = _env_rig(tmp_path)
+    manifest = PluginManifest(
+        name="wf",
+        api_version=1,
+        workflows=(
+            WorkflowSpec(
+                name="gate",
+                stage="pre_commit_gate",
+                role="review",
+                prompt="/gate {story_key}",
+                blocking=True,
+            ),
+        ),
+    )
+    workflow = _claiming(SessionResult(status="completed", result_json={}))
+    engine, adapter = make_engine(
+        project,
+        [
+            dev_effect(project, "1-1-a", followup_review=False),
+            workflow if env_up else rig.dies_during(workflow),
+        ],
+        policy=_env_policy(rig, review=ReviewPolicy(enabled=False)),
+        registry=PluginRegistry([LoadedPlugin(manifest=manifest)]),
+    )
+    summary = engine.run()
+
+    assert len(adapter.sessions) == 2
+    task = engine.state.tasks["1-1-a"]
+    (claim,) = _claim_rows(engine)
+    assert claim["role"] == "workflow"
+    if env_up:
+        assert summary.done == 1 and claim["probe_outcome"] == "passed"
+        assert task.env_fault_site is None
+    else:
+        assert summary.paused and summary.escalated == 1 and summary.done == 0
+        assert claim["probe_outcome"] == "failed"
+        assert task.phase == Phase.ESCALATED
+        assert task.env_fault_site == "probe:claim:workflow"
+
+
+def test_rescue_gate_env_fault_escalates_not_defers(project):
+    """Bug fix (DW-523): an env fault at the review-budget rescue gate fell
+    through to the "did not converge" defer — filing verify-green work as
+    unconverged over an environment fault. It escalates now, recording
+    `verify:review`. No probes involved: rc 127 is itself the env fault.
+    Ablation: revert the `or rescue.env_fault` conjunct and it DEFERS."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    root = project.project.parent / "rescue-rig"
+    root.mkdir()
+    counter = root / "count"
+    command = _python_cmd(
+        root / "verify.py",
+        "import pathlib, sys\n"
+        f"p = pathlib.Path(r'{counter}')\n"
+        "n = int(p.read_text()) + 1 if p.exists() else 1\n"
+        "p.write_text(str(n))\n"
+        "sys.exit(0 if n == 1 else 127)\n",
+    )
+    engine, adapter = make_engine(
+        project,
+        [dev_effect(project, "1-1-a")]
+        + [review_effect(project, "1-1-a", clean=False) for _ in range(3)],
+        policy=Policy(
+            gates=GatesPolicy(mode="none"),
+            notify=QUIET,
+            scm=ScmPolicy(rollback_on_failure=True),
+            verify=VerifyPolicy(commands=(command,)),
+            limits=LimitsPolicy(max_followup_reviews=5),
+        ),
+    )
+    summary = engine.run()
+
+    assert not summary.crashed
+    assert summary.paused and summary.escalated == 1 and summary.deferred == 0
+    assert [s.role for s in adapter.sessions] == ["dev", "review", "review", "review"]
+    task = engine.state.tasks["1-1-a"]
+    assert task.phase == Phase.ESCALATED and task.env_fault_site == "verify:review"
+    assert "verify environment fault" in engine.state.paused_reason
+    entries = engine.journal.entries()
+    (failed,) = [e for e in entries if e["kind"] == "review-verify-failed"]
+    assert failed["env_fault"] is True and failed["contradiction"] is False
+    kinds = {e["kind"] for e in entries}
+    assert "story-deferred" not in kinds and "review-budget-committed" not in kinds
+    assert "change for 1-1-a" in (project.project / "src.txt").read_text()
+
+
+@pytest.mark.parametrize("role", ["dev", "fix", "review"])
+def test_env_fault_site_recorded_per_verify_site(project, tmp_path, role):
+    """A verify env fault (rc 127) escalates with `verify:<role>` — the pass that
+    reported it — on the task, in `story-escalated`, and through state.json."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    root = tmp_path / "site-rig"
+    root.mkdir()
+    counter = root / "count"
+    codes = {"dev": [127], "review": [0, 127], "fix": [0, 1, 127]}[role]
+    command = _python_cmd(
+        root / "verify.py",
+        "import pathlib, sys\n"
+        f"p = pathlib.Path(r'{counter}')\n"
+        "n = int(p.read_text()) + 1 if p.exists() else 1\n"
+        "p.write_text(str(n))\n"
+        f"codes = {codes!r}\n"
+        "sys.exit(codes[min(n, len(codes)) - 1])\n",
+    )
+    engine, adapter = make_engine(
+        project,
+        [
+            dev_effect(project, "1-1-a"),
+            review_effect(project, "1-1-a", clean=True),
+            _fix_session_effect,
+        ],
+        policy=Policy(
+            gates=GatesPolicy(mode="none"),
+            notify=QUIET,
+            verify=VerifyPolicy(commands=(command,)),
+            limits=LimitsPolicy(max_dev_attempts=3),
+        ),
+    )
+    summary = engine.run()
+
+    assert summary.paused and summary.escalated == 1
+    expected_roles = {"dev": ["dev"], "review": ["dev", "review"], "fix": ["dev", "review", "dev"]}
+    assert [s.role for s in adapter.sessions] == expected_roles[role]
+    site = f"verify:{role}"
+    assert engine.state.tasks["1-1-a"].env_fault_site == site
+    assert load_state(engine.run_dir).tasks["1-1-a"].env_fault_site == site
+    escalated = [e for e in engine.journal.entries() if e["kind"] == "story-escalated"][-1]
+    assert escalated["env_fault_site"] == site
+    assert not _reclassified(engine)  # already an env fault: nothing to re-probe
+
+
+def test_no_probes_configured_journals_no_env_kinds(project, monkeypatch):
+    """Defaults are byte-identical (DW-523): with no `[environment] probes` the
+    seam spawns nothing and journals nothing new, even across a retry and a
+    defer, and no record carries `env_fault_site`. Ablation: drop the
+    `not self.policy.environment.probes` early return and the probe runner is
+    called."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    called: list[object] = []
+    real = verify.run_environment_probes
+
+    def spy(policy, cwd):
+        called.append(cwd)
+        return real(policy, cwd)
+
+    monkeypatch.setattr(verify, "run_environment_probes", spy)
+    policy = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        verify=VerifyPolicy(commands=(_FAIL,)),
+        limits=LimitsPolicy(max_dev_attempts=2),
+    )
+    engine, adapter = make_engine(
+        project, [dev_effect(project, "1-1-a"), dev_effect(project, "1-1-a")], policy=policy
+    )
+    summary = engine.run()
+
+    assert summary.deferred == 1
+    assert called == []
+    entries = engine.journal.entries()
+    kinds = {e["kind"] for e in entries}
+    assert not kinds & {"env-probe-failed", "env-fault-reclassified"}
+    assert all("env_fault_site" not in e for e in entries)
+    assert engine.state.tasks["1-1-a"].env_fault_site is None
+
+
+_CLAIM = "postgres container is down"
+
+
+def _claiming(entry, claim: str = _CLAIM):
+    """A session script entry whose result carries an "Environment fault:" claim
+    (DW-523) — the key ``devcontract.synthesize_result`` mints from the line."""
+
+    def run(spec):
+        result = entry(spec) if callable(entry) else entry
+        return dataclasses.replace(
+            result, result_json={**(result.result_json or {}), "env_fault_claim": claim}
+        )
+
+    return run
+
+
+def _claim_rows(engine) -> list[dict]:
+    return [e for e in engine.journal.entries() if e["kind"] == "env-fault-claim"]
+
+
+def _claim_case(role: str, project, rig: _EnvRig):
+    """(script, policy, sessions) for a claim on ``role`` whose session leaves the
+    environment dead behind a decision that would otherwise PROCEED. The fix leg
+    kills it inside its own (green) verify command: the fix verify's preflight
+    probe has to pass for the repair to reach the claim at all."""
+    if role == "dev":
+        script = [rig.dies_during(_claiming(dev_effect(project, "1-1-a")))]
+        return script, _env_policy(rig), ["dev"]
+    if role == "review":
+        script = [
+            dev_effect(project, "1-1-a"),
+            rig.dies_during(_claiming(review_effect(project, "1-1-a", clean=True))),
+        ]
+        return script, _env_policy(rig), ["dev", "review"]
+    script = [
+        dev_effect(project, "1-1-a"),
+        review_effect(project, "1-1-a", clean=True),
+        _claiming(_fix_session_effect),
+    ]
+    policy = _env_policy(rig, rig.verify([0, 1, 0], kill_from=3))
+    return script, policy, ["dev", "review", "dev"]
+
+
+@pytest.mark.parametrize("role", ["dev", "review", "fix"])
+def test_claim_with_failing_probe_pauses_as_env_fault(project, tmp_path, role):
+    """A session claims an environment fault and the orchestrator's own probe
+    confirms it: the decision (a PROCEED on every leg here) is replaced by a PAUSE
+    at ``probe:claim:<role>``; the reason leads with the confirmation and quotes
+    the claim. Ablation: drop the `_env_gate_claim` call in `_env_gate_decision`
+    (or, for the fix leg, the PROCEED gate in `_fix_phase`) and the story is
+    committed."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    rig = _env_rig(tmp_path)
+    script, policy, sessions = _claim_case(role, project, rig)
+    engine, adapter = make_engine(project, script, policy=policy)
+    summary = engine.run()
+
+    assert summary.paused and summary.escalated == 1 and summary.done == 0
+    assert [s.role for s in adapter.sessions] == sessions
+    task = engine.state.tasks["1-1-a"]
+    site = f"probe:claim:{role}"
+    assert task.phase == Phase.ESCALATED and task.env_fault_site == site
+    assert engine.state.paused_stage == PAUSE_ESCALATION
+    reason = engine.state.paused_reason
+    assert reason.startswith(
+        f"environment fault: {role} session reported an environment fault and a probe "
+        "confirmed it — probe failed (rc=3)"
+    )
+    assert f"session claim: {_CLAIM}" in reason
+    assert "the attempt is not charged" in reason
+    (claim,) = _claim_rows(engine)
+    assert claim == {
+        **claim,
+        "story_key": "1-1-a",
+        "role": role,
+        "reason": _CLAIM,
+        "probe_outcome": "failed",
+        "action": "pause",
+    }
+    (reclassified,) = _reclassified(engine)
+    assert reclassified["site"] == site and reclassified["action"] == "proceed"
+    failed = [e for e in engine.journal.entries() if e["kind"] == "env-probe-failed"]
+    assert [e["site"] for e in failed] == [site]
+
+
+def test_claim_with_passing_probe_is_journaled_and_ignored(project, tmp_path, monkeypatch):
+    """The claim is prose, never a verdict: with the environment healthy the probe
+    passes, the claim is journaled with ``probe_outcome="passed"`` and the
+    session's own decision stands — the story commits. Ablation: make
+    `_env_gate_claim` return a PAUSE without probing (the claim pausing alone)
+    and the story escalates."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    rig = _env_rig(tmp_path)
+    engine, adapter = make_engine(
+        project,
+        [_claiming(dev_effect(project, "1-1-a")), review_effect(project, "1-1-a", clean=True)],
+        policy=_env_policy(rig),
+    )
+    sites: list[str] = []
+    real = engine._run_environment_probes
+
+    def spy(task, *, site):
+        sites.append(site)
+        return real(task, site=site)
+
+    monkeypatch.setattr(engine, "_run_environment_probes", spy)
+    summary = engine.run()
+
+    assert summary.done == 1 and summary.escalated == 0 and not summary.paused
+    assert [s.role for s in adapter.sessions] == ["dev", "review"]
+    task = engine.state.tasks["1-1-a"]
+    assert task.phase == Phase.DONE and task.env_fault_site is None
+    assert "probe:claim:dev" in sites
+    (claim,) = _claim_rows(engine)
+    assert claim["role"] == "dev" and claim["reason"] == _CLAIM
+    assert claim["probe_outcome"] == "passed" and claim["action"] == "proceed"
+    assert not _reclassified(engine)
+    decision = [e for e in engine.journal.entries() if e["kind"] == "dev-decision"][-1]
+    assert decision["action"] == "proceed" and "env_fault_site" not in decision
+
+
+def test_claim_without_probes_is_journaled_only(project, monkeypatch):
+    """No `[environment] probes`: the claim has nothing to trigger. It is journaled
+    (``probe_outcome="not-configured"``), nothing spawns, and the story commits.
+    Ablation: drop the not-configured journal row and the row assertion fails."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    called: list[object] = []
+    real = verify.run_environment_probes
+
+    def spy(policy, cwd):
+        called.append(cwd)
+        return real(policy, cwd)
+
+    monkeypatch.setattr(verify, "run_environment_probes", spy)
+    engine, adapter = make_engine(
+        project,
+        [_claiming(dev_effect(project, "1-1-a")), review_effect(project, "1-1-a", clean=True)],
+        policy=Policy(gates=GatesPolicy(mode="none"), notify=QUIET),
+    )
+    summary = engine.run()
+
+    assert summary.done == 1 and not summary.paused
+    assert called == []
+    (claim,) = _claim_rows(engine)
+    assert claim["probe_outcome"] == "not-configured" and claim["action"] == "proceed"
+    assert not _reclassified(engine)
+    assert engine.state.tasks["1-1-a"].env_fault_site is None
+
+
+def test_env_claim_prompt_clause_only_when_probes_configured(project, tmp_path):
+    """The claim contract rides the dev legs and the review prompt only while
+    `[environment] probes` is set; without probes every prompt is byte-identical
+    to the pre-DW-523 one. With probes the clause is the only difference, sits
+    BEFORE the park clause (which stays last), and is backtick-free.
+    Ablation: return the clause unconditionally and the no-probe prompts change."""
+    rig = _env_rig(tmp_path)
+    plain, _ = make_engine(project, [], policy=_park_policy())
+    probed, _ = make_engine(
+        project,
+        [],
+        policy=_park_policy(environment=EnvironmentPolicy(probes=(rig.probe,))),
+    )
+    clause = probed._environment_claim_instruction()
+    assert plain._environment_claim_instruction() == ""
+    assert clause.startswith("If something outside the code blocks your work")
+    assert "Environment fault:" in clause
+    assert "`" not in clause and "append" not in clause.lower()
+
+    spec = str(spec_path(project, "1-1-a"))
+    feedback = project.implementation_artifacts / "feedback.md"
+    legs = [
+        (_prompt_task(), None),
+        (_prompt_task(spec_file=spec, dispatched_spec_file=spec), None),
+        (_prompt_task(spec_file=spec, restore_patch="/run/attempt.patch"), None),
+        (_prompt_task(), feedback),
+    ]
+    park = plain._operator_park_instruction()
+    assert park  # else the ordering check is vacuous
+    for task, fb in legs:
+        before = plain._generic_dev_prompt(task, fb)
+        after = probed._generic_dev_prompt(task, fb)
+        assert clause not in before
+        assert after.replace(f" {clause}", "", 1) == before
+        assert after.index(clause) < after.index(park)
+    task = _prompt_task(spec_file=spec)
+    before = plain._review_prompt(task)
+    after = probed._review_prompt(task)
+    assert clause not in before
+    assert after == f"{before} {clause}"
+
+
 def _spawn_error_names(message: str, path: Path) -> bool:
     """Whether a spawn-error record names ``path``.
 
@@ -13266,6 +14137,410 @@ def test_fix_phase_env_fault_escalates_instead_of_looping(project):
     assert "verify environment fault" in engine.state.paused_reason
     fix = [e for e in engine.journal.entries() if e["kind"] == "fix-decision"][-1]
     assert fix["env_fault"] is True
+
+
+# ------------------------------------------- DW-523: the session dispatch gate
+
+
+def _dispatch_paused(engine, role: str = "dev") -> StoryTask:
+    """Assert the run paused at the `environment` stage over a ``role`` dispatch
+    probe, persisted, and return the in-memory task."""
+    site = f"probe:dispatch:{role}"
+    assert engine.state.paused_stage == PAUSE_ENVIRONMENT
+    assert engine.state.paused_story_key == "1-1-a"
+    reason = engine.state.paused_reason
+    assert reason.startswith(f"environment fault before {role} session dispatch — probe failed")
+    assert "no session was started and nothing was charged" in reason
+    assert f"`bmad-loop resume {engine.state.run_id}`" in reason
+    task = engine.state.tasks["1-1-a"]
+    assert task.env_fault_site == site
+    persisted = load_state(engine.run_dir)
+    assert persisted.paused_stage == PAUSE_ENVIRONMENT
+    assert persisted.tasks["1-1-a"].env_fault_site == site
+    return task
+
+
+def test_dispatch_gate_pauses_before_first_dev_session(project, tmp_path):
+    """DW-523: with the environment down, the gate pauses the run BEFORE the first
+    dev session — nothing launched, the attempt counter and phase untouched, no
+    baseline stamped — at the new `environment` stage (not an escalation).
+    Ablation: drop the `_gate_dispatch` call from `_dev_phase` and a dev session
+    is requested (the empty script raises)."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    rig = _env_rig(tmp_path, up=False)
+    engine, adapter = make_engine(project, [], policy=_env_policy(rig))
+    summary = engine.run()
+
+    assert summary.paused and summary.escalated == 0 and summary.deferred == 0
+    assert adapter.sessions == []
+    task = _dispatch_paused(engine)
+    assert task.phase == Phase.PENDING and task.attempt == 0 and task.review_cycle == 0
+    assert task.baseline_commit is None and task.sessions == []
+    assert "probe failed (rc=3)" in engine.state.paused_reason
+    (failed,) = _rows(engine, "env-probe-failed")
+    assert failed["site"] == "probe:dispatch:dev" and failed["rc"] == 3
+    assert not _rows(engine, "story-escalated")
+
+
+def test_dispatch_gate_skips_when_probes_fresh(project, tmp_path):
+    """A probe pass since the last session launch stands in for the gate: the dev
+    dispatch probes (1), the dev verify preflight probes (2) and leaves them fresh,
+    so the review dispatch does NOT re-probe; the review verify preflight (3) is
+    the last. Ablation: drop the `_env_probes_fresh_root` short-circuit in
+    `_gate_dispatch` and the review dispatch probes a fourth time."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    counter = tmp_path / "probe-count"
+    probe = _python_cmd(
+        tmp_path / "probe.py",
+        "import pathlib\n"
+        f"p = pathlib.Path(r'{counter}')\n"
+        "p.write_text(str(int(p.read_text()) + 1 if p.exists() else 1))\n",
+    )
+    policy = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        verify=VerifyPolicy(commands=(_OK,)),
+        environment=EnvironmentPolicy(probes=(probe,)),
+    )
+    engine, adapter = make_engine(
+        project,
+        [dev_effect(project, "1-1-a"), review_effect(project, "1-1-a", clean=True)],
+        policy=policy,
+    )
+    summary = engine.run()
+
+    assert summary.done == 1
+    assert [s.role for s in adapter.sessions] == ["dev", "review"]
+    assert counter.read_text(encoding="utf-8") == "3"
+
+
+def test_resume_with_env_still_down_repauses_unchanged(project, tmp_path):
+    """A resume while the environment is still down re-probes first and re-pauses
+    at the same site with the task exactly as it was — no session, no
+    `env-fault-cleared`, no dispatch. Ablation: drop the re-pause in
+    `_take_env_dispatch_pause` and `env-fault-cleared` / `resume-env-dispatch`
+    are journaled before the gate inside `_dev_phase` pauses again."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    rig = _env_rig(tmp_path, up=False)
+    engine, _ = make_engine(project, [], policy=_env_policy(rig))
+    engine.run()
+    before = load_state(engine.run_dir).tasks["1-1-a"].to_dict()
+
+    engine2, adapter2 = resume_engine(project, engine, [])
+    summary = engine2.run()
+
+    assert summary.paused and adapter2.sessions == []
+    _dispatch_paused(engine2)
+    assert load_state(engine2.run_dir).tasks["1-1-a"].to_dict() == before
+    sites = [e["site"] for e in _rows(engine2, "env-probe-failed")]
+    assert sites == ["probe:dispatch:dev"] * 2
+    assert not _rows(engine2, "env-fault-cleared")
+    assert not _rows(engine2, "resume-env-dispatch")
+    assert not _rows(engine2, "resume-restart")
+
+
+def test_resume_after_dispatch_pause_dispatches_without_rollback(project, tmp_path):
+    """The no-rollback guarantee (DW-523). A resolved re-drive keeps its baseline
+    through the restart arm's rollback, then its dev dispatch pauses on a dead
+    environment. The operator commits a fix while paused; once the environment is
+    back, `resume` dispatches the dev session on top of that commit — nothing ran
+    before the pause, so there is nothing to roll back. Ablation: delete the
+    `resume-env-dispatch` arm of `_finish_inflight` (the task falls through to the
+    restart arm) and the reset to the stale baseline drops the operator's commit."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    rig = _env_rig(tmp_path)
+    policy = _env_policy(rig, _OK, scm=ScmPolicy(rollback_on_failure=True))
+    engine, _ = make_engine(
+        project, [rig.dies_during(_committing_dev(project, "1-1-a", "attempt.txt"))], policy=policy
+    )
+    engine.run()
+    assert engine.state.tasks["1-1-a"].env_fault_site == "verify:dev"
+    rearm_escalation(engine.run_dir, isolated_redrive=False, resolution_recorded=True)
+
+    # resume 1, environment still down: the re-drive rolls back, then the gate pauses
+    engine2, adapter2 = resume_engine(project, engine, [])
+    engine2.run()
+    assert adapter2.sessions == []
+    task = _dispatch_paused(engine2)
+    assert task.phase == Phase.PENDING and task.baseline_commit is not None
+    stale_baseline = task.baseline_commit
+    assert len(_rows(engine2, "resume-restart")) == 1
+
+    (project.project / "operator.txt").write_text("operator fix\n")
+    git(project.project, "add", "operator.txt")
+    git(project.project, "commit", "-q", "-m", "operator fix while paused")
+    operator_commit = git(project.project, "rev-parse", "HEAD").strip()
+    assert operator_commit != stale_baseline
+    rig.up.write_text("up\n")
+
+    engine3, adapter3 = resume_engine(
+        project, engine2, [dev_effect(project, "1-1-a", followup_review=False)]
+    )
+    summary = engine3.run()
+
+    assert summary.done == 1
+    assert [s.role for s in adapter3.sessions] == ["dev"]
+    assert len(_rows(engine3, "resume-restart")) == 1  # resume 1's only
+    (cleared,) = _rows(engine3, "env-fault-cleared")
+    assert cleared["site"] == "probe:dispatch:dev"
+    (dispatched,) = _rows(engine3, "resume-env-dispatch")
+    assert dispatched["role"] == "dev"
+    task = engine3.state.tasks["1-1-a"]
+    assert task.phase == Phase.DONE and task.env_fault_site is None
+    assert task.attempt == 1  # resolve reset the budget; one dispatch, one attempt
+    subprocess.run(
+        ["git", "merge-base", "--is-ancestor", operator_commit, "HEAD"],
+        cwd=project.project,
+        check=True,
+    )
+    assert (project.project / "operator.txt").read_text() == "operator fix\n"
+
+
+def test_gated_resume_of_a_dispatch_pause_keeps_the_site(project, tmp_path):
+    """The resumed dev dispatch is a start, so it is asked the story-gate question —
+    BEFORE the dispatch site clears. A gate opened while the run was paused then
+    pauses at the story gate with `probe:dispatch:dev` still recorded, and the
+    resume after the entry lands still takes the no-rollback arm. Ablation: move
+    the `_refuse_gated_story` call after `_take_env_dispatch_pause` and the site is
+    cleared under the story-gate pause (the next resume would take the restart arm)."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    rig = _env_rig(tmp_path, up=False)
+    engine, _ = make_engine(project, [], policy=_env_policy(rig))
+    engine.run()
+    _dispatch_paused(engine)
+
+    write_gated_ledger(project, {"DW-1": ("open", ["gate: 1-1"])})
+    rig.up.write_text("up\n")
+    engine2, adapter2 = resume_engine(project, engine, [])
+    assert engine2.run().paused
+
+    assert adapter2.sessions == []
+    saved = load_state(engine2.run_dir)
+    assert saved.paused_stage == PAUSE_STORY_GATE
+    assert saved.tasks["1-1-a"].env_fault_site == "probe:dispatch:dev"
+    assert saved.tasks["1-1-a"].phase == Phase.PENDING
+    assert not _rows(engine2, "env-fault-cleared")
+
+    write_gated_ledger(project, {"DW-1": ("done 2026-08-01", ["gate: 1-1"])})
+    engine3, adapter3 = resume_engine(
+        project, engine2, [dev_effect(project, "1-1-a", followup_review=False)]
+    )
+    summary = engine3.run()
+
+    assert summary.done == 1 and [s.role for s in adapter3.sessions] == ["dev"]
+    assert _rows(engine3, "resume-env-dispatch")
+    assert not _rows(engine3, "resume-restart")
+
+
+def test_review_entry_dispatch_pause_resumes_into_review(project, tmp_path):
+    """The environment dies during the dev session; dev verify runs no commands, so
+    the first probe after it is the review dispatch gate. The run pauses at
+    DEV_VERIFY with the cycle uncharged, and resume (the spec-approval-shaped
+    DEV_VERIFY + spec_file arm) goes straight into review: exactly one dev session
+    over both runs."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    rig = _env_rig(tmp_path)
+    engine, adapter = make_engine(
+        project, [rig.dies_during(dev_effect(project, "1-1-a"))], policy=_env_policy(rig)
+    )
+    engine.run()
+
+    assert [s.role for s in adapter.sessions] == ["dev"]
+    task = _dispatch_paused(engine, "review")
+    assert task.phase == Phase.DEV_VERIFY and task.spec_file
+    assert task.attempt == 1 and task.review_cycle == 0
+
+    rig.up.write_text("up\n")
+    engine2, adapter2 = resume_engine(
+        project, engine, [review_effect(project, "1-1-a", clean=True)]
+    )
+    summary = engine2.run()
+
+    assert summary.done == 1
+    assert [s.role for s in adapter2.sessions] == ["review"]
+    task = engine2.state.tasks["1-1-a"]
+    assert task.phase == Phase.DONE and task.review_cycle == 1 and task.attempt == 1
+    assert task.env_fault_site is None
+    (cleared,) = _rows(engine2, "env-fault-cleared")
+    assert cleared["site"] == "probe:dispatch:review"
+    assert _rows(engine2, "resume-review")
+    assert not _rows(engine2, "resume-restart")
+
+
+def test_review_loop_dispatch_pause_replays_completed_pass(project, tmp_path):
+    """A completed, unfinalized review pass loops to the next cycle without
+    charging anything, so nothing probes until that cycle's dispatch gate — which
+    finds the environment dead (it died during the pass) and pauses at
+    REVIEW_VERIFY. Resume replays the recorded pass (no session) and then runs
+    the next cycle: one dev and two review sessions in all."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    rig = _env_rig(tmp_path)
+    engine, adapter = make_engine(
+        project,
+        [
+            dev_effect(project, "1-1-a"),
+            rig.dies_during(review_effect(project, "1-1-a", clean=False, finalized=False)),
+        ],
+        policy=_env_policy(rig, limits=LimitsPolicy(max_review_cycles=3)),
+    )
+    engine.run()
+
+    assert [s.role for s in adapter.sessions] == ["dev", "review"]
+    task = _dispatch_paused(engine, "review")
+    assert task.phase == Phase.REVIEW_VERIFY and task.review_cycle == 1
+
+    rig.up.write_text("up\n")
+    engine2, adapter2 = resume_engine(
+        project, engine, [review_effect(project, "1-1-a", clean=True)]
+    )
+    summary = engine2.run()
+
+    assert summary.done == 1
+    assert [s.role for s in adapter2.sessions] == ["review"]
+    task = engine2.state.tasks["1-1-a"]
+    assert task.phase == Phase.DONE and task.review_cycle == 2
+    (replayed,) = _rows(engine2, "resume-verify")
+    assert replayed["role"] == "review"
+    assert _rows(engine2, "env-fault-cleared")
+    assert not _rows(engine2, "resume-restart")
+
+
+def test_review_loop_dispatch_pause_does_not_double_spend_the_damping_grant(project, tmp_path):
+    """A finalized pass that recommends its own follow-up earns a damping grant; the
+    next cycle's dispatch gate then pauses. The spend must not persist with that
+    pause: the resume replays the recorded pass and re-derives it, so the follow-up
+    review the policy grants still runs (not a damped force-converge), and the grant
+    is spent exactly once.
+
+    Ablation, performed: spend the grant at the end of the cycle (before the gate)
+    and the paused counter reads 1, the replay damps, and no review session runs."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    rig = _env_rig(tmp_path)
+    engine, adapter = make_engine(
+        project,
+        [
+            dev_effect(project, "1-1-a"),
+            rig.dies_during(review_effect(project, "1-1-a", clean=False)),
+        ],
+        policy=_env_policy(rig, limits=LimitsPolicy(max_review_cycles=3, max_followup_reviews=1)),
+    )
+    engine.run()
+
+    assert [s.role for s in adapter.sessions] == ["dev", "review"]
+    task = _dispatch_paused(engine, "review")
+    assert task.phase == Phase.REVIEW_VERIFY and task.review_cycle == 1
+    assert task.followup_reviews_spent == 0  # not persisted with the pause
+
+    rig.up.write_text("up\n")
+    engine2, adapter2 = resume_engine(
+        project, engine, [review_effect(project, "1-1-a", clean=True)]
+    )
+    summary = engine2.run()
+
+    assert summary.done == 1
+    assert [s.role for s in adapter2.sessions] == ["review"]  # the granted follow-up
+    task = engine2.state.tasks["1-1-a"]
+    assert task.phase == Phase.DONE and task.review_cycle == 2
+    assert task.followup_reviews_spent == 1
+    assert not _rows(engine2, "review-followup-damped")
+
+
+def test_isolated_dispatch_pause_reopens_unit(project, tmp_path):
+    """Under worktree isolation the gate fires inside the freshly mounted unit;
+    the pause leaves it mounted, and resume REOPENS that same unit for the dev
+    session (one `worktree-opened` over both runs) and merges it — no restart
+    discard. Ablation: delete the `resume-env-dispatch` arm and the restart arm
+    discards the unit and mounts a second one."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    rig = _env_rig(tmp_path, up=False)
+    policy = _env_policy(
+        rig, review=ReviewPolicy(enabled=False), scm=ScmPolicy(isolation="worktree")
+    )
+    engine, adapter = make_engine(project, [], policy=policy)
+    engine.run()
+
+    assert adapter.sessions == []
+    task = _dispatch_paused(engine)
+    assert task.phase == Phase.PENDING and task.attempt == 0
+    unit_path = task.worktree_path
+    assert unit_path and Path(unit_path).is_dir()
+
+    def dev_in_the_unit(spec):
+        assert Path(spec.cwd) == Path(unit_path)
+        return dev_effect(project.rebased(spec.cwd), "1-1-a", followup_review=False)(spec)
+
+    rig.up.write_text("up\n")
+    engine2, adapter2 = resume_engine(project, engine, [dev_in_the_unit])
+    summary = engine2.run()
+
+    assert summary.done == 1
+    assert [s.role for s in adapter2.sessions] == ["dev"]
+    assert len(_rows(engine2, "worktree-opened")) == 1
+    assert _rows(engine2, "resume-env-dispatch")
+    assert not _rows(engine2, "resume-restart")
+    assert _rows(engine2, "unit-merged")
+
+
+def test_isolated_dispatch_pause_reprobes_inside_the_unit(project, tmp_path):
+    """Resume re-probes a dispatch pause where the paused session would launch —
+    the kept unit — not in the main checkout the resumed engine starts in: a
+    probe may be cwd-sensitive (`docker compose ps`). Ablation, performed: probe
+    `self.workspace.root` in `_take_env_dispatch_pause` and the first resumed
+    probe runs in the main checkout."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    rig = _env_rig(tmp_path, up=False)
+    cwds = tmp_path / "probe-cwds"
+    probe = _python_cmd(
+        rig.root / "cwd_probe.py",
+        "import os, sys\n"
+        f"open(r'{cwds}', 'a', encoding='utf-8').write(os.getcwd() + '\\n')\n"
+        f"sys.exit(0 if os.path.exists(r'{rig.up}') else 3)\n",
+    )
+    policy = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        environment=EnvironmentPolicy(probes=(probe,)),
+        review=ReviewPolicy(enabled=False),
+        scm=ScmPolicy(isolation="worktree"),
+    )
+    engine, _ = make_engine(project, [], policy=policy)
+    engine.run()
+    unit_path = Path(_dispatch_paused(engine).worktree_path).resolve()
+    probed_before = len(cwds.read_text(encoding="utf-8").splitlines())
+
+    def dev_in_the_unit(spec):
+        return dev_effect(project.rebased(spec.cwd), "1-1-a", followup_review=False)(spec)
+
+    rig.up.write_text("up\n")
+    engine2, _ = resume_engine(project, engine, [dev_in_the_unit])
+    assert engine2.run().done == 1
+
+    resumed = cwds.read_text(encoding="utf-8").splitlines()[probed_before:]
+    assert resumed and Path(resumed[0]).resolve() == unit_path
+    (cleared,) = _rows(engine2, "env-fault-cleared")
+    assert cleared["site"] == "probe:dispatch:dev"
+
+
+def test_dispatch_gate_freshness_is_scoped_to_the_probed_root(project, tmp_path):
+    """A probe pass vouches only for the root it ran in: fresh for another
+    worktree (or main), the gate still probes here and pauses on a failure;
+    fresh for this root, it skips. Ablation, performed: compare against any
+    fresh root (the old engine-global flag) and the first half never pauses."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    rig = _env_rig(tmp_path, up=False)
+    engine, _ = make_engine(project, [], policy=_env_policy(rig))
+    task = StoryTask(story_key="1-1-a", epic=1)
+    engine.state.tasks[task.story_key] = task
+
+    engine._env_probes_fresh_root = tmp_path / "another-unit"
+    with pytest.raises(RunPaused):
+        engine._gate_dispatch(task, "dev")
+    assert task.env_fault_site == "probe:dispatch:dev"
+
+    task.env_fault_site = None
+    engine._env_probes_fresh_root = engine.workspace.root
+    engine._gate_dispatch(task, "dev")  # fresh here: no probe, no pause
+    assert task.env_fault_site is None
 
 
 # ---------------------------- session-transport environment faults (#194) ----
@@ -23361,3 +24636,257 @@ def test_ledger_restores_refuse_a_link_at_the_ledger_parent_below_the_mount(
         assert not outside_ledger.exists()
     else:
         assert outside_ledger.read_text(encoding="utf-8") == lands
+
+
+# ------------------------------------- DW-522: `resolve --reverify` engine replay
+
+
+def _committing_dev(project, story_key: str, name: str, *, followup_review: bool = False):
+    """A completed dev (or repair) session that finalizes the spec and COMMITS its
+    work as ``name`` — the reported shape: the attempt's product sits in commits."""
+
+    def effect(spec):
+        result = dev_effect(project, story_key, followup_review=followup_review)(spec)
+        (project.project / name).write_text(f"{name} work\n")
+        git(project.project, "add", name)
+        git(project.project, "commit", "-q", "-m", f"attempt work {name}")
+        return result
+
+    return effect
+
+
+def _reverify_policy(marker: Path, **kw) -> Policy:
+    """The reported config: in place, rollback OFF, two dev attempts, an e2e verify
+    command that passes only while ``marker`` (the container, outside the repo)
+    exists."""
+    kw.setdefault("gates", GatesPolicy(mode="none"))
+    return Policy(
+        notify=QUIET,
+        scm=ScmPolicy(rollback_on_failure=False),
+        limits=LimitsPolicy(max_dev_attempts=2),
+        verify=VerifyPolicy(commands=(_file_exists_cmd(marker),)),
+        **kw,
+    )
+
+
+def _deferred_in_place(project, tmp_path, *, followup_review: bool = False, **policy_kw):
+    """Run the reported scenario to its pause: both dev attempts commit, the e2e
+    verify fails both times (container down), the story DEFERS, and rollback-off
+    pauses the run for manual recovery with the work intact. Returns
+    (engine, marker, baseline)."""
+    # `resolve --reverify` locates the code root through the BMAD config
+    install_bmad_config(project)
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    marker = tmp_path / "container-up"
+    engine, adapter = make_engine(
+        project,
+        [
+            _committing_dev(project, "1-1-a", "e2e-1.txt", followup_review=followup_review),
+            _committing_dev(project, "1-1-a", "e2e-2.txt", followup_review=followup_review),
+        ],
+        policy=_reverify_policy(marker, **policy_kw),
+    )
+    summary = engine.run()
+    assert summary.paused
+    task = engine.state.tasks["1-1-a"]
+    assert task.phase == Phase.DEFERRED
+    assert [s.role for s in adapter.sessions] == ["dev", "dev"]
+    assert engine.state.paused_stage == PAUSE_ESCALATION
+    return engine, marker, task.baseline_commit
+
+
+def _rows(engine, kind: str) -> list[dict]:
+    return [e for e in Journal(engine.run_dir).entries() if e["kind"] == kind]
+
+
+def test_reverify_deferred_in_place_story_commits_without_a_dev_session(project, tmp_path):
+    """DW-522, the reported scenario: a deferred in-place story whose committed work
+    is green once the environment is back reaches DONE through `resolve --reverify`
+    with ZERO dev sessions — verify replays on HEAD, the work squashes into one story
+    commit, and the spec/board finish at done."""
+    engine, marker, baseline = _deferred_in_place(project, tmp_path)
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    # Which pause fired on the defer: NOT manual-recovery shape (c) but the
+    # owned-spec one — `_defer` stashes the spec into the run dir BEFORE its
+    # rollback, so `rollback_or_pause` finds the attempt-bound spec missing and
+    # pauses through `pause_for_owned_spec_recovery` (which tells the operator to
+    # reset — exactly what --reverify must steer them away from).
+    assert "rollback-owned-spec-manual-required" in kinds
+    assert "rollback-manual-required" not in kinds
+    assert "attempt-owned spec needs manual recovery" in engine.state.paused_reason
+    assert "bmad-loop resolve test-run --reverify" in engine.state.paused_reason
+
+    marker.write_text("up\n")  # the operator restarts the container
+    runs.rearm_for_reverify(engine.run_dir, project_root=project.project)
+    engine2, adapter2 = resume_engine(project, engine, [])
+    summary = engine2.run()
+
+    assert adapter2.sessions == []
+    assert not summary.paused
+    task = engine2.state.tasks["1-1-a"]
+    assert task.phase == Phase.DONE
+    assert task.reverify_from == ""
+    assert len(verify.commits_above(project.project, baseline)) == 1  # squashed
+    assert (project.project / "e2e-1.txt").is_file() and (project.project / "e2e-2.txt").is_file()
+    assert read_frontmatter(spec_path(project, "1-1-a"))["status"] == "done"
+    assert story_status(project.sprint_status, "1-1-a") == "done"
+    kinds = [e["kind"] for e in Journal(engine2.run_dir).entries()]
+    assert "resume-reverify" in kinds and "resume-restart" not in kinds
+    [decision] = _rows(engine2, "reverify-decision")
+    assert decision["action"] == "proceed" and decision["origin"] == "deferred"
+    replay = [
+        e
+        for e in _rows(engine2, "verify-command-result")
+        if e["verification_sequence"] == decision["verification_sequence"]
+    ]
+    assert [(e["verification_stage"], e["returncode"]) for e in replay] == [("dev", 0)]
+
+
+def test_reverify_runs_the_recommended_review(project, tmp_path):
+    """DW-522: a passing replay hands the kept work to the review loop under normal
+    policy — the dev result recommended a follow-up review, so exactly one review
+    session runs (and still no dev session) before the commit."""
+    engine, marker, _ = _deferred_in_place(project, tmp_path, followup_review=True)
+    marker.write_text("up\n")
+    runs.rearm_for_reverify(engine.run_dir, project_root=project.project)
+    engine2, adapter2 = resume_engine(
+        project, engine, [review_effect(project, "1-1-a", clean=True)]
+    )
+    engine2.run()
+
+    assert [s.role for s in adapter2.sessions] == ["review"]
+    assert engine2.state.tasks["1-1-a"].phase == Phase.DONE
+
+
+def test_reverify_with_the_environment_still_down_re_defers_without_a_session(project, tmp_path):
+    """DW-522: re-verifying before the environment is back fails the replay; a
+    DEFERRED origin goes back to DEFERRED (no retry, no dev session), the latch is
+    spent, and the tree is still the operator's to recover."""
+    engine, _marker, baseline = _deferred_in_place(project, tmp_path)
+    runs.rearm_for_reverify(engine.run_dir, project_root=project.project)
+    engine2, adapter2 = resume_engine(project, engine, [])
+    summary = engine2.run()
+
+    assert adapter2.sessions == []
+    assert summary.paused  # rollback OFF: the re-defer pauses for recovery again
+    task = load_state(engine2.run_dir).tasks["1-1-a"]
+    assert task.phase == Phase.DEFERRED
+    assert task.reverify_from == ""
+    [decision] = _rows(engine2, "reverify-decision")
+    assert decision["action"] == "defer" and decision["env_fault"] is False
+    assert decision["reason"].startswith("reverify failed: ")
+    assert len(verify.commits_above(project.project, baseline)) == 2  # kept, unsquashed
+
+
+def test_reverify_env_fault_replay_re_escalates(project, tmp_path):
+    """DW-522: a replay whose `[environment]` probe still fails is an environment
+    fault, never a re-defer — the story ESCALATES at site `verify:dev` (so it stays
+    reverifiable) without a session, and no `[verify]` command runs."""
+    engine, _marker, _ = _deferred_in_place(project, tmp_path)
+    rig = _env_rig(tmp_path, up=False)
+    policy = dataclasses.replace(engine.policy, environment=EnvironmentPolicy(probes=(rig.probe,)))
+    runs.rearm_for_reverify(engine.run_dir, project_root=project.project)
+    engine2, adapter2 = resume_engine(project, engine, [], policy=policy)
+    summary = engine2.run()
+
+    assert adapter2.sessions == []
+    assert summary.paused and engine2.state.paused_stage == PAUSE_ESCALATION
+    task = engine2.state.tasks["1-1-a"]
+    assert task.phase == Phase.ESCALATED
+    assert task.env_fault_site == "verify:dev"
+    [decision] = _rows(engine2, "reverify-decision")
+    assert decision["action"] == "pause" and decision["env_fault"] is True
+    assert decision["verification_sequence"] is None  # preflight: no command ran
+    assert "--reverify" in (engine2.run_dir / "ATTENTION").read_text()
+
+
+def test_reverify_of_an_env_fault_escalation_commits(project, tmp_path):
+    """DW-522 + DW-523: an attempt whose verify preflight probe failed escalates at
+    `verify:dev` with its committed work kept; once the environment is back,
+    `resolve --reverify` commits that work with no dev session."""
+    install_bmad_config(project)
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    rig = _env_rig(tmp_path)
+    policy = _env_policy(
+        rig,
+        _OK,
+        scm=ScmPolicy(rollback_on_failure=False),
+        limits=LimitsPolicy(max_dev_attempts=2),
+    )
+    engine, adapter = make_engine(
+        project, [rig.dies_during(_committing_dev(project, "1-1-a", "e2e-1.txt"))], policy=policy
+    )
+    summary = engine.run()
+    assert summary.paused and [s.role for s in adapter.sessions] == ["dev"]
+    task = engine.state.tasks["1-1-a"]
+    assert task.phase == Phase.ESCALATED and task.env_fault_site == "verify:dev"
+    baseline = task.baseline_commit
+
+    rig.up.write_text("up\n")
+    outcome = runs.rearm_for_reverify(engine.run_dir, project_root=project.project)
+    assert outcome.story_key == "1-1-a"
+    engine2, adapter2 = resume_engine(project, engine, [])
+    engine2.run()
+
+    assert adapter2.sessions == []
+    task = engine2.state.tasks["1-1-a"]
+    assert task.phase == Phase.DONE and task.env_fault_site is None
+    [decision] = _rows(engine2, "reverify-decision")
+    assert decision["origin"] == "escalated" and decision["action"] == "proceed"
+    assert len(verify.commits_above(project.project, baseline)) == 1
+
+
+def test_reverify_arm_precedes_the_spec_approval_arm(project, tmp_path):
+    """DW-522: a re-armed task sits at DEV_VERIFY with a spec_file — the exact shape
+    of a spec-approval pause. The reverify arm must win, or `_resume_after_dev_verify`
+    reviews and COMMITS the kept work without replaying the (still failing) verify.
+    Ablation: move the `task.reverify_from` arm below the DEV_VERIFY + spec_file arm
+    in `_finish_inflight` and this story commits."""
+    engine, _marker, baseline = _deferred_in_place(project, tmp_path)
+    runs.rearm_for_reverify(engine.run_dir, project_root=project.project)
+    engine2, _ = resume_engine(project, engine, [])
+    engine2.run()
+
+    kinds = [e["kind"] for e in Journal(engine2.run_dir).entries()]
+    assert "resume-review" not in kinds
+    assert engine2.state.tasks["1-1-a"].phase == Phase.DEFERRED
+    assert engine2.state.tasks["1-1-a"].commit_sha is None
+    assert len(verify.commits_above(project.project, baseline)) == 2
+
+
+def test_reverify_honors_the_spec_approval_gate(project, tmp_path):
+    """DW-522: a passing replay is an accepted dev leg, so the spec-approval gate
+    pauses it exactly as `_drive_story` would — with the latch already spent, so
+    the approval resume goes through the ordinary review/commit arm and never
+    replays verify a second time."""
+    engine, marker, _ = _deferred_in_place(
+        project, tmp_path, gates=GatesPolicy(mode="per-story-spec-approval")
+    )
+    marker.write_text("up\n")
+    runs.rearm_for_reverify(engine.run_dir, project_root=project.project)
+    engine2, adapter2 = resume_engine(project, engine, [])
+    summary = engine2.run()
+
+    assert adapter2.sessions == []
+    assert summary.paused and engine2.state.paused_stage == PAUSE_SPEC_APPROVAL
+    task = load_state(engine2.run_dir).tasks["1-1-a"]
+    assert task.phase == Phase.DEV_VERIFY and task.reverify_from == ""
+
+    engine3, adapter3 = resume_engine(project, engine2, [])
+    engine3.run()
+    assert adapter3.sessions == []
+    assert engine3.state.tasks["1-1-a"].phase == Phase.DONE
+    kinds = [e["kind"] for e in Journal(engine3.run_dir).entries()]
+    assert kinds.count("reverify-decision") == 1 and "resume-review" in kinds
+
+
+def test_defer_pause_notice_names_resolve_reverify(project, tmp_path):
+    """DW-522: the deferral that pauses for manual recovery points at `resolve
+    --reverify` in both operator records — the ACTION REQUIRED pause notice and the
+    `story deferred` note. Ablation: drop the hint from `_defer`'s pause note and
+    the story-deferred half fails."""
+    engine, _marker, _ = _deferred_in_place(project, tmp_path)
+    attention = (engine.run_dir / "ATTENTION").read_text()
+    deferred_note = attention[attention.index("story deferred: 1-1-a") :]
+    assert "bmad-loop resolve test-run --reverify" in deferred_note
+    assert "bmad-loop resolve test-run --reverify" in engine.state.paused_reason

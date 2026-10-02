@@ -226,8 +226,11 @@ at all (DW-474). Below that, situational banners:
 
 - `⏸ paused (<stage>) — <reason> · press e to resume` — gate or escalation
   pause; stages are `spec-approval`, `epic-boundary`, `escalation`,
-  `story-gate`. At the `escalation` stage, `e` only skips the escalated story —
-  press `R` instead to resolve it (see "Resolving an escalation" below).
+  `story-gate`, `environment`. At the `escalation` stage, `e` only skips the
+  escalated story — press `R` instead to resolve it (see "Resolving an
+  escalation" below). At the `environment` stage (badge `env`: an
+  `[environment]` probe failed before a session launch) fix the environment and
+  press `e` — the resume re-probes, then launches the same session.
 - `⏹ graceful stop pending — will stop after the current item` — a graceful
   stop was requested (`S`, or `bmad-loop stop --graceful`); the run finishes the
   in-flight story/bundle through commit (or, mid-sweep-triage, lets triage
@@ -527,6 +530,16 @@ herdr's is `ctrl+b q`) to return to the dashboard, which observes the
 resumed run like any other. Exiting the agent without recording a resolution
 leaves the story escalated and the run paused — the safe default.
 
+`R` does not apply to two pauses that can look like one. A run paused at the
+`environment` stage needs no resolve: `R` says so and points at resume (fix the
+environment, then `e`). A pause whose story was **deferred** rather than
+escalated (a manual-recovery pause after a defer) is not re-armed either: `R`
+and `p` notify `run bmad-loop resolve <run> --reverify (re-verify kept work) or
+bmad-loop resume <run> (move on)` and stop there — the TUI does not drive
+`--reverify`, so run it from a shell. The notice keys on the paused story only;
+a deferred worktree unit under another story's pause is reached with
+`bmad-loop resolve <run> --reverify --story <key>`.
+
 ## Reviewing a paused run (`p`)
 
 `p` opens the **stage-appropriate HITL viewer** for the selected paused run,
@@ -574,7 +587,9 @@ artifacts the engine already wrote.
   whose intent regeneration the ledger refused (its task may carry a spec file, but the
   gate is about the ledger, not the spec), an epic boundary has no story at all — so
   they open a compact pause-reason viewer instead: the reason names
-  the blocking entries and the remedy. **Resume** re-picks a gated sprint story;
+  the blocking entries and the remedy. An `environment` pause opens the same
+  spec-less viewer, whose reason names the failed probe; **Resume** re-runs
+  the probes first and re-pauses unchanged while one still fails. **Resume** re-picks a gated sprint story;
   for a bundle-regeneration pause, it recovers the same persisted bundle and regenerates
   its intent document. Both re-ask the ledger, so an unresolved refusal re-pauses.
 

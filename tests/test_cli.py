@@ -16,6 +16,7 @@ import pytest
 import yaml
 from conftest import (
     _OK,
+    _REVERIFY_KEY,
     MISSING_TOOL_CMD,
     NUL_PATH_RESOLVE_FAULTS,
     PROJECT_MARKER_CMD,
@@ -23,6 +24,7 @@ from conftest import (
     REPO_ROOT_MARKER_CMD,
     UNDECODABLE_LEDGER,
     UNRESOLVABLE,
+    _reverify_run,
     assert_run_state_lock_held,
     escalated_run,
     fault_metadata_probe,
@@ -4140,6 +4142,24 @@ def test_resolve_rejects_non_escalation_stage(tmp_path, capsys):
     _make_run_with_state(tmp_path, "r1", paused_stage="spec-approval", paused_reason="x")
     assert cli.main(["resolve", "--project", str(tmp_path), "r1"]) == 1
     assert "not paused at an escalation" in capsys.readouterr().err
+
+
+def test_resolve_refuses_environment_pause_with_resume_hint(tmp_path, capsys):
+    """DW-523: an environment pause is lifted by a plain resume, so resolve refuses
+    it AND names the remedy; any other non-escalation stage gets the bare refusal."""
+    _make_run_with_state(tmp_path, "r1", paused_stage="environment", paused_reason="x")
+    assert cli.main(["resolve", "--project", str(tmp_path), "r1"]) == 1
+    err = capsys.readouterr().err
+    assert "not paused at an escalation (stage: environment)" in err
+    assert "an environment pause needs no resolve" in err
+    assert "`bmad-loop resume r1`" in err
+
+    _make_run_with_state(tmp_path, "r2", paused_stage="spec-approval", paused_reason="x")
+    assert cli.main(["resolve", "--project", str(tmp_path), "r2"]) == 1
+    err = capsys.readouterr().err
+    assert "not paused at an escalation (stage: spec-approval)" in err
+    assert "needs no resolve" not in err
+    assert "bmad-loop resume" not in err
 
 
 # resolve refuses 'unknown' too, not just 'alive' — re-driving a possibly-live engine.
@@ -13743,9 +13763,9 @@ def test_confirm_reverify_runs_the_commands_in_the_code_tree(
     classify_cwds: list[Path] = []
     real_env_fault = verify.env_fault_reason
 
-    def classify_in(result, cwd):
+    def classify_in(result, cwd, **kwargs):
         classify_cwds.append(cwd)
-        return real_env_fault(result, cwd)
+        return real_env_fault(result, cwd, **kwargs)
 
     monkeypatch.setattr(verify, "env_fault_reason", classify_in)
 
@@ -13926,6 +13946,37 @@ def test_reverify_walks_every_command_when_they_all_pass(tmp_path, capsys):
 
     assert sentinel.is_file()
     assert "verify commands passed" in capsys.readouterr().out
+
+
+def test_reverify_runs_probes_first_and_names_the_environment(tmp_path, capsys):
+    """A failed `[environment]` probe answers before any `[verify]` command runs
+    (DW-523), and the reason names the probe and the environment rather than the
+    story. Ablation: drop the probe block from `_reverify` and the sentinel
+    command runs (and the reason becomes None — the commands pass)."""
+    sentinel = tmp_path / "probed-ran"
+    command = _sentinel_writer_cmd(tmp_path, sentinel, rc=0, stem="probed")
+    _write_policy(
+        tmp_path,
+        f"[verify]\ncommands = {json.dumps([command])}\n" '[environment]\nprobes = ["exit 6"]\n',
+    )
+
+    reason = cli._reverify(tmp_path, tmp_path)
+
+    assert reason is not None
+    assert reason.startswith("environment probe 'exit 6' failed (rc=6)")
+    assert "the run environment, not the story" in reason
+    assert not sentinel.exists()
+    assert "re-running" not in capsys.readouterr().out
+
+
+def test_reverify_declared_env_fault_rc_reports_not_could_not_run(tmp_path):
+    """A command exiting with `[verify] env_fault_rc` RAN and declared the fault;
+    "could not run" would send the operator hunting for a missing binary."""
+    _write_policy(tmp_path, '[verify]\ncommands = ["exit 75"]\nenv_fault_rc = 75\n')
+
+    reason = cli._reverify(tmp_path, tmp_path)
+
+    assert reason == "'exit 75' reported an environment fault (rc=75, [verify] env_fault_rc)"
 
 
 def test_confirm_drops_a_record_path_replaced_by_a_directory(project, capsys, monkeypatch):
@@ -14533,9 +14584,9 @@ def test_a_resume_reverify_runs_the_commands_in_the_code_tree(
     classify_cwds: list[Path] = []
     real_env_fault = verify.env_fault_reason
 
-    def classify_in(result, cwd):
+    def classify_in(result, cwd, **kwargs):
         classify_cwds.append(cwd)
-        return real_env_fault(result, cwd)
+        return real_env_fault(result, cwd, **kwargs)
 
     monkeypatch.setattr(verify, "env_fault_reason", classify_in)
 
@@ -18200,3 +18251,237 @@ def test_resume_accept_baseline_latches_for_one_resume_only(project, monkeypatch
     assert cli.main(argv) == 0
     assert seen == [True, False]
     assert load_state(run_dir).accept_baseline is False
+
+
+# ----------------------------------------------- resolve --reverify (DW-522)
+
+
+def _reverify_project(tmp_path):
+    """A deferred in-place run (`conftest._reverify_run`) and its project root."""
+    run_dir, spec = _reverify_run(tmp_path)
+    return run_dir, spec.parents[2]
+
+
+def _resolve_reverify(project, *extra):
+    return cli.main(["resolve", "--project", str(project), "r1", "--reverify", *extra])
+
+
+def test_resolve_reverify_rearms_and_resumes(tmp_path, monkeypatch, capsys):
+    from bmad_loop.journal import Journal, load_state
+    from bmad_loop.model import Phase
+
+    run_dir, project = _reverify_project(tmp_path)
+    resumed = []
+    monkeypatch.setattr(cli, "_resume_paused_run", lambda proj, rd: resumed.append(rd) or 0)
+
+    rc = _resolve_reverify(project, "--resume")
+
+    assert rc == 0 and resumed == [run_dir]
+    out = capsys.readouterr()
+    assert "No dev session and no resolve agent run" in out.err
+    assert "included in the story's squashed commit" in out.err
+    assert f"re-armed {_REVERIFY_KEY} for re-verification" in out.out
+    task = load_state(run_dir).tasks[_REVERIFY_KEY]
+    assert task.phase == Phase.DEV_VERIFY and task.reverify_from == "deferred"
+    assert [e["kind"] for e in Journal(run_dir).entries()].count("story-reverify-armed") == 1
+
+
+def test_resolve_reverify_no_resume_persists_the_latch(tmp_path, monkeypatch, capsys):
+    from bmad_loop.journal import load_state
+
+    run_dir, project = _reverify_project(tmp_path)
+    monkeypatch.setattr(
+        cli, "_resume_paused_run", lambda *_a: pytest.fail("--no-resume must not resume")
+    )
+
+    rc = _resolve_reverify(project, "--no-resume")
+
+    assert rc == 0
+    assert "resume when ready: bmad-loop resume r1" in capsys.readouterr().out
+    assert load_state(run_dir).tasks[_REVERIFY_KEY].reverify_from == "deferred"
+
+
+def test_resolve_reverify_cancel_writes_nothing(tmp_path, monkeypatch, capsys):
+    run_dir, project = _reverify_project(tmp_path)
+    before = _state_bytes(run_dir)
+    monkeypatch.setattr(cli, "_confirm", lambda _q: False)
+
+    rc = _resolve_reverify(project)
+
+    assert rc == 0
+    assert "cancelled" in capsys.readouterr().out
+    assert _state_bytes(run_dir) == before
+
+
+@pytest.mark.parametrize(
+    "other", [["--adopt-branch"], ["--restore-patch", "p.patch"]], ids=["adopt", "restore"]
+)
+def test_resolve_reverify_is_mutually_exclusive_with_adopt_and_restore(tmp_path, capsys, other):
+    _run_dir, project = _reverify_project(tmp_path)
+    with pytest.raises(SystemExit) as exc:
+        _resolve_reverify(project, *other)
+    assert exc.value.code == 2
+    assert "not allowed with argument" in capsys.readouterr().err
+
+
+def test_resolve_reverify_refusals_leave_state_untouched(tmp_path, monkeypatch, capsys):
+    """A story the replay cannot claim is refused BEFORE the statement and the
+    prompt, with state.json unchanged. Ablation, performed: delete the
+    `runs.reverify_refusal` early exit in `_resolve_reverify` and the prompt is
+    reached (the locked re-arm would still refuse, but only after asking)."""
+    from bmad_loop.journal import load_state, save_state
+    from bmad_loop.model import Phase, StoryTask
+
+    run_dir, project = _reverify_project(tmp_path)
+    state = load_state(run_dir)
+    # a later story was picked: an in-place replay would squash its work in too
+    state.tasks["1-1-b"] = StoryTask(story_key="1-1-b", epic=1, phase=Phase.PENDING)
+    save_state(run_dir, state)
+    before = _state_bytes(run_dir)
+    monkeypatch.setattr(cli, "_confirm", lambda _q: pytest.fail("prompted for a refused replay"))
+
+    rc = _resolve_reverify(project)
+
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "a later story was picked" in err and "re-verifying" not in err
+    assert _state_bytes(run_dir) == before
+
+
+def test_resolve_on_a_deferred_task_without_reverify_hints_the_flag(tmp_path, monkeypatch, capsys):
+    """A bare `resolve` on a deferred story names `--reverify` instead of the generic
+    "no escalated story" refusal, and writes nothing. Ablation, performed: delete the
+    DEFERRED hint branch in `cmd_resolve` and the generic refusal prints instead."""
+    run_dir, project = _reverify_project(tmp_path)
+    before = _state_bytes(run_dir)
+    monkeypatch.setattr(cli, "_confirm", lambda _q: pytest.fail("prompted"))
+
+    rc = cli.main(["resolve", "--project", str(project), "r1"])
+
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert f"story {_REVERIFY_KEY} is deferred, not escalated" in err
+    assert "bmad-loop resolve r1 --reverify" in err
+    assert _state_bytes(run_dir) == before
+
+
+@pytest.mark.parametrize("force", [True, False], ids=["force", "no-force"])
+def test_resolve_reverify_force_unknown_proceeds(tmp_path, monkeypatch, capsys, force):
+    from bmad_loop.journal import load_state
+
+    run_dir, project = _reverify_project(tmp_path)
+    before = _state_bytes(run_dir)
+    monkeypatch.setattr(runs, "engine_liveness", lambda _rd: "unknown")
+    monkeypatch.setattr(cli, "_resume_paused_run", lambda *_a: 0)
+
+    rc = _resolve_reverify(project, "--resume", *(["--force"] if force else []))
+
+    if force:
+        assert rc == 0
+        assert load_state(run_dir).tasks[_REVERIFY_KEY].reverify_from == "deferred"
+    else:
+        assert rc == 1
+        assert "unverifiable pid" in capsys.readouterr().err
+        assert _state_bytes(run_dir) == before
+
+
+def test_resolve_reverify_never_launches_the_resolve_agent(tmp_path, monkeypatch):
+    """--reverify runs no interactive session even without --no-interactive: the
+    agent, the adapters and the escalation re-arm are never reached."""
+    from bmad_loop import resolve
+
+    _run_dir, project = _reverify_project(tmp_path)
+    monkeypatch.setattr(resolve, "run_session", lambda *a, **k: pytest.fail("ran the agent"))
+    monkeypatch.setattr(cli, "_make_adapters", lambda *a, **k: pytest.fail("built adapters"))
+    monkeypatch.setattr(runs, "rearm_escalation", lambda *a, **k: pytest.fail("re-armed"))
+    monkeypatch.setattr(cli, "_resume_paused_run", lambda *_a: 0)
+
+    assert _resolve_reverify(project, "--resume") == 0
+
+
+def _off_escalation_pause(run_dir) -> None:
+    """Re-pause the run at a non-escalation stage on another story — the shape a
+    worktree run is in when an isolated defer let it move on."""
+    from bmad_loop.journal import load_state, save_state
+
+    state = load_state(run_dir)
+    state.paused_stage = "story-gate"
+    state.paused_story_key = "1-1-b"
+    save_state(run_dir, state)
+
+
+def _mount_reverify_task(run_dir, project) -> Path:
+    """Move `_reverify_run`'s attempt into a kept worktree unit: a registered
+    worktree on the unit branch, holding a committed change above the baseline and
+    the spec, recorded on the task as `isolation = "worktree"` records it."""
+    from bmad_loop.journal import load_state, save_state
+
+    state = load_state(run_dir)
+    task = state.tasks[_REVERIFY_KEY]
+    branch = f"bmad-loop/r1/{_REVERIFY_KEY}"
+    wt = project / ".bmad-loop" / "worktrees" / "r1" / _REVERIFY_KEY
+    git(project, "worktree", "add", "-q", "-b", branch, str(wt), task.baseline_commit)
+    (wt / "unit.py").write_text("print('unit attempt')\n", encoding="utf-8")
+    git(wt, "add", "unit.py")
+    git(wt, "commit", "-q", "-m", "unit attempt")
+    spec = wt / (task.spec_file or "")
+    spec.parent.mkdir(parents=True, exist_ok=True)
+    spec.write_bytes((project / (task.spec_file or "")).read_bytes())
+    task.worktree_path = str(wt)
+    task.branch = branch
+    save_state(run_dir, state)
+    return wt
+
+
+def test_resolve_reverify_story_accepts_any_pause_for_a_mounted_task(tmp_path, monkeypatch, capsys):
+    """DW-522: an isolated defer does not pause the run, so a deferred worktree unit
+    is re-verified under whatever pause the run reached — when `--story` names it.
+    Unnamed, resolve still requires the escalation pause.
+
+    Ablation: make `_resolve_pause_admits` ignore `reverify_named` and the named
+    resolve is refused at the entry gate."""
+    from bmad_loop.journal import load_state
+    from bmad_loop.model import Phase
+
+    run_dir, project = _reverify_project(tmp_path)
+    wt = _mount_reverify_task(run_dir, project)
+    _off_escalation_pause(run_dir)
+    monkeypatch.setattr(
+        cli, "_resume_paused_run", lambda *_a: pytest.fail("--no-resume must not resume")
+    )
+
+    before = _state_bytes(run_dir)
+    assert _resolve_reverify(project, "--no-resume") == 1
+    assert "not paused at an escalation (stage: story-gate)" in capsys.readouterr().err
+    assert _state_bytes(run_dir) == before
+
+    rc = _resolve_reverify(project, "--story", _REVERIFY_KEY, "--no-resume")
+
+    out = capsys.readouterr()
+    assert rc == 0, out.err
+    assert f"in its kept worktree: the attempt is branch bmad-loop/r1/{_REVERIFY_KEY}" in out.err
+    assert "the unit merges into the target branch on a pass" in out.err
+    saved = load_state(run_dir)
+    assert saved.paused_stage == "story-gate"  # the pause is the resume's to clear
+    task = saved.tasks[_REVERIFY_KEY]
+    assert task.phase == Phase.DEV_VERIFY and task.reverify_from == "deferred"
+    assert task.worktree_path == str(wt)
+
+
+def test_resolve_reverify_in_place_still_requires_the_escalation_pause(tmp_path, capsys):
+    """DW-522: naming an IN-PLACE story does not lift the pause rule — its replay
+    claims the whole code tree, which is only the story's attempt when the run
+    stopped on it. The CLI admits the named story; `reverify_refusal` refuses it.
+
+    Ablation: drop the pause-stage check in `runs.reverify_refusal` and the
+    re-arm goes through."""
+    run_dir, project = _reverify_project(tmp_path)
+    _off_escalation_pause(run_dir)
+    before = _state_bytes(run_dir)
+
+    rc = _resolve_reverify(project, "--story", _REVERIFY_KEY, "--no-resume")
+
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "an in-place replay re-verifies only the story the run stopped on" in err
+    assert _state_bytes(run_dir) == before

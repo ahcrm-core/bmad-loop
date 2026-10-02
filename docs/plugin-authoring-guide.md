@@ -450,7 +450,13 @@ counter bounded by `[limits] max_dev_attempts`, which is also the bound on how
 many times the stage can fire for one story. Write handlers to be idempotent and
 to key on the correlation fields below rather than on the story alone. It also
 fires on the way to a pause: an attempt whose session reported a CRITICAL
-escalation emits before the run stops, on either leg.
+escalation emits before the run stops, on either leg — and so does a dev or repair
+leg whose `[environment]` probe preflight failed, with no command results. One
+emission falls outside that bound: a `bmad-loop resolve --reverify` replay fires
+the stage once more with **no session** — `ctx.session_status` is `None`,
+`ctx.result_json` is the latest completed dev session's result, and `attempt` does
+not advance — so a handler that assumes a session behind every emission must
+check `session_status` first.
 
 `post_dev_verify` exposes `ctx.command_results`: an immutable tuple of the
 per-command `CommandResult` records core just executed. Each has `command`,
@@ -516,7 +522,9 @@ is ambiguous:
 - **`verification_stage is None`** — no verify pass ran. Several causes land here
   and the empty tuple names none of them: the session did not complete
   (`ctx.session_status`), an earlier gate already failed the attempt — the
-  dev-artifact check or the deferral harvest (`ctx.verify_reason`) — or the engine
+  dev-artifact check or the deferral harvest (`ctx.verify_reason`) — an
+  `[environment]` probe failed the preflight, so no command was started
+  (`ctx.verify_reason` names the probe) — or the engine
   variant suppressed the pass for this leg (stories mode skips it on a plan-halt
   leg, which has no implementation to build).
 - **stage set, `verification_sequence is None`** — the pass ran and executed
@@ -607,14 +615,14 @@ handler cannot change the gate's outcome, the routing, or the journal.
 
 The context carries the same payload as `post_dev_verify`:
 
-| Field                       | Value                                                                                                                                                                                                                                                                                  |
-| --------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `ctx.session_status`        | the status of the review session whose product was gated — the timeout-class status on the review-timeout salvage visit; `None` on the skip-review path, where no review session ran                                                                                                   |
-| `ctx.result_json`           | that review session's result (a copy) — often `None` on the timeout-salvage visit; `None` on the skip-review path                                                                                                                                                                      |
-| `ctx.verify_reason`         | the gate's outcome reason (the failure reason on a red gate)                                                                                                                                                                                                                           |
-| `ctx.command_results`       | the `CommandResult` records the gate's command pass ran, in order                                                                                                                                                                                                                      |
-| `ctx.verification_stage`    | `"review"` whenever the gate reached its command pass (including zero commands); `None` when one of the gate's artifact checks refused first — the spec, the operator-action list, the sprint board, or a sweep's ledger (stories mode checks the spec only); `verify_reason` names it |
-| `ctx.verification_sequence` | the story's ordinal for that pass (joins the `verify-command-result` entries), or `None` if it recorded nothing (no `[verify] commands`, or no pass)                                                                                                                                   |
+| Field                       | Value                                                                                                                                                                                                                                                                                                                                                           |
+| --------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `ctx.session_status`        | the status of the review session whose product was gated — the timeout-class status on the review-timeout salvage visit; `None` on the skip-review path, where no review session ran                                                                                                                                                                            |
+| `ctx.result_json`           | that review session's result (a copy) — often `None` on the timeout-salvage visit; `None` on the skip-review path                                                                                                                                                                                                                                               |
+| `ctx.verify_reason`         | the gate's outcome reason (the failure reason on a red gate)                                                                                                                                                                                                                                                                                                    |
+| `ctx.command_results`       | the `CommandResult` records the gate's command pass ran, in order                                                                                                                                                                                                                                                                                               |
+| `ctx.verification_stage`    | `"review"` whenever the gate reached its command pass (including zero commands); `None` when one of the gate's artifact checks refused first — the spec, the operator-action list, the sprint board, or a sweep's ledger (stories mode checks the spec only) — or a failed `[environment]` probe stopped the gate before its commands; `verify_reason` names it |
+| `ctx.verification_sequence` | the story's ordinal for that pass (joins the `verify-command-result` entries), or `None` if it recorded nothing (no `[verify] commands`, or no pass)                                                                                                                                                                                                            |
 
 Read `command_results == ()` with `verification_stage` exactly as for
 `post_dev_verify`. A review pass cut short by a hard `bmad-loop stop` stops the run
