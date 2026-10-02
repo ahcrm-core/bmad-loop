@@ -181,6 +181,12 @@ class SessionRecord:
     # the session's parsed result payload, persisted so a durably-saved
     # completed session is actionable on resume, not just forensics
     result_json: dict[str, Any] | None = None
+    # the plugin workflow (``<plugin>.<workflow>``) an injected workflow session
+    # ran; "" for the primary dev/fix/review sessions. A workflow declares its
+    # own role, so a `role="dev"` record is not necessarily the story's dev or
+    # fix session — lookups of the attempt's own result skip labeled records
+    # (DW-522). "" also for every record written before the field existed.
+    label: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -193,6 +199,7 @@ class SessionRecord:
             "transcript_path": self.transcript_path,
             "usage": self.usage.to_dict() if self.usage else None,
             "result_json": self.result_json,
+            "label": self.label,
         }
 
     @classmethod
@@ -208,6 +215,7 @@ class SessionRecord:
             transcript_path=d.get("transcript_path"),
             usage=TokenUsage.from_dict(usage) if usage else None,
             result_json=d.get("result_json"),
+            label=str(d.get("label", "") or ""),
         )
 
 
@@ -1078,8 +1086,8 @@ def env_fault_site_reverifiable(task: StoryTask) -> bool:
     True for every site in `ENV_FAULT_SITES` except the dispatch sites
     (`probe:dispatch:*`): those fired before a session ran, so there is nothing to
     re-verify. `probe:decision:dev` / `probe:decision:fix` and `probe:claim:dev` /
-    `probe:claim:fix` additionally require the role's LATEST session record to be
-    `completed` — the seam re-probes crashed and timed-out sessions too, and those
+    `probe:claim:fix` additionally require the role's LATEST session record (plugin
+    workflow sessions excluded) to be `completed` — the seam re-probes crashed and timed-out sessions too, and those
     produced no verifiable attempt. False for no
     site, and for any value outside the closed vocabulary (fail closed)."""
     site = task.env_fault_site
@@ -1090,7 +1098,7 @@ def env_fault_site_reverifiable(task: StoryTask) -> bool:
     role = _REVERIFY_DECISION_SITE_ROLES.get(site)
     if role is None:
         return True
-    latest = next((s for s in reversed(task.sessions) if s.role == role), None)
+    latest = next((s for s in reversed(task.sessions) if s.role == role and not s.label), None)
     return latest is not None and latest.status == "completed"
 
 

@@ -8205,6 +8205,7 @@ class Engine:
                         if resumable and result.result_json is not None
                         else None
                     ),
+                    label=label or "",
                 )
             )
             # Make the completed session durable before the usage read, post-session

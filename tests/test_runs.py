@@ -9409,6 +9409,33 @@ def test_rearm_for_reverify_accepts_a_verify_env_fault_escalation(tmp_path):
     assert _reverify_rows(run_dir)[0]["origin"] == "escalated"
 
 
+def test_rearm_for_reverify_skips_plugin_workflow_sessions(tmp_path):
+    """A plugin workflow declaring `role = "dev"` (a post_dev_phase or
+    pre_commit_gate gate) is recorded under the dev role with no result payload;
+    it is not the attempt, so neither the dev-result lookup nor the latest-session
+    check reads it. Ablation, performed: drop the `not s.label` filter from
+    `latest_completed_dev_record` (or from the `last_dev` lookup) and this refuses."""
+    from bmad_loop.model import Phase, SessionRecord
+
+    run_dir, spec_path = _reverify_run(tmp_path)
+
+    def edit(_state, task):
+        task.sessions.append(
+            SessionRecord(
+                task_id="1-1-a-tea.gate-1",
+                role="dev",
+                status="completed",
+                label="tea.gate",
+            )
+        )
+
+    _edit_reverify_state(run_dir, edit)
+
+    runs.rearm_for_reverify(run_dir, project_root=spec_path.parents[2])
+
+    assert load_state(run_dir).tasks[_REVERIFY_KEY].phase == Phase.DEV_VERIFY
+
+
 def test_rearm_for_reverify_restores_the_stashed_spec_byte_exact(tmp_path):
     run_dir, spec_path = _reverify_run(tmp_path, spec="stashed")
     stash = runs.deferred_stash_path(run_dir, _REVERIFY_KEY, spec_path.name)

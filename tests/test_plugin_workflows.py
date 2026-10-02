@@ -222,6 +222,10 @@ def test_workflow_injects_a_session_at_post_dev_phase(project):
     assert "workflow-start" in kinds and "workflow-end" in kinds
     starts = [e for e in engine.journal.entries() if e["kind"] == "workflow-start"]
     assert starts[0]["plugin"] == "wf" and starts[0]["workflow"] == "doc"
+    # the record names its workflow, so attempt-result lookups (DW-522) skip it;
+    # the primary sessions stay unlabeled
+    labels = {s.task_id: s.label for s in engine.state.tasks["1-1-a"].sessions}
+    assert labels == {"1-1-a-dev-1": "", "1-1-a-wf.doc-1": "wf.doc", "1-1-a-review-1": ""}
 
 
 def test_dev_and_review_sessions_carry_no_workflow_contract(project):

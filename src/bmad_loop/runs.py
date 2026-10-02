@@ -6102,9 +6102,15 @@ def deferred_stash_path(run_dir: Path, story_key: str, spec_name: str) -> Path:
 
 def latest_completed_dev_record(task: StoryTask) -> SessionRecord | None:
     """The task's latest COMPLETED dev-role session record, or None. Fix sessions are
-    recorded under the dev role too, so a repaired attempt's verdict is the one read."""
+    recorded under the dev role too, so a repaired attempt's verdict is the one read.
+    Plugin workflow sessions are skipped even when they run under the dev role: they
+    persist no result payload and are not the attempt (`SessionRecord.label`)."""
     return next(
-        (s for s in reversed(task.sessions) if s.role == "dev" and s.status == "completed"),
+        (
+            s
+            for s in reversed(task.sessions)
+            if s.role == "dev" and not s.label and s.status == "completed"
+        ),
         None,
     )
 
@@ -6182,7 +6188,7 @@ def reverify_refusal(
     # a crashed or timed-out session after it left its partial work on the tree,
     # which the earlier result does not describe. The escalated sites check this in
     # `env_fault_site_reverifiable`; a DEFERRED story reaches here without it.
-    last_dev = next(s for s in reversed(task.sessions) if s.role == "dev")
+    last_dev = next(s for s in reversed(task.sessions) if s.role == "dev" and not s.label)
     if last_dev is not latest:
         return (
             f"story {story_key}'s latest dev session ({last_dev.task_id}) ended "

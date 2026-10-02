@@ -366,6 +366,15 @@ def test_session_record_adapter_identity_defaults_for_legacy_state():
     assert back.model == ""
 
 
+def test_session_record_label_round_trips_and_defaults_for_legacy_state():
+    record = SessionRecord(task_id="1-1-a-tea.gate-1", role="dev", status="completed")
+    record.label = "tea.gate"
+    assert SessionRecord.from_dict(record.to_dict()).label == "tea.gate"
+    doc = record.to_dict()
+    del doc["label"]  # state.json from before the field existed
+    assert SessionRecord.from_dict(doc).label == ""
+
+
 def test_followup_review_recommended_round_trips():
     task = StoryTask(story_key="1-1-a", epic=1, followup_review_recommended=True)
     assert StoryTask.from_dict(task.to_dict()).followup_review_recommended is True
