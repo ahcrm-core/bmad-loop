@@ -9,6 +9,9 @@ import pytest
 from conftest import refuse_to_resolve
 
 from bmad_loop.model import (
+    ENV_FAULT_SITE_DISPATCH_PREFIX,
+    ENV_FAULT_SITES,
+    PAUSE_ENVIRONMENT,
     SWEEP_REFUSED_DIRTY,
     SWEEP_REFUSED_NOT_STARTED,
     Phase,
@@ -17,6 +20,7 @@ from bmad_loop.model import (
     StoryTask,
     TokenUsage,
     VerifyOutcome,
+    env_fault_site_reverifiable,
     result_mapping,
 )
 
@@ -67,6 +71,47 @@ def test_run_state_code_root_restamp_pending_round_trips_and_defaults_false():
     d = state.to_dict()
     del d["code_root_restamp_pending"]
     assert RunState.from_dict(d).code_root_restamp_pending is False
+
+
+def test_mint_time_root_identities_round_trip_as_two_int_lists():
+    """DW-446: `RunState.run_dir_identity` and `StoryTask.worktree_identity` persist
+    as a two-int JSON list (or null) and read back as the same tuple.
+
+    Ablation: drop either key from `to_dict` and its round trip reads None."""
+    task = StoryTask(story_key="1-1-a", epic=1, worktree_path="/p/wt", worktree_identity=(7, 42))
+    state = _state(run_dir_identity=(3, 9), tasks={"1-1-a": task})
+
+    d = json.loads(json.dumps(state.to_dict()))
+    assert d["run_dir_identity"] == [3, 9]
+    assert d["tasks"]["1-1-a"]["worktree_identity"] == [7, 42]
+    back = RunState.from_dict(d)
+    assert back.run_dir_identity == (3, 9)
+    assert back.tasks["1-1-a"].worktree_identity == (7, 42)
+
+    unset = json.loads(json.dumps(_state(tasks={"x": StoryTask("x", 1)}).to_dict()))
+    assert unset["run_dir_identity"] is None
+    assert unset["tasks"]["x"]["worktree_identity"] is None
+
+
+def test_mint_time_root_identities_default_none_for_legacy_or_malformed_state():
+    """A state.json from before the fields existed reads back None (no record, which
+    every pin refuses), and so does anything that is not a list of exactly two ints —
+    never a raise out of `from_dict`, which would keep the run from loading."""
+    task = StoryTask(story_key="1-1-a", epic=1, worktree_identity=(7, 42))
+    legacy = _state(run_dir_identity=(3, 9), tasks={"1-1-a": task}).to_dict()
+    del legacy["run_dir_identity"]
+    del legacy["tasks"]["1-1-a"]["worktree_identity"]
+    back = RunState.from_dict(legacy)
+    assert back.run_dir_identity is None
+    assert back.tasks["1-1-a"].worktree_identity is None
+
+    for bad in ([1], [1, 2, 3], ["1", 2], [True, 2], [1.0, 2], {"dev": 1}, "1,2", 12, [None, 2]):
+        d = _state(run_dir_identity=(3, 9), tasks={"1-1-a": task}).to_dict()
+        d["run_dir_identity"] = bad
+        d["tasks"]["1-1-a"]["worktree_identity"] = bad
+        back = RunState.from_dict(d)
+        assert back.run_dir_identity is None, bad
+        assert back.tasks["1-1-a"].worktree_identity is None, bad
 
 
 def test_run_state_repo_root_round_trips_and_backs_code_root():
@@ -321,6 +366,15 @@ def test_session_record_adapter_identity_defaults_for_legacy_state():
     assert back.model == ""
 
 
+def test_session_record_label_round_trips_and_defaults_for_legacy_state():
+    record = SessionRecord(task_id="1-1-a-tea.gate-1", role="dev", status="completed")
+    record.label = "tea.gate"
+    assert SessionRecord.from_dict(record.to_dict()).label == "tea.gate"
+    doc = record.to_dict()
+    del doc["label"]  # state.json from before the field existed
+    assert SessionRecord.from_dict(doc).label == ""
+
+
 def test_followup_review_recommended_round_trips():
     task = StoryTask(story_key="1-1-a", epic=1, followup_review_recommended=True)
     assert StoryTask.from_dict(task.to_dict()).followup_review_recommended is True
@@ -342,6 +396,75 @@ def test_salvage_refile_pending_defaults_false_for_legacy_state():
     doc = StoryTask(story_key="1-1-a", epic=1).to_dict()
     del doc["salvage_refile_pending"]
     assert StoryTask.from_dict(doc).salvage_refile_pending is False
+
+
+def test_migration_delivery_fields_round_trip():
+    """DW-317: the completion identity, latch and replay counts survive state.json."""
+    counts = {"converted": 2, "entries_now": 3, "open_now": 1}
+    task = StoryTask(
+        story_key="sweep-migrate",
+        epic=0,
+        migration_delivery_id="abc123",
+        migration_delivery_pending=True,
+        migration_delivery_counts=counts,
+    )
+    back = StoryTask.from_dict(json.loads(json.dumps(task.to_dict())))
+    assert back.migration_delivery_id == "abc123"
+    assert back.migration_delivery_pending is True
+    assert back.migration_delivery_counts == counts
+
+
+def test_migration_delivery_fields_default_for_pre_upgrade_state():
+    doc = StoryTask(story_key="sweep-migrate", epic=0).to_dict()
+    for key in (
+        "migration_delivery_id",
+        "migration_delivery_pending",
+        "migration_delivery_counts",
+    ):
+        del doc[key]
+    back = StoryTask.from_dict(doc)
+    assert back.migration_delivery_id is None
+    assert back.migration_delivery_pending is False
+    assert back.migration_delivery_counts is None
+
+
+def test_migration_commit_escalated_round_trips():
+    """DW-405/407: the escalated-from-COMMITTING fact survives state.json."""
+    task = StoryTask(story_key="sweep-migrate", epic=0, migration_commit_escalated=True)
+    back = StoryTask.from_dict(json.loads(json.dumps(task.to_dict())))
+    assert back.migration_commit_escalated is True
+
+
+def test_migration_commit_escalated_defaults_false_for_pre_upgrade_state():
+    doc = StoryTask(story_key="sweep-migrate", epic=0).to_dict()
+    del doc["migration_commit_escalated"]
+    assert StoryTask.from_dict(doc).migration_commit_escalated is False
+
+
+def test_migration_ledger_rival_round_trips():
+    """DW-429: the refused-a-rival latch survives state.json."""
+    task = StoryTask(story_key="sweep-migrate", epic=0, migration_ledger_rival=True)
+    back = StoryTask.from_dict(json.loads(json.dumps(task.to_dict())))
+    assert back.migration_ledger_rival is True
+
+
+def test_migration_ledger_rival_defaults_false_for_pre_upgrade_state():
+    doc = StoryTask(story_key="sweep-migrate", epic=0, migration_ledger_rival=True).to_dict()
+    del doc["migration_ledger_rival"]
+    assert StoryTask.from_dict(doc).migration_ledger_rival is False
+
+
+def test_migration_rewrite_rejected_round_trips():
+    """DW-436: the validation-retry rejection latch survives state.json."""
+    task = StoryTask(story_key="sweep-migrate", epic=0, migration_rewrite_rejected=True)
+    back = StoryTask.from_dict(json.loads(json.dumps(task.to_dict())))
+    assert back.migration_rewrite_rejected is True
+
+
+def test_migration_rewrite_rejected_defaults_false_for_pre_upgrade_state():
+    doc = StoryTask(story_key="sweep-migrate", epic=0, migration_rewrite_rejected=True).to_dict()
+    del doc["migration_rewrite_rejected"]
+    assert StoryTask.from_dict(doc).migration_rewrite_rejected is False
 
 
 def test_legacy_park_eligible_state_loads_but_is_not_persisted():
@@ -424,6 +547,109 @@ def test_escalations_resolved_upto_defaults_zero_for_legacy_state():
 def test_resolved_redrive_round_trips():
     task = StoryTask(story_key="1-1-a", epic=1, resolved_redrive=True)
     assert StoryTask.from_dict(task.to_dict()).resolved_redrive is True
+
+
+def test_env_fault_site_round_trips_and_defaults_none():
+    task = StoryTask(story_key="1-1-a", epic=1, env_fault_site="probe:decision:dev")
+    restored = StoryTask.from_dict(json.loads(json.dumps(task.to_dict())))
+    assert restored.env_fault_site == "probe:decision:dev"
+    assert StoryTask(story_key="1-1-a", epic=1).env_fault_site is None
+    doc = StoryTask(story_key="1-1-a", epic=1).to_dict()
+    del doc["env_fault_site"]  # state.json from before the field existed
+    assert StoryTask.from_dict(doc).env_fault_site is None
+
+
+def test_env_fault_sites_vocabulary():
+    assert ENV_FAULT_SITES == {
+        "verify:dev",
+        "verify:fix",
+        "verify:review",
+        "probe:decision:dev",
+        "probe:decision:fix",
+        "probe:decision:review",
+        "probe:decision:workflow",
+        "probe:claim:dev",
+        "probe:claim:fix",
+        "probe:claim:review",
+        "probe:claim:workflow",
+        "probe:dispatch:dev",
+        "probe:dispatch:review",
+    }
+    dispatch = {s for s in ENV_FAULT_SITES if s.startswith(ENV_FAULT_SITE_DISPATCH_PREFIX)}
+    assert dispatch == {"probe:dispatch:dev", "probe:dispatch:review"}
+    assert PAUSE_ENVIRONMENT == "environment"
+
+
+def test_reverify_from_round_trips():
+    task = StoryTask(story_key="1-1-a", epic=1, reverify_from="deferred")
+    restored = StoryTask.from_dict(json.loads(json.dumps(task.to_dict())))
+    assert restored.reverify_from == "deferred"
+
+
+def test_reverify_from_defaults_empty_for_legacy_state():
+    doc = StoryTask(story_key="1-1-a", epic=1).to_dict()
+    del doc["reverify_from"]  # state.json from before the field existed
+    assert StoryTask.from_dict(doc).reverify_from == ""
+    doc["reverify_from"] = None  # a null is not a pending replay either
+    assert StoryTask.from_dict(doc).reverify_from == ""
+
+
+def test_reverify_from_unknown_value_is_kept_not_dropped():
+    """Any non-empty latch means a replay is pending, so a value this version does
+    not know (a newer writer's) must survive the read rather than silently turning
+    the replay into a dev re-drive."""
+    doc = StoryTask(story_key="1-1-a", epic=1).to_dict()
+    doc["reverify_from"] = "from-the-future"
+    assert StoryTask.from_dict(doc).reverify_from == "from-the-future"
+
+
+def _dev_record(status: str) -> SessionRecord:
+    return SessionRecord(task_id="1-1-a-dev-1", role="dev", status=status)
+
+
+@pytest.mark.parametrize(
+    ("site", "latest_dev_status", "expected"),
+    [
+        (None, "completed", False),
+        ("not-a-site", "completed", False),
+        ("verify:dev", None, True),
+        ("verify:fix", None, True),
+        ("verify:review", None, True),
+        ("probe:decision:review", None, True),
+        ("probe:decision:workflow", None, True),
+        ("probe:claim:review", None, True),
+        ("probe:claim:workflow", None, True),
+        ("probe:dispatch:dev", "completed", False),
+        ("probe:dispatch:review", "completed", False),
+        ("probe:decision:dev", "completed", True),
+        ("probe:decision:dev", "crashed", False),
+        ("probe:decision:dev", None, False),
+        ("probe:decision:fix", "completed", True),
+        ("probe:decision:fix", "timeout", False),
+        ("probe:claim:dev", "completed", True),
+        ("probe:claim:dev", "crashed", False),
+        ("probe:claim:dev", None, False),
+        ("probe:claim:fix", "completed", True),
+        ("probe:claim:fix", "timeout", False),
+    ],
+)
+def test_env_fault_site_reverifiable_matrix(site, latest_dev_status, expected):
+    """Dispatch sites fired before any session ran, and a decision- or claim-site
+    fault after a crashed/timed-out dev (or fix — recorded under the dev role)
+    session left no product: neither is reverifiable. Every other site in the closed vocabulary is.
+
+    Ablation, performed: drop the latest-record status check and the `crashed` /
+    `timeout` / no-record rows redden; drop the dispatch-prefix check and both
+    dispatch rows redden."""
+    task = StoryTask(story_key="1-1-a", epic=1, env_fault_site=site)
+    if latest_dev_status is not None:
+        # an older completed record must not vouch for the latest attempt
+        task.sessions.append(_dev_record("completed"))
+        task.sessions.append(
+            SessionRecord(task_id="1-1-a-review-1", role="review", status="crashed")
+        )
+        task.sessions.append(_dev_record(latest_dev_status))
+    assert env_fault_site_reverifiable(task) is expected
 
 
 def test_resolved_redrive_defaults_false_for_legacy_state():
@@ -752,11 +978,13 @@ _DEFERRED_STATE_KEYS = (
     "accepted_dev_session_index",
     "harvest_carry_commit_pending",
     "isolated_ledger_carried",
+    "ledger_seed_text",
+    "pinned_config_rewrites",
 )
 
 
 def test_deferred_work_state_fields_round_trip_through_json():
-    """All eleven fields are hand-enumerated in both serializers. Non-default
+    """All thirteen fields are hand-enumerated in both serializers. Non-default
     values make a missing line on either side observable, while the JSON leg pins
     the on-disk container shape rather than only an in-memory dataclass copy."""
     task = StoryTask(
@@ -773,6 +1001,10 @@ def test_deferred_work_state_fields_round_trip_through_json():
         accepted_dev_session_index=3,
         harvest_carry_commit_pending=True,
         isolated_ledger_carried=True,
+        ledger_seed_text="# Deferred Work\n",
+        pinned_config_rewrites={
+            ".claude/settings.json": {"dialect": "claude-settings-json", "text": "{}\n"}
+        },
     )
     restored = StoryTask.from_dict(json.loads(json.dumps(task.to_dict())))
 
@@ -788,10 +1020,14 @@ def test_deferred_work_state_fields_round_trip_through_json():
     assert restored.accepted_dev_session_index == 3
     assert restored.harvest_carry_commit_pending is True
     assert restored.isolated_ledger_carried is True
+    assert restored.ledger_seed_text == "# Deferred Work\n"
+    assert restored.pinned_config_rewrites == {
+        ".claude/settings.json": {"dialect": "claude-settings-json", "text": "{}\n"}
+    }
 
 
 def test_deferred_work_state_fields_default_for_one_old_state_dict():
-    """A state.json written before this package has none of the eleven keys.
+    """A state.json written before this package has none of the thirteen keys.
     Every load must use ``d.get`` so resume reaches the old behavior instead of
     raising KeyError; one shared old document prevents testing only a subset."""
     doc = StoryTask(story_key="1-1-a", epic=1).to_dict()
@@ -810,6 +1046,8 @@ def test_deferred_work_state_fields_default_for_one_old_state_dict():
     assert restored.accepted_dev_session_index is None
     assert restored.harvest_carry_commit_pending is False
     assert restored.isolated_ledger_carried is False
+    assert restored.ledger_seed_text is None
+    assert restored.pinned_config_rewrites == {}
 
 
 def test_pre_harvest_ledger_preserves_absent_empty_and_text_states():
@@ -1243,3 +1481,85 @@ def test_story_task_baseline_artifacts_mangled_shape_reads_as_no_snapshot(mangle
     d["baseline_artifacts"] = mangled
 
     assert StoryTask.from_dict(d).baseline_artifacts is None
+
+
+# ------------------------------------------- nested mount project (DW-379)
+
+
+def _nested_state() -> RunState:
+    """A run whose project `/r/app` is nested in its code root `/r`."""
+    return RunState(run_id="r1", project="/r/app", repo_root="/r", started_at="now")
+
+
+def test_mount_project_keeps_a_nested_projects_offset():
+    """`RunState.mount_project` is `ProjectPaths.rebased(<mount>).project` from what
+    state records: the mount itself by default, `<mount>/<offset>` when the project is
+    nested in the code root, None without a mount."""
+    task = StoryTask("1-1-a", 1)
+    assert _nested_state().mount_project(task) is None
+    task.worktree_path = "/r/app/.bmad-loop/runs/r1/worktrees/1"
+    assert _nested_state().mount_project(task) == Path(task.worktree_path) / "app"
+    assert _state().mount_project(task) == Path(task.worktree_path)
+
+
+def test_nested_spec_paths_round_trip_through_the_mount_project():
+    """DW-379: a relative spec spelling is always PROJECT-relative. In a nested mount
+    `to_dict` persists the spec relative to `<mount>/app`, reopening re-anchors it
+    there, and releasing the mount keeps the same project-relative spelling — the
+    one a replacement mount (or the main checkout) re-resolves against its own
+    project.
+
+    Ablation: drop the mount project from `RunState.to_dict`'s task call and the
+    persisted spelling reddens as `app/_bmad-output/...`, which the reopen then joins
+    onto `<mount>/app` a second time."""
+    state = _nested_state()
+    wt = "/r/app/.bmad-loop/runs/r1/worktrees/1"
+    task = StoryTask("1-1-a", 1)
+    task.worktree_path = wt
+    task.spec_file = f"{wt}/app/_bmad-output/impl/s.md"
+    task.dispatched_spec_file = f"{wt}/app/_bmad-output/impl/s.md"
+    state.tasks[task.story_key] = task
+
+    persisted = state.to_dict()["tasks"]["1-1-a"]
+    assert persisted["spec_file"] == "_bmad-output/impl/s.md"
+    assert persisted["dispatched_spec_file"] == "_bmad-output/impl/s.md"
+
+    reopened = RunState.from_dict(json.loads(json.dumps(state.to_dict())))
+    back = reopened.tasks["1-1-a"]
+    mount_project = reopened.mount_project(back)
+    assert mount_project is not None
+    back.rebase_spec_paths_on(mount_project)
+    assert back.spec_file == str(Path(wt) / "app" / "_bmad-output" / "impl" / "s.md")
+    assert back.dispatched_spec_file == back.spec_file
+
+    back.release_mount_owned_state(mount_project)
+    assert back.spec_file == "_bmad-output/impl/s.md"
+    assert back.dispatched_spec_file is None
+
+
+def test_default_config_spec_paths_keep_the_mount_relative_spelling():
+    """Byte-identical when `project == repo_root`: the mount project IS the mount, so
+    the persisted spelling is exactly today's mount-relative one, and a bare
+    `to_dict()` (no anchor) agrees with the state-level call."""
+    state = _state()
+    wt = "/p/.bmad-loop/runs/r1/worktrees/1"
+    task = StoryTask("1-1-a", 1)
+    task.worktree_path = wt
+    task.spec_file = f"{wt}/_bmad-output/impl/s.md"
+    state.tasks[task.story_key] = task
+
+    assert state.to_dict()["tasks"]["1-1-a"]["spec_file"] == "_bmad-output/impl/s.md"
+    assert task.to_dict()["spec_file"] == "_bmad-output/impl/s.md"
+
+
+def test_nested_spec_outside_the_mount_project_stays_verbatim():
+    """A spec inside the mount but OUTSIDE its project (the checkout's other tree) is
+    not project-relative, so it is persisted absolute — never spelled `../...`."""
+    state = _nested_state()
+    wt = "/r/app/.bmad-loop/runs/r1/worktrees/1"
+    task = StoryTask("1-1-a", 1)
+    task.worktree_path = wt
+    task.spec_file = f"{wt}/other/s.md"
+    state.tasks[task.story_key] = task
+
+    assert state.to_dict()["tasks"]["1-1-a"]["spec_file"] == f"{wt}/other/s.md"

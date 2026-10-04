@@ -55,6 +55,15 @@ _REPLACE_CAP_S = 0.7
 # holding characters win32 forbids outright, which no shorter prefix fixes.
 _WINERROR_FILENAME_EXCED_RANGE = 206
 
+# Windows-only: a parent os.rmdir fails with ERROR_DIR_NOT_EMPTY (145) while a child
+# is delete-pending — its unlink succeeded, but another process still holds a
+# FILE_SHARE_DELETE handle, so the name lingers until that handle closes. That is
+# the legacy delete every non-NTFS volume (FAT32/exFAT) still gets; recent Windows
+# 10+ tries a POSIX delete on NTFS, which should unlink the name at once — whether
+# NTFS can still hit this is unverified. retrying_rmtree retries it for rmdir alone.
+# CPython maps it to ENOTEMPTY, so only .winerror tells it from a POSIX ENOTEMPTY.
+_WINERROR_DIR_NOT_EMPTY = 145
+
 # Reserved on Windows regardless of extension: CON.txt is as illegal as CON. The
 # COM0/LPT0 and superscript (COM¹/COM²/COM³) forms are reserved by the same rule,
 # as are the console device names CONIN$/CONOUT$.
@@ -362,8 +371,9 @@ def resolve_or_lexical(path: str | Path) -> Path:
     (pathlib folds ``//wsl.localhost/...`` to the backslash form on the way). It is
     *not* canonical, so this helper stays at the observation surface —
     ``cli._project``, which runs pre-dispatch where there is no handler to catch
-    anything, and ``bmadconfig.worktree_isolation_conflict``'s comparison, which must
-    not kill ``validate`` ahead of the platform preflight. ``bmadconfig.load_paths``
+    anything, and ``bmadconfig.worktree_isolation_conflict``'s containment test
+    (project inside ``repo_root``), which must not kill ``validate`` ahead of the
+    platform preflight. ``bmadconfig.load_paths``
     is the boundary and refuses instead — a typed ``BmadConfigError`` for the project
     root *and* every configured path: a spelling the OS cannot canonicalize has an
     unknowable location (it can sit lexically inside the project while an in-tree
@@ -409,24 +419,48 @@ def resolve_or_lexical(path: str | Path) -> Path:
         return lexical
 
 
-def _retry_on_sharing_violation(op: Callable[[], None]) -> None:
+def _is_sharing_violation(exc: BaseException) -> bool:
+    """Whether ``exc`` is the retryable open-handle denial a concurrent handle on
+    the file triggers on Windows (WinError 5/32), not a genuine permission fault.
+    Platform-blind: callers gate the retry to win32 themselves."""
+    winerror = getattr(exc, "winerror", None)
+    return isinstance(exc, PermissionError) or winerror in (5, 32)
+
+
+def _is_rmdir_retryable(exc: BaseException) -> bool:
+    """Whether a failed ``os.rmdir`` is worth retrying on Windows: a sharing
+    violation (:func:`_is_sharing_violation`), or ``_WINERROR_DIR_NOT_EMPTY``
+    (145) — a child whose unlink succeeded is still delete-pending under another
+    process's ``FILE_SHARE_DELETE`` handle, so the directory is "not empty" until
+    that handle closes. That is the legacy delete a non-NTFS volume (FAT32/exFAT)
+    always gets; under the POSIX delete recent Windows uses on NTFS the name should
+    go at once, so whether NTFS still produces this is unverified. Kept apart from
+    :func:`_is_sharing_violation` so ``atomic_replace``/``retrying_unlink`` still
+    raise a 145 at once.
+    Platform-blind: callers gate the retry to win32 themselves."""
+    return _is_sharing_violation(exc) or getattr(exc, "winerror", None) == _WINERROR_DIR_NOT_EMPTY
+
+
+def _retry_on_sharing_violation(
+    op: Callable[[], None],
+    *,
+    retryable: Callable[[BaseException], bool] = _is_sharing_violation,
+) -> None:
     """Run ``op``, retrying the transient Windows sharing violation a concurrent
     handle on the file triggers (WinError 5/32). Gated to win32 so a real POSIX
     EACCES/EPERM surfaces immediately instead of after a pointless backoff.
     Worst-case total wait is ~5 s of jittered exponential backoff before the final
-    failure propagates."""
+    failure propagates. ``retryable`` widens what counts as transient for one
+    caller (``retrying_rmtree``'s rmdir); the default is the sharing violation."""
     for attempt in range(_REPLACE_ATTEMPTS):
         try:
             op()
             return
         except OSError as exc:
             last = attempt == _REPLACE_ATTEMPTS - 1
-            # a retryable open-handle denial, not a genuine permission fault
-            winerror = getattr(exc, "winerror", None)
-            retryable = isinstance(exc, PermissionError) or winerror in (5, 32)
             # portability: only Windows denies a rename/delete over an open handle;
             # elsewhere a permission error is real and must surface at once.
-            if sys.platform != "win32" or last or not retryable:
+            if sys.platform != "win32" or last or not retryable(exc):
                 raise
             delay = min(_REPLACE_CAP_S, _REPLACE_BASE_S * 2**attempt)
             time.sleep(delay + random.uniform(0, _REPLACE_BASE_S))  # nosec B311 - retry jitter
@@ -953,6 +987,20 @@ def is_link_like(path: Path) -> bool:
         return False
 
 
+def link_like_stat(info: os.stat_result) -> bool:
+    """:func:`is_link_like` over a stat the caller already took with
+    ``follow_symlinks=False`` (an ``os.lstat`` or a ``DirEntry.stat``): True for
+    ``S_IFLNK``, and on win32 for a symlink or DIRECTORY JUNCTION reparse tag
+    (:data:`_LINK_REPARSE_TAGS`), whose mode is ``S_IFDIR``.
+
+    One predicate over one observation, so a caller that also reads the mode or
+    the identity from that stat never answers the link question about a second,
+    later ``lstat`` of the same name."""
+    if stat.S_ISLNK(info.st_mode):
+        return True
+    return getattr(info, "st_reparse_tag", 0) in _LINK_REPARSE_TAGS  # win32-only field
+
+
 class UnconfinedWriteError(OSError):
     """A confined write refused: the path is not under its root, or a component
     below that root is a link, is missing, or cannot be probed.
@@ -1023,6 +1071,209 @@ def path_is_confined(root: Path, target: Path) -> bool:
     return True
 
 
+def pinned_root_identity(root: Path) -> os.stat_result | None:
+    """The identity to pin a confined walk's ``root`` to — ``os.lstat(root)`` —
+    or None when ``root`` cannot be pinned (DW-338).
+
+    For roots the ORCHESTRATOR mints or validates whose callers opt in — today
+    the artifact-publication root, the run dir for the verify-stream write, the
+    exact-path candidate worktree, the integration snapshot directory's
+    no-dir-fd arms, the ``live_spec_root`` spec writers — re-arm and TUI
+    replan (DW-423, through ``runs.live_spec_root_identity``) — and the engine's
+    and ``recovery_flow``'s worktree-mount writers (DW-445). Their contract
+    refuses a linked root, so a root that is a symlink, a win32 link reparse
+    point (:data:`_LINK_REPARSE_TAGS`), not a directory, or cannot be probed
+    answers None, and a pinned caller treats None as a refusal — never as "open
+    it unpinned". Pass the result to :func:`open_dir_confined`'s
+    ``root_identity`` (or a confined writer's), which refuses unless the root it
+    actually opened is this same directory. Operator-chosen roots (the project
+    checkout, the state root) are not pinned; see :func:`open_dir_confined`.
+
+    A fresh ``lstat`` refuses a link only at the FINAL component: an ancestor
+    swapped for a link to a tree holding a real leaf of the same name answers
+    the outside directory. So the two roots a session outlives — the run dir and
+    each unit worktree mount — are not pinned by a per-write call of this but by
+    a MINT-TIME record (DW-446): :func:`root_identity_record` takes this identity
+    when the orchestrator mints the root, run state persists it, and the pin
+    compares the opened root against :func:`recorded_root_identity`. The mount
+    writers reach a nested project (DW-379) from the recorded mount by an
+    ``O_NOFOLLOW`` walk (``runs.mount_root_identity``). The candidate worktree is
+    pinned by this call right after ``git worktree add`` and held for its
+    one-call lifetime; the artifacts root is held by artifact publication's
+    whole-chain walk, which refuses a link at every ancestor."""
+    try:
+        info = os.lstat(root)
+    except OSError:
+        return None
+    if stat.S_ISLNK(info.st_mode):
+        return None
+    if getattr(info, "st_reparse_tag", 0) in _LINK_REPARSE_TAGS:  # win32-only field
+        return None
+    if not stat.S_ISDIR(info.st_mode):
+        return None
+    return info
+
+
+# A root's mint-time identity as persisted in run state (DW-446): ``(st_dev,
+# st_ino)``. Serialized as a two-int JSON list; ``None`` means "no record".
+RootIdentityRecord = tuple[int, int]
+
+# An identity no directory can match: mode 0 is not ``S_ISDIR`` and inode 0 carries
+# no identity, so :func:`_same_dir_identity` refuses it and every pinned write
+# handed it refuses. What a missing mint-time record pins to (DW-446): a missing
+# record REFUSES, it never degrades to an unpinned open or to a fresh ``lstat``.
+NEVER_MATCHING_IDENTITY = os.stat_result((0,) * 10)
+
+
+def root_identity_record(root: Path) -> RootIdentityRecord | None:
+    """The mint-time identity record for an orchestrator-minted ``root`` (the run
+    dir, a unit worktree mount): :func:`pinned_root_identity`'s ``(st_dev,
+    st_ino)``, or None when ``root`` is unpinnable or reports a zero inode (a host
+    or synthetic stat that carries no identity — it would never match anyway).
+
+    Take it at the MINT, before any session can reach the root, and persist it;
+    the pins then compare the root they open against this record through
+    :func:`recorded_root_identity` rather than a per-write ``lstat`` that follows a
+    link at every ancestor. Trust-on-first-use: whatever sits at ``root`` when this
+    is taken is what every later write is held to.
+
+    A zero-inode root (some win32 filesystems) records None, so every write
+    pinned to it refuses. For the mount writers and the dir-fd verify-stream arm
+    that is unchanged — a zero inode never matched — but the win32 verify-stream
+    arm, which used to write through such a run dir, now refuses it: a refusal,
+    not a degrade, journaled per stream as ``capture_error`` (DW-446, accepted
+    2026-09-27). ``st_dev`` is not stable across a reboot or remount, so
+    ``runs.reconcile_root_identities`` re-binds a record's ``st_dev`` at a locked
+    resume/re-arm when the root still ``lstat``s as a real directory with the
+    same ``st_ino``; within a live engine the compare stays full ``(st_dev,
+    st_ino)``."""
+    info = pinned_root_identity(root)
+    if info is None or info.st_ino == 0:
+        return None
+    return (info.st_dev, info.st_ino)
+
+
+def recorded_root_identity(record: RootIdentityRecord | None) -> os.stat_result:
+    """A ``root_identity`` for :func:`open_dir_confined` (or any pinned writer)
+    built from a persisted mint-time record: a synthetic directory stat carrying the
+    record's ``st_dev``/``st_ino``. A ``None`` record answers
+    :data:`NEVER_MATCHING_IDENTITY`, so a missing record refuses at the write."""
+    if record is None:
+        return NEVER_MATCHING_IDENTITY
+    dev, ino = record
+    # os.stat_result field order: mode, ino, dev, nlink, uid, gid, size, atime, mtime, ctime
+    return os.stat_result((stat.S_IFDIR, ino, dev, 0, 0, 0, 0, 0, 0, 0))
+
+
+def _same_dir_identity(a: os.stat_result, b: os.stat_result) -> bool:
+    """Whether ``a`` and ``b`` name the same DIRECTORY: both directories, a
+    nonzero inode, equal ``(st_dev, st_ino)``. A link's ``lstat`` (not a
+    directory) or a zero inode (a host or synthetic stat that carries no
+    identity) never matches — an identity that proves nothing refuses rather
+    than degrading to an unpinned open."""
+    if not (stat.S_ISDIR(a.st_mode) and stat.S_ISDIR(b.st_mode)):
+        return False
+    if a.st_ino == 0 or b.st_ino == 0:
+        return False
+    return (a.st_dev, a.st_ino) == (b.st_dev, b.st_ino)
+
+
+def _root_still_pinned(root: Path, root_identity: os.stat_result) -> bool:
+    """The no-handle fallback's pin check: ``os.lstat(root)`` against the
+    accepted identity. Check-then-write — stale the moment it returns, the same
+    residual as :func:`path_is_confined` (DW-295)."""
+    try:
+        current = os.lstat(root)
+    except OSError:
+        return False
+    return _same_dir_identity(root_identity, current)
+
+
+def require_root_pinned(root: Path, root_identity: os.stat_result | None) -> None:
+    """The external-arm pin pre-check (DW-445): raise `UnconfinedWriteError` unless
+    ``root_identity`` is None or ``root`` still ``lstat``s as that same directory.
+
+    For a pinned writer whose target lies OUTSIDE its ``confine_root`` (a
+    configured artifacts folder, or a path already resolved through a swapped
+    mount) and for path-based acts — unlink, ``mkdir`` — that have no walked handle
+    to ``fstat``. A root swapped for a link refuses here while that swap still
+    stands, including when the path was resolved through it; an INTACT root whose
+    artifacts folder is a link resolving elsewhere passes, and the write proceeds
+    exactly as unpinned. Check-then-write, the residual :func:`_root_still_pinned`
+    documents: a swap reverted between resolution and this check passes it, and
+    one landing after it is not seen. ``None`` is a no-op, so the unpinned call
+    stays byte-for-byte what it was."""
+    if root_identity is not None and not _root_still_pinned(root, root_identity):
+        raise UnconfinedWriteError(f"{root} is no longer the directory it was pinned to")
+
+
+def _win32_filesystem_name(path: Path) -> str:
+    """``GetVolumePathNameW`` then ``GetVolumeInformationW``'s file-system name
+    buffer, as ``"<fs> at <volume>"``; a failed call answers ``unknown (...)``."""
+    if sys.platform != "win32":
+        raise OSError(errno.ENOSYS, "volume information is a win32 API")
+    import ctypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    import ctypes.wintypes as wt
+
+    get_volume_path = kernel32.GetVolumePathNameW
+    get_volume_path.argtypes = [wt.LPCWSTR, wt.LPWSTR, wt.DWORD]
+    get_volume_path.restype = wt.BOOL
+    get_volume_info = kernel32.GetVolumeInformationW
+    get_volume_info.argtypes = [
+        wt.LPCWSTR,
+        wt.LPWSTR,
+        wt.DWORD,
+        ctypes.POINTER(wt.DWORD),
+        ctypes.POINTER(wt.DWORD),
+        ctypes.POINTER(wt.DWORD),
+        wt.LPWSTR,
+        wt.DWORD,
+    ]
+    get_volume_info.restype = wt.BOOL
+    size = 32768  # the extended-length path ceiling, in UTF-16 units
+    volume = ctypes.create_unicode_buffer(size)
+    if not get_volume_path(os.path.abspath(path), volume, size):
+        error = ctypes.get_last_error()
+        return f"unknown (GetVolumePathNameW failed: winerror {error})"
+    fs_name = ctypes.create_unicode_buffer(261)  # MAX_PATH + 1
+    if not get_volume_info(volume.value, None, 0, None, None, None, fs_name, len(fs_name)):
+        error = ctypes.get_last_error()
+        return f"unknown (GetVolumeInformationW failed on {volume.value}: winerror {error})"
+    if not fs_name.value:
+        return f"unknown (no filesystem name reported for {volume.value})"
+    return f"{fs_name.value} at {volume.value}"
+
+
+def filesystem_name(path: Path) -> str:
+    """A diagnostic label for the filesystem holding ``path``:
+    ``"<fs> at <volume>"`` (DW-444's ``artifact-observation-unpinned`` event).
+
+    Diagnostic only — it never gates a decision. win32 asks the volume
+    (``GetVolumePathNameW`` then ``GetVolumeInformationW``). Every other host
+    answers ``unknown (<platform>)``: the only caller is the path-based fallback
+    of ``artifact_publication``, which a host with ``O_DIRECTORY`` (every POSIX
+    host) never takes, so a mount-table arm there would be unreachable. Never
+    ``""`` and never raises: any fault answers ``unknown (<reason>)``, which a
+    reader can tell from a real answer (:func:`filesystem_type`)."""
+    try:
+        if sys.platform == "win32":
+            return _win32_filesystem_name(path)
+        return f"unknown ({sys.platform})"
+    except Exception as exc:  # a diagnostic label must never fault its caller
+        return f"unknown ({type(exc).__name__}: {exc})"
+
+
+def filesystem_type(label: str) -> str:
+    """The filesystem TYPE of a :func:`filesystem_name` label, without the
+    volume path: ``"NTFS at C:\\\\"`` -> ``"NTFS"``, and every ``unknown (...)``
+    label (whose reason may quote a path) -> ``"unknown"``. Never ``""``."""
+    if label.startswith("unknown"):
+        return "unknown"
+    return label.partition(" at ")[0] or "unknown"
+
+
 def walk_files_unlinked(top: Path) -> Iterator[Path]:
     """Every non-directory entry under ``top``, never crossing a redirect out of it.
 
@@ -1060,7 +1311,13 @@ def walk_files_unlinked(top: Path) -> Iterator[Path]:
             yield Path(root) / name
 
 
-def open_dir_confined(root: Path, target: Path, *, search_only: bool = False) -> int | None:
+def open_dir_confined(
+    root: Path,
+    target: Path,
+    *,
+    search_only: bool = False,
+    root_identity: os.stat_result | None = None,
+) -> int | None:
     """An open descriptor for ``target``, reached from ``root`` without
     traversing a symlink at any component below it — or None when that cannot be
     established. The caller owns the descriptor and must ``os.close`` it.
@@ -1090,7 +1347,69 @@ def open_dir_confined(root: Path, target: Path, *, search_only: bool = False) ->
     opens — a directory handle for ``root``, then each component opened relative
     to the one above with reparse points refused, so a junction or symlink below
     the root fails the walk exactly as ``O_NOFOLLOW`` fails it. Hosts with
-    neither arm get None, and their callers keep a path-based fallback."""
+    neither arm get None, and their callers keep a path-based fallback.
+
+    ``root_identity`` pins the root (DW-338). Following links at ``root`` is
+    right for a root the operator chose and wrong for one the orchestrator minted
+    or validated INSIDE the checkout — ``implementation_artifacts``, the run dir
+    a verify stream is written under, a candidate worktree — because a session-reachable writer can
+    replace such a root with a link between the caller's ``lstat`` predicate and
+    this open, and every later confined read or write would then land outside the
+    repository. Given the identity the caller accepted (``os.lstat`` of the root,
+    usually via :func:`pinned_root_identity`), the opened root is ``fstat``-ed on
+    both arms (``os.fstat`` fills ``st_dev``/``st_ino`` on the :mod:`.win32_at`
+    handle too) and the walk refuses — None — unless both are directories with
+    the same nonzero ``(st_dev, st_ino)``. A link's own ``lstat`` or a zero inode
+    never matches: an identity that proves nothing refuses rather than degrading
+    to an unpinned open. The compare also catches an ANCESTOR swapped between the
+    caller's predicate and the open, which ``O_NOFOLLOW`` on the root would not.
+
+    The pin rule: pin a root the orchestrator mints or validates (its contract
+    already refuses a linked one); leave operator-chosen roots — the project
+    checkout, the state root — unpinned (``root_identity=None``, the
+    default, byte-for-byte today's behaviour). The operator may spell those
+    through a link (``test_open_dir_confined_accepts_a_root_behind_a_link``),
+    their parent lies outside the checkout so nothing inside it can replace them,
+    and a pin ``stat``-ed at the same instant as the open would bind nothing.
+    Pinned today: artifact publication, the verify-stream write, the
+    exact-path candidate worktree and the worktree-mount spec writers
+    (frontmatter/devcontract/runs and the TUI replan with
+    ``confine_root=live_spec_root(...)``, pinned by
+    ``runs.live_spec_root_identity`` — DW-423), and the engine's and
+    ``recovery_flow``'s mount writers — repair/reset/review, marker repair,
+    reconcile, adoption, park-record write and restore, attempt-owned status
+    normalization and snapshot restore, and the deferred-work ledger restores
+    (DW-498) — which confine to
+    ``workspace.paths.project``/``workspace.root`` and, when that workspace is a
+    unit mount, pin it through ``runs.mount_root_identity`` (DW-445). A pinned
+    spec writer's EXTERNAL arm (a target outside ``confine_root``) pre-checks the
+    pin with :func:`require_root_pinned` before writing, so a path resolved
+    through a swapped mount refuses there too while the swap still stands
+    (check-then-write). The integration snapshot
+    directory is held by its own ``O_NOFOLLOW`` root open on the dir-fd arm (a
+    leaf check, not this identity compare) and by :func:`pinned_root_identity`
+    pre-checks on the others. A pin taken by a fresh ``lstat`` covers the root
+    ITSELF but follows a link at any ancestor, so the run-dir and mount pins
+    compare against the identity recorded when the orchestrator MINTED the root
+    (DW-446, :func:`root_identity_record` / :func:`recorded_root_identity`): an
+    ancestor (``runs/``, ``runs/<id>/``, ``worktrees/``) swapped for a link to a
+    tree holding a real leaf opens a directory with another identity and
+    refuses, and a missing record refuses outright. A nested mount project is
+    reached from the recorded mount by an ``O_NOFOLLOW`` walk (DW-486). The
+    candidate worktree is held per call — pinned right after ``git worktree
+    add`` for its whole one-call lifetime — and artifact publication by a
+    whole-chain walk that refuses a link at every ancestor. Accepted residuals:
+    the record is trust-on-first-use; the locked resume/re-arm ``st_dev`` re-bind
+    (``runs.reconcile_root_identities``) trusts an inode-only match, so a swap
+    made during a pause to a real directory with the same inode number on
+    another filesystem would be re-bound; a win32 zero-inode run dir records
+    nothing, so its verify-stream log tails are lost (each journaled as
+    ``capture_error``); a ``state.json`` edited in a crash window can forge a
+    record; a cross-filesystem project copy changes inodes, so its pinned writes
+    refuse; and a legacy run paused at a plan checkpoint cannot replan from the
+    TUI until a resume or re-arm records its mount. The confined writers' no-handle fallback
+    re-``lstat``s the root instead — check-then-write, the residual
+    :func:`path_is_confined` documents (DW-295)."""
     if not HANDLE_ANCHORED_WRITES:
         return None
     try:
@@ -1106,6 +1425,15 @@ def open_dir_confined(root: Path, target: Path, *, search_only: bool = False) ->
             fd = win32_at.open_directory(root)
     except OSError:
         return None
+    if root_identity is not None:
+        try:
+            opened = os.fstat(fd)
+        except OSError:
+            os.close(fd)
+            return None
+        if not _same_dir_identity(root_identity, opened):
+            os.close(fd)
+            return None  # the root was replaced after the caller accepted it
     for part in relative.parts:
         try:
             nested = open_at(fd, part, access | AT_DIRECTORY | AT_NOFOLLOW)
@@ -1288,7 +1616,12 @@ def _refuse_unwritable_target_at(dir_fd: int, name: str) -> None:
 
 
 def atomic_write_text_confined(
-    path: Path, text: str, *, confine_root: Path, require_writable_target: bool = False
+    path: Path,
+    text: str,
+    *,
+    confine_root: Path,
+    require_writable_target: bool = False,
+    root_identity: os.stat_result | None = None,
 ) -> None:
     """:func:`atomic_write_text`, refusing to write through a redirected PARENT.
 
@@ -1315,7 +1648,8 @@ def atomic_write_text_confined(
     (``O_NOFOLLOW`` has no opinion on dot-dot). Either refusal raises before
     anything is walked or staged. ``path.parent`` must
     already EXIST: a confinement walk cannot vouch for a component that is not
-    there, so every adopter mkdirs or gates first.
+    there, so every adopter mkdirs or gates first — :func:`make_dirs_confined`
+    confines that ``mkdir`` too.
 
     Both anchored hosts walk the components with :func:`open_dir_confined` —
     ``dir_fd`` opens on POSIX, :mod:`.win32_at`'s handle-relative opens on
@@ -1338,7 +1672,13 @@ def atomic_write_text_confined(
     wants :func:`atomic_write_bytes_confined`, as it wants the bytes writer today.
 
     ``require_writable_target`` behaves as it does in :func:`atomic_write_text`;
-    on the anchored arm the probe is asked dir_fd-relative, never by path."""
+    on the anchored arm the probe is asked dir_fd-relative, never by path.
+
+    ``root_identity`` pins ``confine_root`` exactly as it does for
+    :func:`open_dir_confined` (whose docstring carries the pin rule); on the
+    no-handle fallback the root is re-``lstat``-ed and compared before the write
+    — check-then-write, the same residual as that arm's confinement check. A
+    mismatch raises :class:`UnconfinedWriteError` on every arm."""
     _atomic_write_confined(
         path,
         text,
@@ -1346,6 +1686,7 @@ def atomic_write_text_confined(
         encoding="utf-8",
         confine_root=confine_root,
         require_writable_target=require_writable_target,
+        root_identity=root_identity,
     )
 
 
@@ -1355,6 +1696,7 @@ def atomic_write_bytes_confined(
     *,
     confine_root: Path,
     require_writable_target: bool = False,
+    root_identity: os.stat_result | None = None,
     _before_staging: Callable[[], None] | None = None,
     _before_replace: Callable[[], None] | None = None,
     _after_replace: Callable[[int | None], None] | None = None,
@@ -1377,7 +1719,8 @@ def atomic_write_bytes_confined(
     replacement. ``_before_staging`` runs before the writable-target probe and
     temp creation; ``_before_replace`` remains the later pre-publication
     validation seam. Neither predicate supplies a lock or atomic
-    compare-and-swap guarantee."""
+    compare-and-swap guarantee. ``root_identity`` pins ``confine_root`` as in
+    :func:`atomic_write_text_confined`."""
     _atomic_write_confined(
         path,
         data,
@@ -1385,6 +1728,7 @@ def atomic_write_bytes_confined(
         encoding=None,
         confine_root=confine_root,
         require_writable_target=require_writable_target,
+        root_identity=root_identity,
         before_staging=_before_staging,
         before_replace=_before_replace,
         after_replace=_after_replace,
@@ -1399,6 +1743,7 @@ def _atomic_write_confined(
     encoding: str | None,
     confine_root: Path,
     require_writable_target: bool,
+    root_identity: os.stat_result | None = None,
     before_staging: Callable[[], None] | None = None,
     before_replace: Callable[[], None] | None = None,
     after_replace: Callable[[int | None], None] | None = None,
@@ -1421,7 +1766,7 @@ def _atomic_write_confined(
         raise UnconfinedWriteError(f"{path} climbs back out of {confine_root} through '..'")
     unconfined = f"cannot reach {path.parent} from {confine_root} without a redirect"
     if HANDLE_ANCHORED_WRITES:
-        dir_fd = open_dir_confined(confine_root, path.parent)
+        dir_fd = open_dir_confined(confine_root, path.parent, root_identity=root_identity)
         if dir_fd is None:
             raise UnconfinedWriteError(unconfined)
         try:
@@ -1442,6 +1787,8 @@ def _atomic_write_confined(
         return
     if not path_is_confined(confine_root, path.parent):
         raise UnconfinedWriteError(unconfined)
+    if root_identity is not None and not _root_still_pinned(confine_root, root_identity):
+        raise UnconfinedWriteError(f"{confine_root} is no longer the directory the caller accepted")
     _atomic_write(
         path,
         payload,
@@ -1455,7 +1802,9 @@ def _atomic_write_confined(
     )
 
 
-def create_exclusive_confined(path: Path, *, confine_root: Path) -> int:
+def create_exclusive_confined(
+    path: Path, *, confine_root: Path, root_identity: os.stat_result | None = None
+) -> int:
     """``os.open(path, O_WRONLY | O_CREAT | O_EXCL, 0o600)``, the parent reached
     the way the confined writers reach it (#593). Returns the open fd, which the
     caller owns; raises ``FileExistsError`` when the name is already taken — a
@@ -1472,7 +1821,7 @@ def create_exclusive_confined(path: Path, *, confine_root: Path) -> int:
     (:data:`HANDLE_ANCHORED_WRITES`, POSIX and Windows alike) the create is made
     relative to the walked descriptor; a host with neither arm degrades to the
     same documented check-then-create as :func:`atomic_write_text_confined`'s
-    fallback arm."""
+    fallback arm. ``root_identity`` pins ``confine_root`` as it does there."""
     if not path.is_relative_to(confine_root):
         raise UnconfinedWriteError(f"{path} is not under {confine_root}")
     if has_parent_ref(path.relative_to(confine_root)):
@@ -1480,7 +1829,7 @@ def create_exclusive_confined(path: Path, *, confine_root: Path) -> int:
     unconfined = f"cannot reach {path.parent} from {confine_root} without a redirect"
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
     if HANDLE_ANCHORED_WRITES:
-        dir_fd = open_dir_confined(confine_root, path.parent)
+        dir_fd = open_dir_confined(confine_root, path.parent, root_identity=root_identity)
         if dir_fd is None:
             raise UnconfinedWriteError(unconfined)
         try:
@@ -1489,7 +1838,230 @@ def create_exclusive_confined(path: Path, *, confine_root: Path) -> int:
             os.close(dir_fd)
     if not path_is_confined(confine_root, path.parent):
         raise UnconfinedWriteError(unconfined)
+    if root_identity is not None and not _root_still_pinned(confine_root, root_identity):
+        raise UnconfinedWriteError(f"{confine_root} is no longer the directory the caller accepted")
     return os.open(path, flags, 0o600)
+
+
+def _open_subdir_at(dir_fd: int, name: str, *, create: bool) -> int:
+    """One directory component below ``dir_fd``, opened without following a
+    link — created first when ``create`` — for :func:`make_dirs_confined` and
+    :func:`unlink_confined`. The caller owns the returned descriptor.
+
+    The arms of ``verify._make_candidate_parents``: POSIX ``mkdir``-s at the
+    descriptor (which never dereferences the final component) and then opens
+    ``O_NOFOLLOW | O_DIRECTORY``; :mod:`.win32_at` creates-or-opens in ONE
+    handle-relative call (``O_CREAT`` without ``O_EXCL``), a junction or symlink
+    opened as the reparse point itself and refused (DW-420). A refused open is
+    re-read with :func:`stat_at`: a link there raises :class:`UnconfinedWriteError`
+    — the confined writers' refusal — and any other failure (a missing
+    component, a file in the way, a permission error) propagates as it was."""
+    flags = os.O_RDONLY | AT_DIRECTORY | AT_NOFOLLOW
+    if create:
+        if DIR_FD_ANCHORED_WRITES:
+            with suppress(FileExistsError):
+                os.mkdir(name, 0o777, dir_fd=dir_fd)
+        else:
+            flags |= os.O_CREAT
+    try:
+        return open_at(dir_fd, name, flags)
+    except FileNotFoundError:
+        raise
+    except OSError as exc:
+        try:
+            info = stat_at(dir_fd, name)
+        except OSError:
+            raise exc from None
+        if link_like_stat(info):
+            raise UnconfinedWriteError(f"{name} is a redirect, not a directory") from exc
+        raise
+
+
+def _only_missing_below(root: Path, target: Path, root_identity: os.stat_result | None) -> bool:
+    """Whether a confined walk from ``root`` to ``target`` failed for a MISSING
+    component alone — nothing to act on — rather than a redirect: the root still
+    pinned, and walking down by ``lstat``, a component that is absent before any
+    that is a link or not a directory. Every other answer is False, so a caller
+    that cannot vouch for the walk refuses."""
+    if root_identity is not None and not _root_still_pinned(root, root_identity):
+        return False
+    cursor = root
+    for part in target.relative_to(root).parts:
+        cursor = cursor / part
+        try:
+            info = os.lstat(cursor)
+        except FileNotFoundError:
+            return True
+        except OSError:
+            return False
+        if link_like_stat(info) or not stat.S_ISDIR(info.st_mode):
+            return False
+    return False
+
+
+def _confined_relative(path: Path, confine_root: Path) -> Path:
+    """``path`` relative to ``confine_root``: lexically under it, with no ``..``
+    below it, or :class:`UnconfinedWriteError` (see :func:`_atomic_write_confined`)."""
+    if not path.is_relative_to(confine_root):
+        raise UnconfinedWriteError(f"{path} is not under {confine_root}")
+    relative = path.relative_to(confine_root)
+    if has_parent_ref(relative):
+        raise UnconfinedWriteError(f"{path} climbs back out of {confine_root} through '..'")
+    return relative
+
+
+def make_dirs_confined(
+    target: Path, *, confine_root: Path, root_identity: os.stat_result | None = None
+) -> None:
+    """``target.mkdir(parents=True, exist_ok=True)``, with every component below
+    ``confine_root`` created or reached as the confined writers reach it (DW-497).
+
+    For the callers that must create a confined writer's parent first (the
+    writers require it to exist). ``mkdir(parents=True)`` accepts a
+    symlink-to-a-directory at any component, so a link planted at
+    ``.bmad-loop/`` got the rest of the tree created at its target. Here, on
+    both anchored arms (:data:`HANDLE_ANCHORED_WRITES`), ``confine_root`` is
+    opened through :func:`open_dir_confined` — pinned by ``root_identity`` as
+    there — and each component is created and opened no-follow relative to the
+    one above (:func:`_open_subdir_at`), so a link below the root refuses before
+    anything is created through it. A host with neither arm degrades to the
+    confined writers' fallback: a root ``lstat`` compare, then
+    :func:`path_is_confined` before each ``mkdir`` and over ``target`` itself —
+    check-then-act, the residual that fallback documents.
+
+    Refusals raise :class:`UnconfinedWriteError` (an ``OSError``), as the confined
+    writers' do; any other failure is the kernel's own ``OSError``."""
+    relative = _confined_relative(target, confine_root)
+    if HANDLE_ANCHORED_WRITES:
+        fd = open_dir_confined(confine_root, confine_root, root_identity=root_identity)
+        if fd is None:
+            raise UnconfinedWriteError(f"cannot open {confine_root} as the accepted directory")
+        try:
+            for part in relative.parts:
+                nested = _open_subdir_at(fd, part, create=True)
+                fd, previous = nested, fd
+                os.close(previous)
+        finally:
+            os.close(fd)
+        return
+    if root_identity is not None and not _root_still_pinned(confine_root, root_identity):
+        raise UnconfinedWriteError(f"{confine_root} is no longer the directory the caller accepted")
+    current = confine_root
+    for part in relative.parts:
+        current = current / part
+        if not path_is_confined(confine_root, current.parent):
+            raise UnconfinedWriteError(f"{current.parent} is redirected below {confine_root}")
+        current.mkdir(exist_ok=True)
+    if not path_is_confined(confine_root, target):
+        raise UnconfinedWriteError(f"{target} is redirected below {confine_root}")
+
+
+_NOT_EMPTY_ERRNOS = (errno.ENOTEMPTY, errno.EEXIST)
+
+
+def unlink_confined(
+    path: Path,
+    *,
+    confine_root: Path,
+    root_identity: os.stat_result | None = None,
+    missing_ok: bool = False,
+    prune_empty_parent: bool = False,
+) -> None:
+    """``path.unlink()`` with its parent reached as the confined writers reach it
+    (DW-497) — and, with ``prune_empty_parent``, that parent then removed if it
+    is left empty.
+
+    A by-path unlink resolves every directory above the file by name, so a link
+    planted anywhere below ``confine_root`` gets a file of the same name deleted
+    at its target. On both anchored arms the directory holding ``path`` — its
+    grandparent when pruning — is opened through :func:`open_dir_confined`,
+    pinned by ``root_identity`` as there; the pruned parent is opened no-follow
+    below it (:func:`_open_subdir_at`), and the file is removed with
+    :func:`unlink_at`, which removes a link at the file itself rather than
+    following it. POSIX removes the emptied parent with ``rmdir`` relative to
+    the grandparent's descriptor, which never follows the final component.
+    :mod:`.win32_at` has no directory delete, so on that arm the parent is
+    removed by path after :func:`path_is_confined` and a root pin re-check;
+    hosts with neither arm take the same path-based route for the unlink too.
+    Both are check-then-act, the residual the confined writers' fallback
+    documents.
+
+    ``missing_ok`` tolerates an absent file — and an absent directory on the way
+    to it, told apart from a redirect by an ``lstat`` walk that must meet the
+    missing component before any link; without it either raises
+    ``FileNotFoundError``. A non-empty parent is left in place.
+    Refusals raise :class:`UnconfinedWriteError` (an ``OSError``); any other
+    failure is the kernel's own ``OSError``."""
+    relative = _confined_relative(path, confine_root)
+    parent = path.parent
+    if prune_empty_parent and len(relative.parts) < 2:
+        raise UnconfinedWriteError(f"refusing to prune {confine_root} itself")
+    anchor = parent.parent if prune_empty_parent else parent
+    unconfined = f"cannot reach {anchor} from {confine_root} without a redirect"
+    if not HANDLE_ANCHORED_WRITES:
+        if not path_is_confined(confine_root, parent):
+            if _only_missing_below(confine_root, parent, root_identity):
+                if missing_ok:
+                    return
+                raise FileNotFoundError(errno.ENOENT, "No such file or directory", str(parent))
+            raise UnconfinedWriteError(unconfined)
+        require_root_pinned(confine_root, root_identity)
+        path.unlink(missing_ok=missing_ok)
+        if prune_empty_parent:
+            _rmdir_if_empty(parent)
+        return
+    anchor_fd = open_dir_confined(confine_root, anchor, root_identity=root_identity)
+    if anchor_fd is None:
+        if _only_missing_below(confine_root, anchor, root_identity):
+            if missing_ok:
+                return
+            raise FileNotFoundError(errno.ENOENT, "No such file or directory", str(anchor))
+        raise UnconfinedWriteError(unconfined)
+    try:
+        dir_fd = anchor_fd
+        if prune_empty_parent:
+            try:
+                dir_fd = _open_subdir_at(anchor_fd, parent.name, create=False)
+            except FileNotFoundError:
+                if missing_ok:
+                    return
+                raise
+        try:
+            unlink_at(dir_fd, path.name)
+        except FileNotFoundError:
+            if not missing_ok:
+                raise
+        finally:
+            if dir_fd != anchor_fd:
+                os.close(dir_fd)
+        if not prune_empty_parent:
+            return
+        if DIR_FD_ANCHORED_WRITES:
+            try:
+                os.rmdir(parent.name, dir_fd=anchor_fd)
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                if exc.errno not in _NOT_EMPTY_ERRNOS:
+                    raise
+            return
+    finally:
+        os.close(anchor_fd)
+    if not path_is_confined(confine_root, parent):
+        raise UnconfinedWriteError(f"cannot reach {parent} from {confine_root} without a redirect")
+    require_root_pinned(confine_root, root_identity)
+    _rmdir_if_empty(parent)
+
+
+def _rmdir_if_empty(directory: Path) -> None:
+    """``directory.rmdir()``, leaving a missing or non-empty directory in place."""
+    try:
+        directory.rmdir()
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        if exc.errno not in _NOT_EMPTY_ERRNOS:
+            raise
 
 
 def retrying_unlink(path: Path) -> None:
@@ -1500,6 +2072,74 @@ def retrying_unlink(path: Path) -> None:
     an AV/indexer scanning the just-written source file fails the unlink. Pair the
     two whenever a move must not half-apply."""
     _retry_on_sharing_violation(path.unlink)
+
+
+def retrying_rmtree(path: Path) -> None:
+    """``shutil.rmtree(path)`` with the same win32 retry as :func:`atomic_replace`,
+    applied per failing entry.
+
+    Windows denies a delete against an open handle — Python's ``open()`` grants no
+    ``FILE_SHARE_DELETE`` — so a concurrent reader (a TUI refresh, an AV/indexer
+    scan) holding any one file in the tree fails a bare ``rmtree`` outright on the
+    first sharing violation. The handler retries just that path under the shared
+    backoff and lets the walk continue. Only the removal ops (``os.unlink``,
+    ``os.rmdir``) are retried: rmtree's probes and scans (``os.lstat``,
+    ``os.path.islink``, ``os.scandir``, ...) make the walk return early or skip a
+    directory once the handler returns, so "retrying" one would report a removal
+    that never happened. Off win32, for those non-removal ops, and for any error
+    not retryable for that op, the handler re-raises the original exception
+    at once, so the failure surfaces exactly as a bare ``rmtree``'s would. A path
+    gone by retry time is treated as removed. After the retries run out the error
+    propagates and the tree stays partially removed, as with a bare ``rmtree``.
+    A failed ``os.rmdir`` also retries WinError 145 (:func:`_is_rmdir_retryable`):
+    a child unlinked under another process's ``FILE_SHARE_DELETE`` handle stays
+    delete-pending, leaving its parent "not empty" until that handle closes. The
+    trade-off: a directory that is genuinely non-empty (a child created after the
+    walk) also reports 145, so it fails only after the backoff runs out.
+
+    ``shutil.rmtree`` is looked up on the module at call time so tests that patch
+    it still intercept this call.
+
+    ``surfaced`` holds each exception that escaped an exhausted retry; immediate
+    re-raises are not recorded. It guards against re-entry by the iterative
+    fd-based walk (3.13+), which catches an exception the handler raised for an
+    entry and calls the handler AGAIN for the enclosing directory with the same
+    exception object. That walk is POSIX-only, so this re-entry is never reached on
+    real Windows; only with a faked win32 platform on POSIX. The removal-op check
+    already re-raises that second call (it reports ``os.scandir``); the identity
+    check keeps the final failure from being swallowed whatever op is reported."""
+    surfaced: list[BaseException] = []
+
+    def _retry(func: Callable[..., object], failed: str, exc: BaseException) -> None:
+        # looked up at call time: shutil passes whatever os.rmdir is now
+        retryable = _is_rmdir_retryable if func is os.rmdir else _is_sharing_violation
+        if (
+            any(exc is seen for seen in surfaced)
+            or sys.platform != "win32"
+            # looked up at call time: shutil passes whatever os.unlink is now
+            or (func is not os.unlink and func is not os.rmdir)
+            or not retryable(exc)
+        ):
+            raise exc
+
+        def _again() -> None:
+            func(failed)
+
+        try:
+            with suppress(FileNotFoundError):  # already gone is the goal
+                # the loop needs the same predicate, or a repeated 145 raises after
+                # a single re-attempt
+                _retry_on_sharing_violation(_again, retryable=retryable)
+        except BaseException as final:
+            surfaced.append(final)
+            raise
+
+    if sys.version_info >= (3, 12):
+        shutil.rmtree(path, onexc=_retry)
+    else:  # 3.11: no `onexc`; `onerror` (deprecated from 3.12) carries exc_info
+        shutil.rmtree(
+            path, onerror=lambda func, failed, exc_info: _retry(func, failed, exc_info[1])
+        )
 
 
 class LockUnavailableError(OSError):

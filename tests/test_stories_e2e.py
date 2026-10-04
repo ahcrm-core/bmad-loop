@@ -78,6 +78,7 @@ from conftest import (
     bind_recorded_child,
     install_build_auto_skill,
     install_dev_base_skills,
+    install_sweep_skill,
     kill_recorded_child,
     preflight_pidfd_support,
     proc_starttime,
@@ -236,6 +237,32 @@ sleep 30
 # Built by swapping the one line that names the directory, so it can differ from
 # FAKE_CLI in nothing else.
 LEGACY_EVENTS_FAKE_CLI = FAKE_CLI.replace('ed="$BMAD_LOOP_EVENTS_DIR"', 'ed="$rd/events"')
+
+# The same script with a nested coding CLI launched inside the session (#767): the
+# child inherits BMAD_LOOP_TASK_ID/BMAD_LOOP_EVENTS_DIR, so its own SessionStart,
+# Stop and SessionEnd land in the parent's stream, before the parent has written a
+# result. Fresh timestamps (and a pause so they reach the watcher as their own ticks)
+# order every child event ahead of the parent's Stop, which is re-stamped too, so the
+# parent's completion cannot overtake them in one poll.
+_NESTED_CHILD_EVENTS = r"""
+for kind in SessionStart Stop SessionEnd; do
+    cts=$(date +%s%N)
+    printf '{"ts": %s, "event": "%s", "task_id": "%s", "session_id": "child-1"}' \
+        "$cts" "$kind" "$tid" > "$ed/$cts-$tid-$kind.json"
+done
+sleep 2
+"""
+_PARENT_START = """    "$ts" "$tid" > "$ed/$ts-$tid-SessionStart.json"
+"""
+_STORY_STOP_TS = """write_done                       # normal fresh dispatch
+fi
+
+ts2=$(( ts + 1 ))
+"""
+assert FAKE_CLI.count(_PARENT_START) == 1 and FAKE_CLI.count(_STORY_STOP_TS) == 1
+NESTED_CHILD_FAKE_CLI = FAKE_CLI.replace(
+    _PARENT_START, _PARENT_START + _NESTED_CHILD_EVENTS
+).replace(_STORY_STOP_TS, _STORY_STOP_TS.replace("$(( ts + 1 ))", "$(date +%s%N)"))
 
 PROFILE_TOML = """\
 name = "fakestories"
@@ -616,6 +643,8 @@ def _scaffold_sweep(root: Path) -> None:
 
     # the SAME folder+id-capable skill stubs the other scaffolds install
     install_dev_base_skills(root, folder_id=True)  # tree matches PROFILE_TOML's skill_tree
+    # the triage session dispatches `/bmad-loop-sweep`, as `bmad-loop init` lays it down
+    install_sweep_skill(root)
 
     # canonical DW-format ledger (no legacy content → migration is skipped)
     (impl / "deferred-work.md").write_text(
@@ -2263,6 +2292,154 @@ def test_e2e_a_relay_that_only_knows_the_legacy_events_dir_still_completes(tmp_p
     run_id = _run_id(root)
     assert list((root / ".bmad-loop" / "runs" / run_id / "events").glob("*.json"))
     assert not list(runs.events_dir_for(root, run_id).glob("*.json"))
+
+
+def test_e2e_nested_child_cli_events_do_not_end_the_parent(tmp_path):
+    """A nested coding CLI started from inside the session writes its own
+    SessionStart, Stop and SessionEnd into the parent's event stream before the
+    parent has finished (#767). Through the real CLI and real tmux, the child's
+    announced start marks it foreign: its SessionEnd must not crash the story and
+    its Stop must not complete it early. Only the parent's own Stop does. The
+    profile maps SessionEnd here (as claude.toml does) so the child's SessionEnd
+    really reaches the wait loop.
+
+    Ablation guard: make `SessionAttribution.admit` always admit and the
+    `foreign-hook-event-ignored` assertion fails. The outcome assertions alone do
+    NOT catch that ablation: the child's SessionEnd then crashes the session, but
+    a crash is graded on the artifact read back within RESULT_GRACE_S (15 s), and
+    the parent's spec lands inside it, so the story still reaches `done`."""
+    assert NESTED_CHILD_FAKE_CLI != FAKE_CLI, "the child splice did not take"
+    session_end_profile = PROFILE_TOML.replace(
+        'Stop = "Stop" }', 'Stop = "Stop", SessionEnd = "SessionEnd" }'
+    )
+    assert session_end_profile != PROFILE_TOML, "the SessionEnd mapping did not take"
+
+    root = tmp_path / "sbx"
+    _scaffold(root, [_entry("1")])
+    fake = root / ".bmad-loop" / "fake-cli.sh"
+    fake.write_text(NESTED_CHILD_FAKE_CLI, encoding="utf-8")
+    (root / ".bmad-loop" / "profiles" / "fakestories.toml").write_text(
+        session_end_profile.format(binary=str(fake)), encoding="utf-8"
+    )
+    _git(root, "commit", "-q", "-am", "nested-child fake")
+    base = _commit_count(root)
+
+    proc = _run(root, "run")
+    assert proc.returncode == 0, proc.stderr or proc.stdout
+    assert _status(root, "1") == "done"
+    assert _commit_count(root) == base + 1
+
+    run_id = _run_id(root)
+    lifecycle = root / ".bmad-loop" / "runs" / run_id / "tasks"
+    crumbs = [
+        json.loads(line)
+        for path in lifecycle.glob("*/session-lifecycle.jsonl")
+        for line in path.read_text(encoding="utf-8").splitlines()
+    ]
+    ignored = [c for c in crumbs if c["event"] == "foreign-hook-event-ignored"]
+    assert [(c["foreign_session_id"], c["hook_event"]) for c in ignored] == [
+        ("child-1", "SessionStart")
+    ]
+
+
+# DW-507: the real relay, not `printf`, writes this variant's hook events, so each
+# carries the relay's `lineage` tag computed from the REAL pane process tree the
+# tmux launch prelude produced. The parent fires its SessionStart and Stop through
+# a non-exec'ing `sh -c '<relay> relay <Event> && true'` wrapper, the shape a hook
+# host gives the registered command; a nested child script (a separate file whose
+# cmdline holds neither relay marker nor event name) fires an ID-LESS Stop through
+# the same relay once the 5 s launch window has passed.
+_FAKE_SESSION_START = """printf '{"ts": %s, "event": "SessionStart", "task_id": "%s", "session_id": "fake-1"}' \\
+    "$ts" "$tid" > "$ed/$ts-$tid-SessionStart.json"
+"""
+_FAKE_STORY_STOP = """ts2=$(( ts + 1 ))
+printf '{"ts": %s, "event": "Stop", "task_id": "%s", "session_id": "fake-1"}' \\
+    "$ts2" "$tid" > "$ed/$ts2-$tid-Stop.json"
+sleep 30
+"""
+assert FAKE_CLI.count(_FAKE_SESSION_START) == 1 and FAKE_CLI.endswith(_FAKE_STORY_STOP)
+_VENV_RELAY = Path(sys.executable).parent / "bmad-loop"
+
+
+def _relay_call(relay: Path, event: str, payload: str) -> str:
+    """A shell line piping `payload` into `<relay> relay <event>` behind a
+    non-exec'ing `sh -c` wrapper (the trailing `&& true` keeps it a list)."""
+    inner = f"{shlex.quote(str(relay))} relay {event} && true"
+    return f"printf '%s' {shlex.quote(payload)} | sh -c {shlex.quote(inner)}\n"
+
+
+def _lineage_fake_cli(relay: Path, nested_child: Path) -> str:
+    start = _relay_call(relay, "SessionStart", '{"session_id": "fake-1"}')
+    child = (
+        "# past the relays' 5 s launch window, so only lineage can call the child's\n"
+        "# tool shell foreign, then the nested child's id-less Stop\n"
+        f"sleep 6\n{shlex.quote(str(nested_child))}\nsleep 2\n"
+    )
+    stop = _relay_call(relay, "Stop", '{"session_id": "fake-1"}') + "sleep 30\n"
+    fake = FAKE_CLI.replace(_FAKE_SESSION_START, start + child)
+    return fake[: -len(_FAKE_STORY_STOP)] + stop
+
+
+@pytest.mark.skipif(not _VENV_RELAY.is_file(), reason="no bmad-loop console script beside python")
+def test_e2e_relay_lineage_drops_a_nested_childs_id_less_stop(tmp_path):
+    """DW-507 end to end, zero tokens: the real tmux launch prelude records the
+    launched pid, the REAL relay tags every event from the real process tree,
+    and attribution acts on it. The parent's first SessionStart reads `match`,
+    so lineage is trusted; the nested child's id-less Stop reads `mismatch` and
+    is dropped (the #767 rules alone admit any id-less event, so it would have
+    completed the session before the parent wrote its spec); the parent's own
+    Stop, fired after the launch window through a real wrapper, reads `match`
+    and completes the story.
+
+    Ablation guards: drop the prelude from `_window_launch` and every tag is
+    `unknown` (the lineage assert fails); delete the trusted-mismatch check in
+    `SessionAttribution.admit` and the `foreign-hook-event-ignored` assert
+    fails. The outcome asserts alone do NOT catch the latter: the child's Stop
+    then ends the wait result-less, but the Stop read-back grace outlasts the
+    parent's spec write, so the story still reaches `done`."""
+    nested_dir = tmp_path / "nested"
+    nested_dir.mkdir()
+    nested_child = nested_dir / "child.sh"
+    nested_child.write_text(
+        "#!/bin/sh\n" + _relay_call(_VENV_RELAY, "Stop", "{}"), encoding="utf-8"
+    )
+    os.chmod(nested_child, 0o755)
+    fake_text = _lineage_fake_cli(_VENV_RELAY, nested_child)
+    assert '"event": "SessionStart"' not in fake_text, "the start splice did not take"
+
+    root = tmp_path / "sbx"
+    _scaffold(root, [_entry("1")])
+    fake = root / ".bmad-loop" / "fake-cli.sh"
+    fake.write_text(fake_text, encoding="utf-8")
+    _git(root, "commit", "-q", "-am", "lineage fake")
+    base = _commit_count(root)
+
+    proc = _run(root, "run")
+    assert proc.returncode == 0, proc.stderr or proc.stdout
+    assert _status(root, "1") == "done"
+    assert _commit_count(root) == base + 1
+
+    run_id = _run_id(root)
+    recorded = [
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in sorted(runs.events_dir_for(root, run_id).glob("*.json"))
+    ]
+    tags = [(e["event"], e["session_id"], e["lineage"]) for e in recorded]
+    assert tags == [
+        ("SessionStart", "fake-1", "match"),
+        ("Stop", None, "mismatch"),
+        ("Stop", "fake-1", "match"),
+    ], tags
+
+    lifecycle = root / ".bmad-loop" / "runs" / run_id / "tasks"
+    crumbs = [
+        json.loads(line)
+        for path in lifecycle.glob("*/session-lifecycle.jsonl")
+        for line in path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert not [c for c in crumbs if c["event"] == "hook-lineage-untrusted"]
+    ignored = [c for c in crumbs if c["event"] == "foreign-hook-event-ignored"]
+    assert [(c["foreign_session_id"], c["hook_event"]) for c in ignored] == [(None, "Stop")]
 
 
 def test_e2e_sprint_mode_regression(tmp_path):

@@ -48,12 +48,21 @@ VALIDATE_CHECKS: frozenset[str] = frozenset(
         "policy",
         "policy.model-qualified",
         "policy.effort-unsupported",
+        "policy.bypass-dropped",
+        # opencode-http: a role's extra_args repeating an adapter-owned serve flag (DW-483)
+        "policy.extra-args-unservable",
+        # worktree isolation beside a project that is NOT inside repo_root (a
+        # disjoint layout, #414); a nested project is supported since DW-379
         "policy.isolation-repo-root",
+        # worktree isolation beside an artifact dir inside repo_root but outside the
+        # project: shared with the main checkout, not per-worktree (DW-485)
+        "policy.isolation-shared-artifact-dir",
         "adapter.profile",
         "adapter.binary",
         "adapter.binary-unrunnable",
         "adapter.hookless",
         "adapter.httpx",
+        "adapter.launch-args-unservable",
         "adapter.kind",
         "adapter.external",
         "adapter.external-profile",
@@ -69,11 +78,14 @@ VALIDATE_CHECKS: frozenset[str] = frozenset(
         "hooks.trust",
         "hooks.relay-present",
         "hooks.relay-stale",
+        "hooks.relay-path-unsafe",
         "mux.backend",
         "mux.preflight",
         "mux.backends-detected",
         "mux.selection",
         "mux.external-backend",
+        # a registered backend whose platform predicate, factory or available() raised (DW-464)
+        "mux.backend-probe",
         "host.process",
         "host.win32-on-wsl-path",
         "notify.desktop-unavailable",
@@ -86,6 +98,7 @@ VALIDATE_CHECKS: frozenset[str] = frozenset(
         "skills.dev-renderer",
         "skills.dev-renderer-config",
         "skills.dev-renderer-sources",
+        "skills.dev-render-probe",
         "skills.review-layer-missing",
         "skills.review-layer-unresolved",
         "skills.review-layers-empty",
@@ -93,6 +106,9 @@ VALIDATE_CHECKS: frozenset[str] = frozenset(
         "skills.stories-dispatch",
         "skills.stories-dispatch-missing",
         "skills.stories-dispatch-stale",
+        "skills.sweep",
+        "skills.sweep-missing",
+        "skills.sweep-incomplete",
         "operator.registry-stale",
         "operator.actions-malformed",
         "operator.confirm-interrupted",
@@ -103,6 +119,8 @@ VALIDATE_CHECKS: frozenset[str] = frozenset(
         "deferred.hard-gate",
         "deferred.hard-gate-unstructured",
         "deferred.ledger-unreadable",
+        "deferred.ledger-untracked",
+        "deferred.ledger-ignored-isolated",
     }
 )
 

@@ -903,6 +903,89 @@ def test_the_two_commit_probe_records_alias_one_baseline_to_one_name():
         assert canary not in rendered, f"LEAK: {canary!r}"
 
 
+def test_the_two_migration_reset_refusals_alias_one_snapshot_ref():
+    """`snapshot_ref` names the worktree snapshot `sweep._migration_reset` parked
+    before refusing its reset (DW-435), on both of that refusal's records. It is a
+    ref NAME embedding the story slug and a baseline prefix, so it is aliased in a
+    `ref` namespace of its own — one snapshot, one alias across both kinds — rather
+    than left to `scrub_json`, which redacts it only because of its `/`.
+
+    Ablation: drop `"snapshot_ref"` from `_JOURNAL_ALIAS_FIELDS` and the test dies at
+    the `next(...)` alias lookup with `StopIteration`."""
+    ref = f"refs/attempt-preserve-dirty/{PROPRIETARY}-{SHA[:8]}-2"
+    pseudo = sanitize.Pseudonymizer(salt=b"fixed")
+    probe_failed = diagnostics._scrub_entry(
+        {
+            "ts": 1.0,
+            "kind": "ledger-snapshot-probe-failed",
+            "story_key": STORY_KEY,
+            "snapshot_ref": ref,
+            "error": f"GitError: git show {ref}:ledger failed in {HOME_PATH}",
+        },
+        pseudo,
+        {},
+        1.0,
+    )
+    diverged = diagnostics._scrub_entry(
+        {
+            "ts": 2.0,
+            "kind": "sweep-migration-restore-diverged",
+            "story_key": STORY_KEY,
+            "ledger": f"{HOME_PATH}/deferred-work.md",
+            "snapshot_ref": ref,
+        },
+        pseudo,
+        {},
+        1.0,
+    )
+
+    alias = next(a for ns, orig, a in pseudo.entries() if ns == "ref" and orig == ref)
+    assert probe_failed["snapshot_ref"] == diverged["snapshot_ref"] == alias != ref
+    assert "error" not in probe_failed and probe_failed["error_present"] is True
+
+    rendered = json.dumps([probe_failed, diverged])
+    for canary in (ref, SHA[:8], PROPRIETARY, HOME_PATH, *CANARIES):
+        assert canary not in rendered, f"LEAK: {canary!r}"
+
+
+def test_the_park_failure_records_alias_one_head_to_one_name():
+    """`head` is the attempt HEAD sha a rollback could not park
+    (`attempt-preserve-failed`) or fell through past on a re-drive
+    (`attempt-preserve-fallthrough`, DW-481) — the sha a reflog rescue starts from.
+    It left the routing guard's benign inventory for the `commit` namespace, so one
+    HEAD gets one alias across both kinds; `leg` is a closed token and ships as-is.
+
+    Ablation: drop `"head"` from `_JOURNAL_ALIAS_FIELDS` and the test dies at the
+    `next(...)` alias lookup with `StopIteration`."""
+    pseudo = sanitize.Pseudonymizer(salt=b"fixed")
+    failed = diagnostics._scrub_entry(
+        {"ts": 1.0, "kind": "attempt-preserve-failed", "story_key": STORY_KEY, "head": SHA},
+        pseudo,
+        {},
+        1.0,
+    )
+    fallthrough = diagnostics._scrub_entry(
+        {
+            "ts": 2.0,
+            "kind": "attempt-preserve-fallthrough",
+            "story_key": STORY_KEY,
+            "leg": "commits-park",
+            "head": SHA,
+        },
+        pseudo,
+        {},
+        1.0,
+    )
+
+    alias = next(a for ns, orig, a in pseudo.entries() if ns == "commit" and orig == SHA)
+    assert failed["head"] == fallthrough["head"] == alias != SHA
+    assert fallthrough["leg"] == "commits-park"
+
+    rendered = json.dumps([failed, fallthrough])
+    for canary in (SHA, PROPRIETARY, *CANARIES):
+        assert canary not in rendered, f"LEAK: {canary!r}"
+
+
 def test_remaining_journal_shapes_route_by_kind_and_preserve_safe_structure():
     """The overloaded names are handled according to the producer shape, not by
     their generic scalar fallback."""
@@ -992,6 +1075,55 @@ def test_journal_alias_routes_accept_lone_unicode_surrogates(project):
     assert len(set(commits["commits"])) == len(commit_values)
     assert sentinel_value not in rendered
     assert all(value not in rendered for value in commit_values)
+
+
+@pytest.mark.parametrize(
+    ("kind", "field", "values"),
+    [
+        ("retro-auto-dirty", "paths", ["src/AcmePayroll.py", "AcmeVault.txt"]),
+        ("retro-auto-finished", "docs", ["epic-1-retro-AcmeVault.md"]),
+    ],
+)
+def test_auto_retro_path_lists_reduce_to_counts(kind, field, values):
+    """DW-389: the auto retrospective's path lists (the leftover dirty paths, the
+    retro doc names) ship as counts, never as names.
+
+    Ablation: drop the kind's row from `_JOURNAL_KIND_COUNTLIST_FIELDS` and the
+    identifier-shaped names ride `scrub_json` into the dump."""
+    scrubbed = diagnostics._scrub_entry(
+        {"kind": kind, "epic": 1, field: values},
+        sanitize.Pseudonymizer(salt=b"fixed"),
+        {},
+        None,
+    )
+
+    assert scrubbed == {"kind": kind, "epic": 1, f"{field}_count": len(values)}
+    assert all(value not in json.dumps(scrubbed) for value in values)
+
+
+@pytest.mark.parametrize("verdict", ["accepted", "accepted-with-open-items", "rejected", "unknown"])
+def test_auto_retro_verdict_ships_as_its_closed_token(verdict):
+    """DW-487: `retro-auto-finished`'s `verdict` is a closed token the engine
+    normalizes (never doc text), declared benign on that kind, so a dump keeps it
+    verbatim beside the doc count — the value a maintainer reads the record for."""
+    scrubbed = diagnostics._scrub_entry(
+        {
+            "kind": "retro-auto-finished",
+            "epic": 1,
+            "docs": ["epic-1-retro-2026-09-26.md"],
+            "verdict": verdict,
+        },
+        sanitize.Pseudonymizer(salt=b"fixed"),
+        {},
+        None,
+    )
+
+    assert scrubbed == {
+        "kind": "retro-auto-finished",
+        "epic": 1,
+        "docs_count": 1,
+        "verdict": verdict,
+    }
 
 
 @pytest.mark.parametrize(
@@ -1094,6 +1226,49 @@ def test_unrelated_raw_presence_field_is_not_suppressed():
         None,
     )
     assert scrubbed["patch_present"] is False
+
+
+def test_unpinned_artifact_observation_keeps_the_fs_type_and_drops_the_paths():
+    """`artifact-observation-unpinned` (DW-444) names the absolute artifacts root
+    and a filesystem label that embeds its volume path — both host paths, routed
+    presence-only for `repo`'s reason. The filesystem TYPE rides its own
+    `fs_type` field and survives as a value; `count` is a benign integer.
+
+    Graded on ABSENCE, as `stories_root` is: the canary sweep alone is a false
+    green because `scrub_json` already collapses a separator-bearing path.
+
+    Ablation: drop `root` or `filesystem` from `_JOURNAL_DROP_FIELDS` and the
+    matching presence assertion reddens; drop the `fs_type` branch in
+    `_scrub_entry` and the path-shaped `fs_type` row ships redacted-by-accident
+    rather than None, while a route that returns None unconditionally loses
+    `NTFS`."""
+    pseudo = sanitize.Pseudonymizer(salt=b"fixed")
+
+    def scrub(fs_type):
+        return diagnostics._scrub_entry(
+            {
+                "ts": 2.0,
+                "kind": "artifact-observation-unpinned",
+                "story_key": STORY_KEY,
+                "root": f"{HOME_PATH}/_bmad-output/implementation-artifacts",
+                "filesystem": f"NTFS at {HOME_PATH}",
+                "fs_type": fs_type,
+                "count": 3,
+            },
+            pseudo,
+            {},
+            1.0,
+        )
+
+    scrubbed = scrub("NTFS")
+    assert "root" not in scrubbed and scrubbed["root_present"] is True
+    assert "filesystem" not in scrubbed and scrubbed["filesystem_present"] is True
+    assert scrubbed["fs_type"] == "NTFS"
+    assert scrubbed["count"] == 3
+    rendered = json.dumps(scrubbed)
+    for canary in (HOME_PATH, *CANARIES):
+        assert canary not in rendered, f"LEAK: {canary!r}"
+    assert scrub(f"NTFS at {HOME_PATH}")["fs_type"] is None
 
 
 def test_sentinel_upstream_record_drops_the_stories_root_it_names():
@@ -1211,6 +1386,25 @@ def test_patch_and_stash_path_fields_are_dropped_at_the_routing_seam(kind, field
     legend = json.dumps(pseudo.legend())
     for canary in (value, HOME_PATH, SPEC_NAME, PROPRIETARY, *CANARIES):
         assert canary not in legend, f"LEAK via legend: {canary!r}"
+
+
+def test_pinned_config_edit_descriptions_are_dropped_at_the_routing_seam():
+    """`pinned-config-edit-refused` (DW-368) lists free-text edit descriptions that
+    quote config paths, the operator's settings keys and error text; a dump keeps
+    only their presence. Ablation: remove `edits` from ``_JOURNAL_DROP_FIELDS`` and
+    the absence assertion fails."""
+    pseudo = sanitize.Pseudonymizer(salt=b"fixed")
+    edits = [f".claude/settings.json: changed outside the relay hooks (keys: {PROPRIETARY})"]
+    scrubbed = diagnostics._scrub_entry(
+        {"ts": 2.0, "kind": "pinned-config-edit-refused", "story_key": STORY_KEY, "edits": edits},
+        pseudo,
+        {},
+        1.0,
+    )
+
+    assert "edits" not in scrubbed
+    assert scrubbed["edits_present"] is True
+    assert PROPRIETARY not in json.dumps(scrubbed)
 
 
 def test_patch_and_stash_paths_are_absent_from_public_diagnostic_renders(project):
@@ -1640,6 +1834,13 @@ def test_integration_receipt_identities_are_pseudonymized_in_merge_records():
     assert operation_aliases == [operation_aliases[0]] * 3
     assert operation_aliases[0] != operation
     assert scrubbed[0]["pre_target_revision"] != revision
+    # DW-318: `source` is the same revision namespace — one SHA, one alias across
+    # every merge kind and `pre_target_revision`. Ablation: drop the `source` rows
+    # from `_JOURNAL_KIND_ALIAS_FIELDS` and the 40-hex value survives `scrub_json`.
+    commit_alias = scrubbed[0]["pre_target_revision"]
+    assert commit_alias.startswith("commit-")
+    assert [entry["source"] for entry in scrubbed] == [commit_alias] * 3
+    assert revision not in json.dumps(scrubbed), "LEAK: raw merge revision"
     assert any(ns == "operation" and original == operation for ns, original, _ in pseudo.entries())
     assert any(ns == "commit" and original == revision for ns, original, _ in pseudo.entries())
 
@@ -2241,16 +2442,26 @@ def test_markdown_sweep_unknown_key_fails_closed_before_the_backstop(project):
             },
         ),
         ("sweep-repeat-done", {"cycles": 2, "reason": "no-open", "stop_cause": "no-open"}),
+        (
+            "sweep-bundles-withheld",
+            {
+                "cycle": 3,
+                "bundles_not_run": 2,
+                "reason": "ledger-unreadable",
+                "story_keys": [STORY_KEY],
+            },
+        ),
     ],
 )
 def test_an_unrouted_field_on_a_markdown_sweep_kind_fails_closed(kind, declared):
-    """The six kinds `render_markdown` prints as a JSON block carry a declared
+    """The seven kinds `render_markdown` prints as a JSON block carry a declared
     schema, so a field a future producer adds WITHOUT routing collapses to a
     presence marker instead of riding `scrub_json` into the pasted dump. Graded
     both ways, as the `preference-escalation` row is: the off-schema value is GONE
     and the declared identity fields (`file`, `refuse_cause`, `stop_cause`,
-    `cycles`) are NOT — a schema that flattened the record would pass an
-    absence-only assertion while destroying what the block is rendered for.
+    `cycles`, `cycle`, `bundles_not_run`) are NOT — a schema that flattened the
+    record would pass an absence-only assertion while destroying what the block is
+    rendered for.
 
     Ablation: drop `kind`'s row from `_JOURNAL_KIND_SCHEMAS` and the `AcmeVault`
     absence assertion reds — `scrub_json` is the identity on that string."""
@@ -2262,7 +2473,7 @@ def test_an_unrouted_field_on_a_markdown_sweep_kind_fails_closed(kind, declared)
     assert "customer" not in scrubbed
     assert scrubbed["customer_present"] is True
     assert "AcmeVault" not in json.dumps(scrubbed), "LEAK: off-schema sweep value"
-    for name in ("file", "refuse_cause", "stop_cause", "cycles"):
+    for name in ("file", "refuse_cause", "stop_cause", "cycles", "cycle", "bundles_not_run"):
         if name in declared:
             assert scrubbed[name] == declared[name]
     for name in ("message", "repo", "error", "reason"):
@@ -2273,6 +2484,9 @@ def test_an_unrouted_field_on_a_markdown_sweep_kind_fails_closed(kind, declared)
     if "dw_ids" in declared:
         # the keylist route runs ahead of the schema: aliased, never collapsed
         assert len(scrubbed["dw_ids"]) == 1 and "DW-7" not in json.dumps(scrubbed)
+    if "story_keys" in declared:
+        # same precedence for the story-key list on `sweep-bundles-withheld`
+        assert len(scrubbed["story_keys"]) == 1 and STORY_KEY not in json.dumps(scrubbed)
 
 
 def test_env_tmux_version_folds_a_multi_line_probe(monkeypatch):

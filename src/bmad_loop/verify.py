@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import hashlib
 import io
-import locale
 import os
 import queue
 import re
@@ -25,14 +24,18 @@ from collections.abc import Callable, Collection, Iterable
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from stat import S_ISLNK, S_ISREG
-from typing import Any, Literal, assert_never, overload
+from typing import Any, Literal, NamedTuple, assert_never, overload
 
 import yaml
 
-from . import deferredwork
+from . import childrun, deferredwork, platform_util
 from .bmadconfig import ProjectPaths
+from .frontmatter import FileIdentity  # noqa: F401 — re-export
+from .frontmatter import FrontmatterTargetChangedError  # noqa: F401 — re-export
 from .frontmatter import FrontmatterWriteError  # noqa: F401 — re-export
+from .frontmatter import parse_frontmatter  # noqa: F401 — re-export
 from .frontmatter import set_frontmatter_status  # noqa: F401 — re-export
+from .frontmatter import set_frontmatter_status_anchored  # noqa: F401 — re-export
 from .frontmatter import (
     _edit_frontmatter_block,
     _split_frontmatter,
@@ -42,14 +45,25 @@ from .frontmatter import (
     status_of,
 )
 from .model import StoryTask, VerifyOutcome, result_mapping
+from .mountpaths import project_offset
 from .platform_util import (
+    AT_DIRECTORY,
+    AT_NOFOLLOW,
     DIR_FD_ANCHORED_WRITES,
+    HANDLE_ANCHORED_WRITES,
+    RootIdentityRecord,
+    UnconfinedWriteError,
+    atomic_replace,
     atomic_write_bytes,
     atomic_write_bytes_confined,
     has_parent_ref,
     names_tree_root,
     names_win32_alias,
     open_dir_confined,
+    path_is_confined,
+    pinned_root_identity,
+    recorded_root_identity,
+    require_root_pinned,
 )
 from .policy import POLICY_FILE, Policy
 from .sprintstatus import STATUS_ORDER, story_status
@@ -136,6 +150,22 @@ class GitTimeoutError(GitError):
     all over again. `cmd_validate` is that caller: three probes in a row against
     one hung binary cost three deadlines, and only the first one told the
     operator anything."""
+
+
+class GitNotARepositoryError(GitError):
+    """Git answered that the directory is in NO repository: its discovery walk
+    failed (`fatal: not a git repository (or any ...)`). A GitError so every
+    existing guard is unchanged; a distinct type because that answer is a steady
+    property of the destination, where a timeout, a spawn failure or an unreadable
+    index is a fault in a real repository — `sweep._commit_ledger` degrades only
+    on this type and re-raises the rest (DW-336). `path_clean` is its only
+    producer."""
+
+
+# Git's repository-discovery failure (`setup.c`), stable under `_run_git`'s
+# `LC_ALL=C`, matched at the START of a stderr line. The trailing "(or any " is
+# what excludes the gitfile form (`not a git repository: <path>`).
+_NOT_A_REPOSITORY_PREFIX = "fatal: not a git repository (or any "
 
 
 class _GitCommitIndeterminate(GitError):
@@ -366,6 +396,27 @@ class IntegrationCleanupChangedError(IntegrationEvidenceError):
         self.cleaned = tuple(cleaned)
 
 
+class MergePreflightPreserveError(GitError):
+    """The merge pre-flight could not park an operator's uncommitted bytes before
+    restoring the tracked incoming paths that hold them (DW-356).
+
+    Raised by :func:`apply_incoming_collision_plan` BEFORE any mutation: nothing was
+    unlinked or checked out, and ``progress`` is empty. A GitError so every existing
+    guard still catches it; a distinct type so the merge caller can name the failed
+    preservation and ``paths`` instead of wording it as the stray-dirt guard's
+    refusal ("commit, stash or revert") or as an environment fault — the dirt here
+    lies INSIDE the branch's incoming set, and the operator's remedy is to save or
+    discard their edit to exactly these paths."""
+
+    def __init__(self, paths: Iterable[str], detail: str) -> None:
+        self.paths = tuple(paths)
+        super().__init__(
+            "could not park the uncommitted working-tree bytes of "
+            f"{', '.join(self.paths)} under a refs/merge-preflight-preserve/ recovery ref "
+            f"before restoring them: {detail}"
+        )
+
+
 @dataclass(frozen=True)
 class IntegrationRefUpdate:
     old_revision: str
@@ -525,6 +576,11 @@ def _validated_index_state(value: object) -> dict[str, object]:
 # `DIR_FD_ANCHORED_WRITES`, and monkeypatched by tests to read the other arm.
 WIN32_PATH_NAMES = sys.platform == "win32"
 
+# Whether `_make_candidate_parents` walks through `win32_at`'s handle-relative
+# create-or-open (DW-420): handle-anchored without the POSIX `dir_fd` family.
+# The host's own, like `WIN32_PATH_NAMES`, and monkeypatched by tests.
+WIN32_HANDLE_PARENTS = HANDLE_ANCHORED_WRITES and not DIR_FD_ANCHORED_WRITES
+
 
 def _portable_integration_path(value: object) -> str:
     """Validate a persisted repository-relative operand before any mutation.
@@ -606,9 +662,89 @@ def _confined_repo_operand(repo: Path, rel: object) -> tuple[str, Path]:
     return validated, candidate
 
 
-def _integration_snapshot_root(run_dir: Path, operation_identity: str) -> Path:
+class _RunDirPin(NamedTuple):
+    """The run dir a snapshot sidecar is written under, and the identity it is
+    pinned to: `platform_util.recorded_root_identity` of ``RunState.run_dir_identity``,
+    the record the composer took when it minted the run dir (DW-446, DW-500)."""
+
+    run_dir: Path
+    identity: os.stat_result
+
+
+def _run_dir_pin(run_dir: Path, run_dir_identity: RootIdentityRecord | None) -> _RunDirPin:
+    """The pin for ``run_dir``'s mint-time record. A ``None`` record (a pre-DW-446
+    state not yet backfilled by `runs.reconcile_root_identities`, a zero-inode
+    claim) pins to the never-matching identity, so every snapshot write REFUSES —
+    DW-446's rule for a missing record, never a fresh ``lstat``."""
+    return _RunDirPin(run_dir, recorded_root_identity(run_dir_identity))
+
+
+def _require_run_dir_pinned(pin: _RunDirPin) -> None:
+    """The path arms' pin (check-then-write): ``pin.run_dir`` must still ``lstat``
+    as its mint-time directory. A fresh ``lstat`` follows a link at any ancestor,
+    so ``runs/`` swapped for a link to a tree holding a real ``<id>/`` answers the
+    OUTSIDE directory — whose identity is not the record — and refuses."""
+    try:
+        require_root_pinned(pin.run_dir, pin.identity)
+    except UnconfinedWriteError as exc:
+        raise IntegrationEvidenceError(
+            "target integration run directory is not the one minted for this run"
+        ) from exc
+
+
+def _integration_snapshot_root(run_dir: Path, operation_identity: str, pin: _RunDirPin) -> Path:
+    """Create the capture root ``<run_dir>/integration-snapshots/<operation>``.
+
+    Confined to the run dir by its MINT-TIME identity (DW-500, DW-446's rule for
+    `Journal.write_verify_stream`): ``run_dir.resolve()`` follows a link at any
+    ancestor, so ``runs/`` swapped for a link to a tree holding a real ``<id>/``
+    used to carry every snapshot sidecar outside the run. On the dir-fd arm the
+    run dir is OPENED and its ``fstat`` compared against the record before
+    anything is created, and both directories are made relative to that
+    descriptor, the snapshot directory reopened ``O_NOFOLLOW``. The other arms
+    re-``lstat`` the run dir against the record before the first ``mkdir`` and
+    again after the last (check-then-write). A missing record refuses."""
     if not re.fullmatch(r"[0-9a-f]{32}", operation_identity):
         raise IntegrationEvidenceError("persisted target integration operation is malformed")
+    if DIR_FD_ANCHORED_WRITES:
+        run_fd = open_dir_confined(run_dir, run_dir, root_identity=pin.identity)
+        if run_fd is None:
+            raise IntegrationEvidenceError(
+                "target integration run directory is not the one minted for this run"
+            )
+        try:
+            try:
+                os.mkdir(_INTEGRATION_SNAPSHOT_DIR, 0o700, dir_fd=run_fd)
+            except FileExistsError:
+                pass  # an existing entry — the O_NOFOLLOW open below vets it
+            try:
+                parent_fd = os.open(
+                    _INTEGRATION_SNAPSHOT_DIR,
+                    os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
+                    dir_fd=run_fd,
+                )
+            except OSError as exc:
+                raise IntegrationEvidenceError(
+                    "target integration snapshot directory was redirected"
+                ) from exc
+        finally:
+            os.close(run_fd)
+        try:
+            try:
+                os.mkdir(operation_identity, 0o700, dir_fd=parent_fd)
+            except FileExistsError as exc:
+                raise IntegrationEvidenceError(
+                    "target integration snapshot operation already exists"
+                ) from exc
+            try:
+                os.fsync(parent_fd)
+            except OSError:
+                os.rmdir(operation_identity, dir_fd=parent_fd)
+                raise
+        finally:
+            os.close(parent_fd)
+        return run_dir / _INTEGRATION_SNAPSHOT_DIR / operation_identity
+    _require_run_dir_pinned(pin)
     run_root = run_dir.resolve(strict=True)
     parent = run_dir / _INTEGRATION_SNAPSHOT_DIR
     if parent.is_symlink():
@@ -634,7 +770,29 @@ def _integration_snapshot_root(run_dir: Path, operation_identity: str) -> Path:
         raise IntegrationEvidenceError("target integration snapshot directory was redirected")
     if resolved != run_root and not resolved.is_relative_to(run_root):
         raise IntegrationEvidenceError("target integration snapshot directory escaped the run")
+    _require_run_dir_pinned(pin)
     return root
+
+
+def _open_snapshot_directory(directory: Path, pin: _RunDirPin | None) -> int:
+    """The dir-fd arm's descriptor for a sidecar's ``directory``.
+
+    Under a ``pin`` it is reached from the run dir, which is opened and compared
+    against its MINT-TIME record, by an ``O_NOFOLLOW`` walk
+    (`platform_util.open_dir_confined`, DW-500): an ``O_NOFOLLOW`` open of the
+    whole path refuses a link only at its final component, so ``runs/`` swapped
+    for a link to a tree holding a real ``<id>/`` carried the sidecar outside the
+    run, and the post-publication ``lstat`` compare followed the same link. A
+    missing record refuses. Without a pin (the restore's staging file in the
+    target repository) the leaf-``O_NOFOLLOW`` open stands."""
+    if pin is None:
+        return os.open(directory, os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0))
+    fd = open_dir_confined(pin.run_dir, directory, root_identity=pin.identity)
+    if fd is None:
+        raise IntegrationEvidenceError(
+            "target integration snapshot directory is missing or redirected"
+        )
+    return fd
 
 
 def _stream_snapshot(
@@ -643,9 +801,33 @@ def _stream_snapshot(
     *,
     max_bytes: int | None = None,
     source_root: Path | None = None,
+    pin: _RunDirPin | None = None,
 ) -> tuple[int, str]:
-    """Publish one file sidecar atomically while keeping memory usage bounded."""
+    """Publish one file sidecar atomically while keeping memory usage bounded.
+
+    ``pin`` holds a destination under the run dir to the run dir's MINT-TIME
+    identity (DW-500): the capture passes it, the restore — whose destination is
+    in the target repository — does not. See `_open_snapshot_directory`."""
     if not DIR_FD_ANCHORED_WRITES:
+        # Check-then-write pin of the orchestrator-minted snapshot dir (DW-338).
+        # Narrower than `_snapshot_bytes`'s fallback, whose confined writer is
+        # handle-anchored wherever HANDLE_ANCHORED_WRITES holds: this arm is
+        # path-based, so a link planted between this check and `mkstemp` still
+        # redirects the staging file. (A swap after `mkstemp` makes the
+        # path-based `os.replace` miss its source and fail.) Under a `pin` the
+        # run dir is compared against its mint-time record rather than a fresh
+        # `lstat` — which follows a swapped ancestor — and every component below
+        # it must be a real directory (DW-500).
+        if pin is not None:
+            _require_run_dir_pinned(pin)
+            if not path_is_confined(pin.run_dir, destination.parent):
+                raise IntegrationEvidenceError(
+                    "target integration snapshot directory is missing or redirected"
+                )
+        elif pinned_root_identity(destination.parent) is None:
+            raise IntegrationEvidenceError(
+                "target integration snapshot directory is missing or redirected"
+            )
         fd, temporary = tempfile.mkstemp(prefix=".capture-", dir=destination.parent)
         digest = hashlib.sha256()
         size = 0
@@ -681,10 +863,7 @@ def _stream_snapshot(
             except FileNotFoundError:
                 pass
         return size, digest.hexdigest()
-    root_fd = os.open(
-        destination.parent,
-        os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
-    )
+    root_fd = _open_snapshot_directory(destination.parent, pin)
     temporary = f".capture-{os.getpid():x}-{os.urandom(6).hex()}"
     fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=root_fd)
     source_fd = -1
@@ -749,14 +928,25 @@ def _stream_snapshot(
     return size, digest.hexdigest()
 
 
-def _snapshot_bytes(data: bytes, destination: Path) -> tuple[int, str]:
+def _snapshot_bytes(data: bytes, destination: Path, pin: _RunDirPin) -> tuple[int, str]:
+    """Publish one in-memory sidecar under the run dir, pinned to the run dir's
+    MINT-TIME identity (DW-500; see `_open_snapshot_directory`)."""
     if not DIR_FD_ANCHORED_WRITES:
-        atomic_write_bytes_confined(destination, data, confine_root=destination.parent)
+        # Pinned like the POSIX arm's confined root open below: the snapshot
+        # directory is orchestrator-minted, so a linked one is refused (DW-338),
+        # and the run dir above it is compared against its mint-time record
+        # rather than a fresh `lstat`, which follows a swapped ancestor (DW-500).
+        # The confined writer walks every component from the run dir down.
+        try:
+            atomic_write_bytes_confined(
+                destination, data, confine_root=pin.run_dir, root_identity=pin.identity
+            )
+        except UnconfinedWriteError as exc:
+            raise IntegrationEvidenceError(
+                "target integration snapshot directory is missing or redirected"
+            ) from exc
         return len(data), hashlib.sha256(data).hexdigest()
-    root_fd = os.open(
-        destination.parent,
-        os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
-    )
+    root_fd = _open_snapshot_directory(destination.parent, pin)
     temporary = f".capture-{os.getpid():x}-{os.urandom(6).hex()}"
     fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=root_fd)
     try:
@@ -1143,6 +1333,7 @@ def _capture_integration_state_into(
     root: Path,
     paths: Iterable[str],
     *,
+    pin: _RunDirPin,
     payload_max_bytes: int | None,
 ) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
     snapshots: list[dict[str, object]] = []
@@ -1241,7 +1432,7 @@ def _capture_integration_state_into(
         sidecar = root / name
         if S_ISLNK(mode):
             target_bytes = os.readlink(os.fsencode(candidate))
-            size, digest = _snapshot_bytes(target_bytes, sidecar)
+            size, digest = _snapshot_bytes(target_bytes, sidecar, pin)
             total_bytes += size
             if payload_max_bytes is not None and total_bytes > payload_max_bytes:
                 raise IntegrationEvidenceError(
@@ -1272,6 +1463,7 @@ def _capture_integration_state_into(
             sidecar,
             max_bytes=remaining,
             source_root=repo,
+            pin=pin,
         )
         total_bytes += size
         if payload_max_bytes is not None and total_bytes > payload_max_bytes:
@@ -1350,7 +1542,7 @@ def _capture_integration_state_into(
                 "path": rel,
                 "head": rev_parse_head(checkout),
                 **_captured_gitlink_entry(_index_state(repo, rel)),
-                "ignored": _seal_ignored_entries(checkout, run_dir, root / name, own_records=False),
+                "ignored": _seal_ignored_entries(checkout, pin, root / name, own_records=False),
             }
         )
     return snapshots, submodules
@@ -1377,16 +1569,24 @@ def capture_integration_state(
     operation_identity: str,
     paths: Iterable[str],
     *,
+    run_dir_identity: RootIdentityRecord | None,
     payload_max_bytes: int | None = None,
 ) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
-    """Capture complete reversible non-ref state into streamed run sidecars."""
-    root = _integration_snapshot_root(run_dir, operation_identity)
+    """Capture complete reversible non-ref state into streamed run sidecars.
+
+    ``run_dir_identity`` is ``RunState.run_dir_identity``, the run dir's MINT-TIME
+    record (DW-446): the capture root and every sidecar are pinned to it (DW-500),
+    so ``runs/`` or the run dir swapped for a link after the mint refuses, and a
+    missing record (a legacy state not yet backfilled on resume/re-arm) refuses."""
+    pin = _run_dir_pin(run_dir, run_dir_identity)
+    root = _integration_snapshot_root(run_dir, operation_identity, pin)
     try:
         return _capture_integration_state_into(
             repo,
             run_dir,
             root,
             paths,
+            pin=pin,
             payload_max_bytes=payload_max_bytes,
         )
     except BaseException:
@@ -1947,7 +2147,10 @@ def _git_env(repo: Path, *args: str, env: dict[str, str]) -> tuple[int, str]:
 
 
 def git_bytes(
-    repo: Path, *args: str, timeout_s: int | None = None
+    repo: Path,
+    *args: str,
+    timeout_s: int | None = None,
+    env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[bytes]:
     """Run one `git -C <repo> …` through the chokepoint, capturing raw BYTES.
 
@@ -1969,8 +2172,13 @@ def git_bytes(
     caller whose surface must not appear hung, the shorter per-call `timeout_s`
     (#390). The two faults with no rc to return still raise — a timeout as
     `GitError`, a spawn failure as `GitSpawnError` — since neither can be
-    expressed as a `CompletedProcess`."""
-    return _run_git(["git", "-C", str(repo), *args], repo, binary=True, timeout_s=timeout_s)
+    expressed as a `CompletedProcess`.
+
+    `env` is opt-in and mirrors `_git_out`'s: it replaces the inherited
+    environment for this one child (`LC_ALL=C` still merged on top)."""
+    return _run_git(
+        ["git", "-C", str(repo), *args], repo, binary=True, timeout_s=timeout_s, env=env
+    )
 
 
 def git_version_at_least(reported: str, want: tuple[int, int]) -> bool:
@@ -3279,7 +3487,11 @@ def _lstat_identity(repo: Path, path: str) -> str | None:
 
 
 def capture_ignored_entries(
-    repo: Path, run_dir: Path, operation_identity: str
+    repo: Path,
+    run_dir: Path,
+    operation_identity: str,
+    *,
+    run_dir_identity: RootIdentityRecord | None,
 ) -> dict[str, object]:
     """The receipt's evidence for the ignored entries of the whole tree.
 
@@ -3295,22 +3507,26 @@ def capture_ignored_entries(
     size and digest — so that after the hooks every ignored entry not on it,
     or on it under another identity, can be NAMED
     (`integrated_ignored_additions`).
+
+    The sidecar is pinned, as `capture_integration_state`'s are, to
+    ``run_dir_identity`` — the run dir's MINT-TIME record (DW-500).
     """
     root = _owned_integration_snapshot_root(run_dir, operation_identity)
-    return _seal_ignored_entries(repo, run_dir, root / _IGNORED_ENTRIES_SIDECAR)
+    pin = _run_dir_pin(run_dir, run_dir_identity)
+    return _seal_ignored_entries(repo, pin, root / _IGNORED_ENTRIES_SIDECAR)
 
 
 def _seal_ignored_entries(
-    repo: Path, run_dir: Path, sidecar: Path, *, own_records: bool = True
+    repo: Path, pin: _RunDirPin, sidecar: Path, *, own_records: bool = True
 ) -> dict[str, object]:
     """Seal `ignored_entries` of ``repo`` into ``sidecar``; the receipt's record of it."""
     data = b"\0".join(
         os.fsencode(path) + b"\0" + identity.encode("ascii")
         for path, identity in ignored_entries(repo, own_records=own_records).items()
     )
-    size, digest = _snapshot_bytes(data, sidecar)
+    size, digest = _snapshot_bytes(data, sidecar, pin)
     return {
-        "sidecar": sidecar.relative_to(run_dir).as_posix(),
+        "sidecar": sidecar.relative_to(pin.run_dir).as_posix(),
         "size": size,
         "sha256": digest,
     }
@@ -4503,7 +4719,7 @@ def last_commit_for(repo: Path, path: Path) -> str:
     return out
 
 
-def worktree_clean(repo: Path) -> bool:
+def worktree_clean(repo: Path, *, project: Path | None = None) -> bool:
     """True when the tree holds no change git would report.
 
     The orchestrator's own config file (.bmad-loop/policy.toml) is excluded: the TUI
@@ -4511,6 +4727,12 @@ def worktree_clean(repo: Path) -> bool:
     tree" that blocks run/sweep/validate or forces a commit. Scope is policy.toml only
     — the deferred-work ledger also lives under .bmad-loop/ and is meant to be
     committed (see sweep._commit_ledger).
+
+    The file lives under the BMAD PROJECT, which a `repo_root:` override can nest
+    below `repo` (DW-379): pass ``project`` and the exclusion is spelled at the
+    project's offset inside `repo` (``app/.bmad-loop/policy.toml``), so probing the
+    code root still ignores a settings edit. Without it, or when the project is
+    `repo` itself or lies outside it, the exclusion is repo-relative as before.
 
     Reads `stdout` ALONE rather than `_git`'s stdout+stderr merge, for the reason
     :func:`path_tracked` spells out: `status` exits 0 while still writing to stderr (a
@@ -4530,7 +4752,7 @@ def worktree_clean(repo: Path) -> bool:
             "--porcelain",
             "--",
             ".",
-            f":(exclude){POLICY_FILE_REL}",
+            f":(exclude){_project_policy_rel(repo, project)}",
         ],
         repo,
     )
@@ -4540,7 +4762,19 @@ def worktree_clean(repo: Path) -> bool:
     return proc.stdout.strip() == ""
 
 
-def path_clean(repo: Path, rel: str) -> bool:
+def _project_policy_rel(repo: Path, project: Path | None) -> str:
+    """The project's policy.toml spelled relative to `repo`, for a pathspec: the
+    project's offset prefixed onto :data:`POLICY_FILE_REL` when the project is nested
+    below `repo`, :data:`POLICY_FILE_REL` itself otherwise (no project given, the
+    default `repo == project`, or a project outside `repo`, whose file no pathspec
+    rooted at `repo` can name). Lexical, over the spellings the caller hands in."""
+    offset = None if project is None else project_offset(project, repo)
+    if offset is None or offset == ".":
+        return POLICY_FILE_REL
+    return f"{offset}/{POLICY_FILE_REL}"
+
+
+def path_clean(repo: Path, rel: str, *, env: dict[str, str] | None = None) -> bool:
     """True when nothing under the single pathspec `rel` (relative to `repo`)
     differs from HEAD — the NARROW sibling of :func:`worktree_clean`.
 
@@ -4562,7 +4796,23 @@ def path_clean(repo: Path, rel: str) -> bool:
     merged stream that chatter is indistinguishable from a porcelain record — a
     clean path would answer DIRTY on a noisy host, and every already-clean publish
     would then stage and re-interrogate a file it had nothing to say about. The
-    error path keeps the merge, where stderr is the informative half."""
+    error path keeps the merge, where stderr is the informative half.
+
+    A failure with a STDERR line that STARTS with git's repository-discovery prefix,
+    `fatal: not a git repository (or any ` — the "(or any of the parent
+    directories)" and "(or any parent up to mount point ...)" forms — raises
+    :class:`GitNotARepositoryError` with the same message; every other failure stays
+    a plain `GitError` (DW-336). The text is stable because `_run_git` pins
+    `LC_ALL=C`, and it is matched at the start of a stderr line alone, so neither a
+    porcelain record nor operator path text quoted mid-line (`cannot change to
+    '<repo>'`) can forge it. The match is deliberately that narrow: a broken gitfile
+    (`not a git repository: <path>`) or a `safe.directory` refusal is a real
+    repository's fault, which a caller that degrades on an absent repository must
+    still see.
+
+    ``env`` is opt-in (default: the inherited environment); the bound
+    publication passes `_bound_git_env()` so the status compares against raw
+    objects rather than `git replace` substitutes (DW-399)."""
     # A resolved symlink target may have any basename, including pathspec magic.
     # Match commit_paths' literal scope and include new publications even when
     # the operator hides untracked files in their interactive status display.
@@ -4578,9 +4828,12 @@ def path_clean(repo: Path, rel: str) -> bool:
             *_literal_specs([rel]),
         ],
         repo,
+        env=env,
     )
     if proc.returncode != 0:
         merged = (proc.stdout + proc.stderr).strip()
+        if any(line.startswith(_NOT_A_REPOSITORY_PREFIX) for line in proc.stderr.splitlines()):
+            raise GitNotARepositoryError(f"git status failed in {repo}: {merged}")
         raise GitError(f"git status failed in {repo}: {merged}")
     return proc.stdout.strip() == ""
 
@@ -4984,13 +5237,18 @@ def attempt_dirty(
     return bool(created)
 
 
-def _entry_at_revision(repo: Path, revision: str, rel: str) -> tuple[str, str, str] | None:
+def _entry_at_revision(
+    repo: Path, revision: str, rel: str, *, env: dict[str, str] | None = None
+) -> tuple[str, str, str] | None:
     """Return ``(mode, type, oid)`` for one literal path at ``revision``.
 
     ``ls-tree`` gives absence as an empty successful result while keeping an
     invalid revision or object-database fault as a non-zero command. That
     distinction is load-bearing for recovery: absence is a proven baseline
     ownership state; a Git failure is not authority to reset.
+
+    ``env`` is opt-in (default: the inherited environment); the bound
+    publication passes `_bound_git_env()` so the read sees raw objects.
     """
     proc = _run_git(
         [
@@ -5006,6 +5264,7 @@ def _entry_at_revision(repo: Path, revision: str, rel: str) -> tuple[str, str, s
         ],
         repo,
         binary=True,
+        env=env,
     )
     if proc.returncode != 0:
         detail = (proc.stdout + proc.stderr).decode("utf-8", "replace").strip()
@@ -5081,16 +5340,22 @@ def worktree_file_bytes_at_revision(repo: Path, revision: str, rel: str) -> byte
     return proc.stdout
 
 
-def path_has_non_tree_ancestor_at_revision(repo: Path, revision: str, rel: str) -> bool:
+def path_has_non_tree_ancestor_at_revision(
+    repo: Path, revision: str, rel: str, *, env: dict[str, str] | None = None
+) -> bool:
     """Whether a parent of ``rel`` is a tracked non-directory at ``revision``.
 
     Resetting such a baseline can replace a currently real directory with a
     symlink, file, or submodule. A pre-reset canonical child path is therefore no
     longer safe restoration authority after the reset.
+
+    ``env`` is opt-in (default: the inherited environment) and is forwarded to
+    each `_entry_at_revision` read; the bound publication passes
+    `_bound_git_env()` so the probe sees raw objects (DW-399).
     """
     parts = Path(rel).parts
     for end in range(1, len(parts)):
-        entry = _entry_at_revision(repo, revision, Path(*parts[:end]).as_posix())
+        entry = _entry_at_revision(repo, revision, Path(*parts[:end]).as_posix(), env=env)
         if entry is not None and entry[1] != "tree":
             return True
     return False
@@ -5958,6 +6223,40 @@ def prune_preserve_dirty_refs(repo: Path, keep: int) -> list[str]:
     )
 
 
+MERGE_PREFLIGHT_PRESERVE_PREFIX = "refs/merge-preflight-preserve/"
+
+
+def prune_merge_preflight_preserve_refs(repo: Path, keep: int) -> list[str]:
+    """Bounded retention for the ``refs/merge-preflight-preserve/*`` snapshots that
+    :func:`apply_incoming_collision_plan` parks before restoring an operator's
+    uncommitted edit to a tracked incoming path (DW-356). The same contract as
+    :func:`prune_preserve_dirty_refs` — keep the ``keep`` newest by committer
+    date, ``update-ref -d`` the tail, report full refnames — over its OWN prefix,
+    so a project minting one ref per merge (a ``per_worktree`` Editor leaking
+    tracked ``.meta`` rewrites) never crowds rollback evidence out of the
+    ``refs/attempt-preserve-dirty/`` budget. Only
+    ``refs/merge-preflight-preserve/`` is ever listed. ``keep <= 0`` means
+    "never prune" — returns ``[]`` without running git.
+
+    Raises :class:`GitError` when the listing fails, or
+    :class:`PrunePreserveError` on a partial delete failure; see
+    :func:`_prune_refs` for the best-effort contract."""
+
+    def _delete(refname: str) -> None:
+        rc, out = _git(repo, "update-ref", "-d", refname)
+        if rc != 0:
+            raise GitError(f"git update-ref -d {refname} failed in {repo}: {out}")
+
+    return _prune_refs(
+        repo,
+        keep,
+        MERGE_PREFLIGHT_PRESERVE_PREFIX,
+        label="merge-preflight-preserve",
+        strip="",
+        delete=_delete,
+    )
+
+
 def snapshot_worktree(
     repo: Path,
     ref_name: str,
@@ -6738,7 +7037,15 @@ def plan_incoming_collisions(
     re-creates the canonical versions.
 
     Guard: only paths that lie within the branch's incoming set are cleaned. A dirty
-    path *outside* that set is real operator work and is never touched. Whether it also
+    path *outside* that set is real operator work and is never touched. A dirty path
+    INSIDE the set is cleaned whoever wrote it — an Editor leak and an operator's own
+    uncommitted edit to a file the branch also changes read the same — so a TRACKED
+    one is parked before it is restored: :func:`apply_incoming_collision_plan` first
+    commits the working-tree bytes of every tracked cleaned path to one snapshot under
+    ``refs/merge-preflight-preserve/<sha>`` and only then checks them out, refusing
+    (:class:`MergePreflightPreserveError`) with nothing mutated when it cannot
+    (DW-356). An untracked cleaned path is the Editor's duplicate of a file the branch
+    adds and is deleted as before. Whether a stray outside the set also
     BLOCKS the merge is decided per path by the INDEX column, not by trackedness
     (#618): the merge writes only paths that differ between `target` and `branch`, so
     a stray git has nothing staged for — untracked, or tracked and edited in the
@@ -6846,14 +7153,128 @@ def plan_incoming_collisions(
     )
 
 
+def _preserve_collision_paths(repo: Path, paths: list[str]) -> str | None:
+    """Park the working-tree bytes of the tracked ``paths`` in one snapshot commit
+    and return the ``refs/merge-preflight-preserve/<sha>`` ref naming it, or
+    ``None`` when there is nothing to park (DW-356).
+
+    :func:`snapshot_worktree`'s mechanism scoped to exactly these paths: a
+    throwaway ``GIT_INDEX_FILE`` seeded ``read-tree HEAD``, the paths staged into
+    it, ``write-tree``, and ``commit-tree -p HEAD`` under the synthetic
+    ``bmad-loop`` identity — the real index and working tree are never touched.
+    A path present on disk is staged with ``add -f`` over its literal pathspec, so
+    a staged-added path that ``.gitignore`` matches is parked rather than refused;
+    a path the operator deleted is dropped from the temp index
+    (``rm --cached --ignore-unmatch``), since ``add`` of a pathspec matching
+    nothing on disk or in the temp index (a staged-add later deleted) is an error,
+    and the ref then simply lacks it — nothing to recover.
+
+    A snapshot tree equal to HEAD's (a staged-only dirty path whose working tree
+    matches HEAD) holds no operator bytes: no commit, no ref, ``None``. The ref is
+    created must-not-exist (``update-ref <ref> <sha> ""``); a ref already holding
+    exactly this commit — only a same-second replay of identical bytes can mint
+    one — is the same evidence and accepted.
+
+    Values are read through ``_git_out`` (stdout only, #442). Raises
+    :class:`GitError` on any git failure and lets the temp directory's ``OSError``
+    through; the caller mutates nothing until this returns."""
+    head = rev_parse_head(repo)
+    present = [p for p in paths if os.path.lexists(repo / p)]
+    absent = [p for p in paths if p not in present]
+    with tempfile.TemporaryDirectory() as td:
+        env = {**os.environ, "GIT_INDEX_FILE": str(Path(td) / "index")}
+        rc, out = _git_env(repo, "read-tree", head, env=env)
+        if rc != 0:
+            raise GitError(f"git read-tree (merge pre-flight snapshot) failed in {repo}: {out}")
+        if present:
+            # core.safecrlf=false: a mixed-EOL edit under autocrlf+safecrlf=true is
+            # refused by `add` (rc 128) though `checkout --` would restore it fine.
+            rc, out = _git_env(
+                repo,
+                "-c",
+                "core.safecrlf=false",
+                "add",
+                "-f",
+                "--",
+                *_literal_specs(present),
+                env=env,
+            )
+            if rc != 0:
+                raise GitError(f"git add (merge pre-flight snapshot) failed in {repo}: {out}")
+        if absent:
+            rc, out = _git_env(
+                repo,
+                "rm",
+                "-q",
+                "--cached",
+                "--ignore-unmatch",
+                "--",
+                *_literal_specs(absent),
+                env=env,
+            )
+            if rc != 0:
+                raise GitError(
+                    f"git rm --cached (merge pre-flight snapshot) failed in {repo}: {out}"
+                )
+        rc, tree, detail = _git_out(repo, "write-tree", env=env)
+        if rc != 0:
+            raise GitError(f"git write-tree (merge pre-flight snapshot) failed in {repo}: {detail}")
+    rc, head_tree, detail = _git_out(repo, "rev-parse", f"{head}^{{tree}}")
+    if rc != 0:
+        raise GitError(f"git rev-parse {head}^{{tree}} failed in {repo}: {detail}")
+    if tree == head_tree:
+        return None  # the working tree already matches HEAD at every path — no bytes to park
+    ident = {
+        **os.environ,
+        "GIT_AUTHOR_NAME": "bmad-loop",
+        "GIT_AUTHOR_EMAIL": "bmad-loop@localhost",
+        "GIT_COMMITTER_NAME": "bmad-loop",
+        "GIT_COMMITTER_EMAIL": "bmad-loop@localhost",
+    }
+    rc, snap, detail = _git_out(
+        repo,
+        "commit-tree",
+        tree,
+        "-p",
+        head,
+        "-m",
+        "merge pre-flight snapshot of uncommitted edits to incoming paths",
+        env=ident,
+    )
+    if rc != 0:
+        raise GitError(f"git commit-tree (merge pre-flight snapshot) failed in {repo}: {detail}")
+    ref = f"{MERGE_PREFLIGHT_PRESERVE_PREFIX}{snap}"
+    rc, out = _git(repo, "update-ref", ref, snap, "")
+    if rc != 0:
+        rc_existing, existing, _detail = _git_out(repo, "rev-parse", "-q", "--verify", ref)
+        if rc_existing != 0 or existing != snap:
+            raise GitError(f"git update-ref {ref} failed in {repo}: {out}")
+    return ref
+
+
 def apply_incoming_collision_plan(
     repo: Path,
     plan: IncomingCollisionPlan,
     *,
     before_mutate: Callable[[str], bool] | None = None,
     progress: list[str] | None = None,
+    on_preserved: Callable[[str, list[str]], None] | None = None,
 ) -> list[str]:
     """Apply an already snapshotted collision plan without widening its paths.
+
+    Park, then restore (DW-356). A tracked cleaned path is restored with
+    ``git checkout -- <path>``, and it may hold an operator's uncommitted edit to
+    a file the branch also changes rather than an Editor leak — without a ref
+    those bytes would be gone, never committed, with nothing to read them back
+    from. So after the re-read and parent resolution below and before the first
+    ``before_mutate``/``progress``/mutation, the working-tree bytes of EVERY
+    tracked cleaned path are parked in one snapshot commit under
+    ``refs/merge-preflight-preserve/<sha>`` (:func:`_preserve_collision_paths`),
+    and ``on_preserved``, when given, is called once with ``(ref, paths)``. A plan
+    with no tracked paths, or whose tracked paths already match HEAD in the working
+    tree, makes no ref and no call. When the snapshot cannot be made (``GitError``
+    or ``OSError``) this raises :class:`MergePreflightPreserveError` with the
+    checkout untouched and ``progress`` empty.
 
     ``progress``, when given, receives each path as it is TAKEN UP — after its
     ``before_mutate`` reading passed and before its first mutation — so a caller
@@ -6894,6 +7315,14 @@ def apply_incoming_collision_plan(
                 f"{repo / path}"
             )
         prune_starts[path] = parent
+    tracked_cleaned = [path for path in plan.cleaned if path not in untracked]
+    if tracked_cleaned:
+        try:
+            ref = _preserve_collision_paths(repo, tracked_cleaned)
+        except (GitError, OSError) as exc:
+            raise MergePreflightPreserveError(tracked_cleaned, str(exc)) from exc
+        if ref is not None and on_preserved is not None:
+            on_preserved(ref, tracked_cleaned)
     cleaned: list[str] = []
     for path in plan.cleaned:
         if before_mutate is not None and not before_mutate(path):
@@ -6922,8 +7351,10 @@ def clean_incoming_collisions(
     *,
     protected: tuple[str, ...] = (),
     on_tolerated: Callable[[list[str]], None] | None = None,
+    on_preserved: Callable[[str, list[str]], None] | None = None,
 ) -> list[str]:
-    """Compatibility wrapper that plans and immediately applies cleanup."""
+    """Compatibility wrapper that plans and immediately applies cleanup;
+    ``on_preserved`` is forwarded to :func:`apply_incoming_collision_plan`."""
     plan = plan_incoming_collisions(
         repo,
         target,
@@ -6931,7 +7362,7 @@ def clean_incoming_collisions(
         protected=protected,
         on_tolerated=on_tolerated,
     )
-    return apply_incoming_collision_plan(repo, plan)
+    return apply_incoming_collision_plan(repo, plan, on_preserved=on_preserved)
 
 
 def _merge_in_progress(repo: Path) -> tuple[bool, GitError | None]:
@@ -7671,7 +8102,14 @@ def capture_diff(repo: Path, baseline: str, *, max_file_bytes: int | None = None
     return "".join(parts)
 
 
-def set_frontmatter_field(path: Path, key: str, value: str, *, confine_root: Path) -> bool:
+def set_frontmatter_field(
+    path: Path,
+    key: str,
+    value: str,
+    *,
+    confine_root: Path,
+    root_identity: os.stat_result | None = None,
+) -> bool:
     """Rewrite (or insert) a scalar ``<key>:`` line in a spec's `---`…`---`
     frontmatter block.
 
@@ -7706,7 +8144,9 @@ def set_frontmatter_field(path: Path, key: str, value: str, *, confine_root: Pat
     identically. ``confine_root`` is required for the reason it is required
     there. So is ``require_writable_target=True`` (#597): this rewrites an
     operator-editable spec, and a read-only one is answered rather than routed
-    around by a replace that only needs the directory writable.
+    around by a replace that only needs the directory writable. ``root_identity``
+    pins ``confine_root`` on the terms stated there: forwarded on the confined arm
+    (DW-423), pre-checked on the external arm (DW-445).
 
     Use the BYTES helper and not the text one:
     `atomic_write_text` keeps ``Path.write_text``'s translating newline default,
@@ -7725,9 +8165,14 @@ def set_frontmatter_field(path: Path, key: str, value: str, *, confine_root: Pat
     payload = (before + edited + after).encode("utf-8")
     if path.is_relative_to(confine_root):
         atomic_write_bytes_confined(
-            path, payload, confine_root=confine_root, require_writable_target=True
+            path,
+            payload,
+            confine_root=confine_root,
+            require_writable_target=True,
+            root_identity=root_identity,
         )
     else:
+        platform_util.require_root_pinned(confine_root, root_identity)
         atomic_write_bytes(path, payload, follow_symlinks=False, require_writable_target=True)
     return True
 
@@ -8052,17 +8497,17 @@ def _verify_shared_gates(
     # `paths.project`. Both baseline writers stamp `workspace.root`
     # (`Engine._dev_phase`, `SweepEngine`'s migration task) and re-arm now does the
     # same, and `Workspace.default` sets `root = paths.repo_root` while
-    # `ProjectPaths.rebased` sets both roots to the worktree — so `repo_root` is
+    # `ProjectPaths.rebased` sets `repo_root` to the worktree — so `repo_root` is
     # the one root that names the same repository as the recorded baseline in every
-    # configuration. Under the `repo_root` override (`isolation = "none"` plus a
-    # `repo_root:` config key, the only shape where the two differ —
-    # `bmadconfig.worktree_isolation_conflict` refuses the other) the session's cwd
-    # IS the code tree, so a `project`-anchored probe judged a tree the session never
-    # touched. WHICH probe burned the attempt depends on the layout, and the burn is
-    # not the proof-of-work probe in both: `_changes_since` answers `None` when git
-    # will not run, and the gate arm below accepts anything that is not a positive
-    # "nothing changed" (`is False`), so wherever `project` is not a checkout the
-    # failing git call PASSES that gate. Nested
+    # configuration. Under a `repo_root:` override (the only shape where the two
+    # differ — in place, or under worktree isolation with the project nested in
+    # `repo_root`, where the rebased project is the mount's `<worktree>/<offset>`,
+    # DW-379) the session's cwd IS the code tree, so a `project`-anchored probe
+    # judged a tree the session never touched. WHICH probe burned the attempt
+    # depends on the layout, and the burn is not the proof-of-work probe in both:
+    # `_changes_since` answers `None` when git will not run, and the gate arm below
+    # accepts anything that is not a positive "nothing changed" (`is False`), so
+    # wherever `project` is not a checkout the failing git call PASSES that gate. Nested
     # (`project` a subdirectory of the code tree) the call succeeds but is scoped to
     # that subdirectory, and the "no changes" forever-burn is real. Disjoint
     # (`project` beside the checkout) git fails and the burn moves to the probes that
@@ -8747,6 +9192,12 @@ class CommandResult:
     LAST and defaulted because the construction sites pass three to seven
     POSITIONAL arguments; a field inserted anywhere else would silently re-bind
     them.
+
+    ``interrupted`` marks a result a HARD stop request cut short (DW-353): the
+    command was killed mid-run, or never spawned because an earlier command was
+    already interrupted. It is not a verdict on the command — never a failure,
+    an env fault or a retry — and it now sits after ``spawn_error`` for the same
+    positional reason. Its rc is :data:`INTERRUPTED_RC`.
     """
 
     command: str
@@ -8757,6 +9208,17 @@ class CommandResult:
     stdout_full_bytes: int | None = None
     stderr_full_bytes: int | None = None
     spawn_error: str | None = None
+    interrupted: bool = False
+
+
+class VerifyInterrupted(Exception):
+    """An interrupted :class:`CommandResult` reached the classifier.
+
+    The engine turns an interrupted verify pass into ``RunStopped`` right after
+    journaling it, before any decision is taken, so reaching
+    :func:`verify_command_results_outcome` with one is a missed boundary. This
+    is the fail-loud backstop: an interrupted pass classified as a failure would
+    dispatch a repair, and as a pass would commit unverified work."""
 
 
 # The synthetic return code on a result whose child never started.
@@ -8780,6 +9242,15 @@ class CommandResult:
 # exists so the journal record and the plugin payload carry an rc that no real
 # child could have produced.
 SPAWN_FAULT_RC = -1000
+
+# The synthetic return code on a result a hard stop request cut short (DW-353):
+# its child was killed by the stop, or never spawned because an earlier command
+# already was. Same magnitude argument as ``SPAWN_FAULT_RC`` — outside every
+# signal death — and distinct from both it (``-1000``) and the timeout leg's
+# ``-1``, so no reader keying on the rc can read an interrupted command as one
+# that never started or one that hung. ``interrupted`` is the discriminator the
+# engine keys on; this code is what the journal record carries beside it.
+INTERRUPTED_RC = -1001
 
 # The sink a caller hands :func:`verify_commands_outcome` to observe the results
 # it is about to classify — the engine journals review-gate results through it.
@@ -8918,10 +9389,39 @@ def _win32_env_fault_reason(result: CommandResult, cwd: Path) -> str | None:
     return None
 
 
-def env_fault_reason(result: CommandResult, cwd: Path) -> str | None:
+def _env_fault_cause(
+    result: CommandResult, cwd: Path, *, env_fault_rc: int = 0
+) -> tuple[str, str] | None:
+    """``(cause, reason)`` for a verify command that is an environment fault, or
+    None. ``cause`` is the :attr:`VerifyOutcome.env_fault_cause` vocabulary bar
+    ``"probe"`` (a probe is not a verify command); ``reason`` is what
+    :func:`env_fault_reason` reports.
+
+    Order: spawn -> declared-rc -> shell-rc -> cmd. A spawn fault has no rc to
+    read (see :func:`env_fault_reason`). The declared code outranks 126/127
+    because an operator who set ``env_fault_rc = 127`` has said what 127 means
+    for their commands, and it outranks the win32 arm because cmd exits 1 for a
+    missing tool, so a declared 1 would otherwise be reported as cmd's guess."""
+    if result.spawn_error is not None:
+        return "spawn", result.spawn_error
+    if env_fault_rc and result.returncode == env_fault_rc:
+        return "declared-rc", f"rc={result.returncode}, [verify] env_fault_rc"
+    if result.returncode in ENV_FAULT_RCS:
+        return "shell-rc", f"rc={result.returncode}"
+    if sys.platform != "win32":
+        return None
+    reason = _win32_env_fault_reason(result, cwd)
+    return None if reason is None else ("cmd", reason)
+
+
+def env_fault_reason(result: CommandResult, cwd: Path, *, env_fault_rc: int = 0) -> str | None:
     """Why this verify command is an environment fault rather than a story
     failure, or None if it is not one. Per-shell: verify commands run through
     the host shell, and sh and cmd signal a broken environment differently.
+
+    ``env_fault_rc`` is the operator's declared code (``[verify] env_fault_rc``,
+    DW-523): a command exiting with it is an environment fault whatever the
+    shell. 0 disables it, leaving only the shell's own signals.
 
     ``spawn_error`` is answered FIRST and unconditionally, before any rc reading
     and before the win32 probe. Not merely an ordering preference: the probe
@@ -8930,49 +9430,21 @@ def env_fault_reason(result: CommandResult, cwd: Path) -> str | None:
     directory nothing ever entered and cannot speak to why. The result also
     carries no exit status to read (see :data:`SPAWN_FAULT_RC`), which is why
     the rc arms cannot classify it either."""
-    if result.spawn_error is not None:
-        return result.spawn_error
-    if result.returncode in ENV_FAULT_RCS:
-        return f"rc={result.returncode}"
-    if sys.platform != "win32":
-        return None
-    return _win32_env_fault_reason(result, cwd)
+    found = _env_fault_cause(result, cwd, env_fault_rc=env_fault_rc)
+    return None if found is None else found[1]
 
 
 def _timeout_stream(value: str | bytes | None) -> str:
-    """Normalize optional timeout output into what the completed path would give.
+    """Normalize optional timeout output — see :func:`childrun.timeout_stream`,
+    where the normalisation moved with the runner (DW-353).
 
-    ``subprocess.run``'s timeout leg is not uniform, so three shapes arrive:
-
-    * ``bytes`` — POSIX. ``Popen._communicate`` raises ``TimeoutExpired`` from
-      ``_check_timeout`` with the raw chunks joined, *before* the text-mode
-      decode that ends the loop, so ``text=True`` never touched them.
-    * ``str`` — Windows, where ``run`` calls ``communicate()`` after ``kill()``
-      and the text wrapper has already decoded. Load-bearing: on that platform
-      this branch is the only way the output arrives at all.
-    * ``None`` — POSIX again, when nothing had been buffered on that stream.
-
-    So the bytes branch has to reproduce what text mode would have done to them,
-    which is exactly ``Popen._translate_newlines``: decode, then collapse ``\\r\\n``
-    and lone ``\\r`` to ``\\n``. Doing neither made the same bytes read back
-    differently depending on which path produced them — under an ASCII locale
-    ``b"caf\\xc3\\xa9\\r\\n"`` completed as ``"caf\\ufffd\\ufffd\\n"`` but timed out
-    as ``"café\\r\\n"``. The codec half also contradicted
-    :func:`run_verify_commands`' own rule (#378) that host-tool output stays on
-    the locale codec: ``locale.getpreferredencoding(False)`` is what ``text=True``
-    resolves for an unset ``encoding`` — deliberately not ``locale.getencoding()``,
-    which disagrees with it under UTF-8 mode (PEP 540), a mode the C/POSIX locale
-    enables by itself. ``errors="replace"`` for the reason the completed path uses
-    it: one undecodable byte must not raise and lose every result.
-
-    The str branch is left alone: its newlines were translated by the text
-    wrapper the reader thread read through, so there is nothing left to collapse."""
-    if value is None:
-        return ""
-    if isinstance(value, bytes):
-        decoded = value.decode(locale.getpreferredencoding(False), errors="replace")
-        return decoded.replace("\r\n", "\n").replace("\r", "\n")
-    return value
+    Only tests reach this name now; no production caller does. A timed-out
+    command's output normally comes from the completed post-kill
+    ``communicate`` inside ``childrun.run_child``, which is already text-mode
+    decoded. ``childrun.timeout_stream`` runs only on that runner's drain-timeout
+    arm — a straggler still holding a pipe past ``childrun.DRAIN_S``. The name is
+    kept so the existing shape tests keep pinning that normalisation."""
+    return childrun.timeout_stream(value)
 
 
 def run_verify_commands(policy: Policy, cwd: Path) -> list[CommandResult]:
@@ -8986,126 +9458,196 @@ def run_verify_commands(policy: Policy, cwd: Path) -> list[CommandResult]:
     precisely because these are host tools — contrast tui/launch.py, which pins
     ``encoding="utf-8"`` because its child is our own UTF-8 CLI.
 
-    "One apiece" holds across all three legs: a completed child, a timeout, and a
-    child that could never be spawned each append exactly one result and the loop
-    goes on to the next command. The three are told apart on the result itself —
-    an rc for the first, ``rc=-1``/``"timed out"`` for the second,
-    ``spawn_error`` plus :data:`SPAWN_FAULT_RC` for the third."""
-    results = []
-    for command in policy.verify.commands:
-        try:
-            # Verify commands are operator-authored shell strings from the project's
-            # policy (e.g. "pytest -q && ruff check"); shell=True is intentional here.
-            proc = subprocess.run(  # nosec B602
-                command,
-                shell=True,  # portability: operator-authored verify command — sanctioned shell-out (see plan out-of-scope)
-                cwd=cwd,
-                capture_output=True,
-                text=True,
-                errors="replace",
-                timeout=COMMAND_TIMEOUT_S,
-            )
-        except subprocess.TimeoutExpired as exc:
-            # the timeout leg is bounded too: a command killed at COMMAND_TIMEOUT_S
-            # is exactly the one that may have been spewing output when it died.
-            t_out, t_out_full = byte_tail(_timeout_stream(exc.stdout), MAX_STREAM_MEMORY_BYTES)
-            t_err, t_err_full = byte_tail(_timeout_stream(exc.stderr), MAX_STREAM_MEMORY_BYTES)
-            results.append(
-                CommandResult(command, -1, "timed out", t_out, t_err, t_out_full, t_err_full)
-            )
-            continue
-        except (OSError, ValueError) as exc:
-            # The child was never started, so no exit status exists to classify:
-            # `subprocess.run` raises out of the fork/exec (or CreateProcess)
-            # itself when `cwd` is unusable — FileNotFoundError (missing),
-            # NotADirectoryError (a regular file, or a path beneath one),
-            # PermissionError (a directory without +x) — or raises ValueError
-            # before spawn when the command or cwd contains an embedded NUL.
-            # The OSError arm uses the base class rather than the three names
-            # because they are the reachable OS shapes TODAY, not a closed set:
-            # the base class is what the platform actually guarantees, and one
-            # uncaught sibling here crashes the whole run.
-            #
-            # Translated instead of raised, the same doctrine `_run_git` follows
-            # for the faults that land before a return code exists (#343): left
-            # uncaught this escapes every `except` in the engine's verification
-            # path and ends the run as a crash, when the fact it reports — a cwd
-            # no command can run in — is a textbook environment fault, identical
-            # for every story and unfixable by a repair session.
-            #
-            # A result is APPENDED and the loop CONTINUES, honouring this
-            # function's documented "one CommandResult apiece": a caller zipping
-            # results against `policy.verify.commands` must not silently lose the
-            # tail of the list to the first broken spawn.
-            results.append(
-                CommandResult(
-                    command,
-                    SPAWN_FAULT_RC,
-                    f"{type(exc).__name__}: {exc}",
-                    # What was OBSERVED, not a diagnosis. `except OSError` is
-                    # wider than the cwd shapes that motivated it — a missing
-                    # `/bin/sh`, EMFILE, ENOMEM all land here — so the cwd is
-                    # named as context ("cwd was X") rather than blamed, and the
-                    # exception carries whatever the real cause was. No "could
-                    # not run" phrasing: `cli._reverify` prefixes its own
-                    # ("<cmd>' could not run: ..."), and the two stuttered.
-                    spawn_error=(f"child not started; cwd was {cwd}; {type(exc).__name__}: {exc}"),
-                )
-            )
-            continue
+    "One apiece" holds across all four legs: a completed child, a timeout, a
+    child that could never be spawned, and a child a hard stop request cut short
+    each append exactly one result and the loop goes on to the next command. The
+    four are told apart on the result itself — an rc for the first,
+    ``rc=-1``/``"timed out"`` for the second, ``spawn_error`` plus
+    :data:`SPAWN_FAULT_RC` for the third, ``interrupted`` plus
+    :data:`INTERRUPTED_RC` for the fourth. Once one command is interrupted every
+    later one yields an interrupted result WITHOUT spawning: the stop is pending,
+    and starting more work under it is exactly what it asked not to happen.
 
-        # Keep result processing outside the spawn-fault handler. A ValueError
-        # here is a programmer defect, not rejected process configuration, and
-        # must remain fail-loud rather than being mislabeled as an environment
-        # fault.
-        stdout, stdout_full = byte_tail(proc.stdout, MAX_STREAM_MEMORY_BYTES)
-        stderr, stderr_full = byte_tail(proc.stderr, MAX_STREAM_MEMORY_BYTES)
-        # merged from the ceilinged streams, not the raw pair: 2000 chars sits
-        # far below the ceiling, so the tail is identical while the full
-        # concatenation — a transient copy of both whole streams — is not built.
-        output = (stdout + stderr)[-2000:]
-        results.append(
-            CommandResult(
-                command, proc.returncode, output, stdout, stderr, stdout_full, stderr_full
-            )
-        )
+    Every child runs through :func:`childrun.run_child`, which kills the whole
+    process tree on a timeout or a hard stop (DW-353). A hard stop is read off
+    the ambient probe the outermost ``Engine.run()`` installs; outside an engine
+    run (``cli._reverify``) none is installed and no command is ever interrupted."""
+    results = []
+    interrupted = False
+    for command in policy.verify.commands:
+        if interrupted:
+            results.append(_interrupted_result(command, "", "", tail=_NOT_STARTED_TAIL))
+            continue
+        # COMMAND_TIMEOUT_S is read here, at call time, so a patched module
+        # value reaches the child.
+        result = _run_shell_command(command, cwd, COMMAND_TIMEOUT_S)
+        interrupted = result.interrupted
+        results.append(result)
     return results
 
 
-def verify_command_results_outcome(results: list[CommandResult], cwd: Path) -> VerifyOutcome:
+def _run_shell_command(command: str, cwd: Path, timeout: float) -> CommandResult:
+    """Run one operator shell command — a ``[verify]`` command or an
+    ``[environment]`` probe — to exactly one :class:`CommandResult`, on the four
+    legs :func:`run_verify_commands` documents: completed, timed out (``rc=-1``,
+    ``"timed out"``), never spawned (``spawn_error``), interrupted by a hard stop
+    (``interrupted``). Not spawning anything after an interrupt is the CALLER's
+    loop latch, not this function's."""
+    try:
+        child = childrun.run_child(command, cwd=cwd, timeout=timeout)
+    except (OSError, ValueError) as exc:
+        # The child was never started, so no exit status exists to classify:
+        # `Popen` raises out of the fork/exec (or CreateProcess)
+        # itself when `cwd` is unusable — FileNotFoundError (missing),
+        # NotADirectoryError (a regular file, or a path beneath one),
+        # PermissionError (a directory without +x) — or raises ValueError
+        # before spawn when the command or cwd contains an embedded NUL.
+        # The OSError arm uses the base class rather than the three names
+        # because they are the reachable OS shapes TODAY, not a closed set:
+        # the base class is what the platform actually guarantees, and one
+        # uncaught sibling here crashes the whole run.
+        #
+        # Translated instead of raised, the same doctrine `_run_git` follows
+        # for the faults that land before a return code exists (#343): left
+        # uncaught this escapes every `except` in the engine's verification
+        # path and ends the run as a crash, when the fact it reports — a cwd
+        # no command can run in — is a textbook environment fault, identical
+        # for every story and unfixable by a repair session.
+        #
+        # A result is RETURNED rather than raised, so `run_verify_commands`
+        # honours its documented "one CommandResult apiece": a caller zipping
+        # results against `policy.verify.commands` must not silently lose the
+        # tail of the list to the first broken spawn.
+        return CommandResult(
+            command,
+            SPAWN_FAULT_RC,
+            f"{type(exc).__name__}: {exc}",
+            # What was OBSERVED, not a diagnosis. `except OSError` is
+            # wider than the cwd shapes that motivated it — a missing
+            # `/bin/sh`, EMFILE, ENOMEM all land here — so the cwd is
+            # named as context ("cwd was X") rather than blamed, and the
+            # exception carries whatever the real cause was. No "could
+            # not run" phrasing: `cli._reverify` prefixes its own
+            # ("<cmd>' could not run: ..."), and the two stuttered.
+            spawn_error=(f"child not started; cwd was {cwd}; {type(exc).__name__}: {exc}"),
+        )
+
+    # Keep result processing outside the spawn-fault handler. A ValueError
+    # here is a programmer defect, not rejected process configuration, and
+    # must remain fail-loud rather than being mislabeled as an environment
+    # fault.
+    if child.interrupted:
+        return _interrupted_result(command, child.stdout, child.stderr)
+    stdout, stdout_full = byte_tail(child.stdout, MAX_STREAM_MEMORY_BYTES)
+    stderr, stderr_full = byte_tail(child.stderr, MAX_STREAM_MEMORY_BYTES)
+    if child.timed_out or child.returncode is None:
+        # the timeout leg is bounded too: a command killed at its timeout is
+        # exactly the one that may have been spewing output when it died.
+        # (`returncode is None` is also possible without either flag set:
+        # run_child reports None when the killed root could not be reaped, as
+        # well as for an interrupt. It is not an exit status, so it must not
+        # be classified as one.)
+        return CommandResult(command, -1, "timed out", stdout, stderr, stdout_full, stderr_full)
+    # merged from the ceilinged streams, not the raw pair: 2000 chars sits
+    # far below the ceiling, so the tail is identical while the full
+    # concatenation — a transient copy of both whole streams — is not built.
+    output = (stdout + stderr)[-2000:]
+    return CommandResult(
+        command, child.returncode, output, stdout, stderr, stdout_full, stderr_full
+    )
+
+
+# The journalled `output_tail` is what tells a command the hard stop KILLED apart
+# from a later one it kept from ever starting; both carry the same rc and flag.
+_INTERRUPTED_TAIL = "interrupted by a hard stop request"
+_NOT_STARTED_TAIL = "not started: an earlier command was interrupted by a hard stop request"
+
+
+def _interrupted_result(
+    command: str, stdout: str, stderr: str, *, tail: str = _INTERRUPTED_TAIL
+) -> CommandResult:
+    """The one result an interrupted (or, after an interrupt, unspawned) command
+    yields: :data:`INTERRUPTED_RC` with ``interrupted=True`` and whatever the
+    killed tree wrote, bounded like every other leg. ``tail`` says which of the
+    two it was."""
+    out, out_full = byte_tail(stdout, MAX_STREAM_MEMORY_BYTES)
+    err, err_full = byte_tail(stderr, MAX_STREAM_MEMORY_BYTES)
+    return CommandResult(
+        command,
+        INTERRUPTED_RC,
+        tail,
+        out,
+        err,
+        out_full,
+        err_full,
+        interrupted=True,
+    )
+
+
+# The explanatory clause of an env-fault escalation, by cause (DW-523). Each one
+# says only what the orchestrator OBSERVED: rc 127 is the shell's code for a
+# missing command, but a command may exit 127 (or 126) on purpose — the only
+# operator escape for "environment broken" before `env_fault_rc` existed — so
+# that clause names the convention instead of asserting it. A spawn fault was
+# never looked for at all, so naming a binary would send the reader hunting for
+# one when the directory is what is broken.
+_ENV_FAULT_CLAUSES = {
+    "spawn": "the command could not be started at all",
+    "declared-rc": "the command exited with the configured environment-fault code",
+    "shell-rc": (
+        "the shell exits 127 when it cannot find a command (126 when it cannot "
+        "execute one), and a command may also exit with it deliberately"
+    ),
+    "cmd": "cmd could not run the command",
+    "probe": "an [environment] probe failed, so no [verify] command was run",
+}
+
+
+def _env_fault_outcome(result: CommandResult, reason: str, cause: str) -> VerifyOutcome:
+    """The one env-fault escalation shape every cause shares: the first line
+    names the reason and the command, the clause names the cause, and the tail
+    (fix the environment, re-arm) is the same because the remedy is."""
+    output = "" if result.spawn_error is not None else f"\n{result.output_tail}"
+    return VerifyOutcome.escalate(
+        f"verify environment fault ({reason}): {result.command}\n"
+        f"{_ENV_FAULT_CLAUSES[cause]} — this is the run environment, "
+        "not the story; fix the environment, then re-arm the escalation "
+        "(the attempt budget resets on re-arm), or keep the attempt's work with "
+        f"`bmad-loop resolve <run> --reverify` (verify replayed, no dev session){output}",
+        env_fault=True,
+        env_fault_cause=cause,
+    )
+
+
+def verify_command_results_outcome(
+    results: list[CommandResult], cwd: Path, *, env_fault_rc: int = 0
+) -> VerifyOutcome:
     """Classify already-observed verifier results without discarding them.
 
     Kept separate from :func:`verify_commands_outcome` so the engine can retain
     and expose exactly the same results it asks core to classify. Failures are fixable:
     the captured output is concrete feedback a repair session can act on —
-    except environment faults (see env_fault_reason), which escalate so the run
+    except environment faults (see env_fault_reason, which ``env_fault_rc`` is
+    handed to), which escalate so the run
     pauses for an environment fix instead of burning story budgets. An env
     fault anywhere in the run wins over earlier ordinary failures: a repair
     session dispatched for the ordinary failure would still run in the
     broken environment. Note the first loop inspects rc=0 results too — on
-    Windows an unrunnable command is a silent pass, not a failure (#302)."""
+    Windows an unrunnable command is a silent pass, not a failure (#302).
+
+    An interrupted result (DW-353) is not classifiable at all and raises
+    :class:`VerifyInterrupted` before anything else is read: the engine raises
+    ``RunStopped`` on one before reaching here, so this is a backstop."""
+    interrupted = [result.command for result in results if result.interrupted]
+    if interrupted:
+        raise VerifyInterrupted(
+            f"verify results interrupted by a hard stop request: {', '.join(interrupted)}"
+        )
     for result in results:
-        reason = env_fault_reason(result, cwd)
-        if reason is not None:
-            # The explanatory clause branches on WHICH fault this is, because the
-            # rc-based one is a claim about the command and the spawn one is not:
-            # a child that never started was never looked for, so "command not
-            # found / not executable" would send the reader hunting for a binary
-            # when the directory is what is broken. Everything after the dash is
-            # shared — the remedy (fix the environment, re-arm) is the same.
-            clause = (
-                "the command could not be started at all"
-                if result.spawn_error is not None
-                else "command not found / not executable"
-            )
-            output = "" if result.spawn_error is not None else f"\n{result.output_tail}"
-            return VerifyOutcome.escalate(
-                f"verify environment fault ({reason}): {result.command}\n"
-                f"{clause} — this is the run environment, "
-                "not the story; fix the environment, then re-arm the escalation "
-                f"(the attempt budget resets on re-arm){output}",
-                env_fault=True,
-            )
+        found = _env_fault_cause(result, cwd, env_fault_rc=env_fault_rc)
+        if found is not None:
+            cause, reason = found
+            return _env_fault_outcome(result, reason, cause)
     for result in results:
         if result.returncode != 0:
             return VerifyOutcome.retry(
@@ -9116,8 +9658,123 @@ def verify_command_results_outcome(results: list[CommandResult], cwd: Path) -> V
     return VerifyOutcome.passed()
 
 
+@dataclass(frozen=True)
+class ProbeOutcome:
+    """One pass over ``[environment] probes`` (DW-523), fail-fast.
+
+    ``results`` holds every probe that RAN, in order — the pass stops at the
+    first failure or interrupt, so a probe after it never spawned and is absent.
+    ``failed`` is that first failing result, None when none failed. ``reason``
+    is :func:`probe_failure_reason` for it ("" when none failed). ``timeout_s``
+    is the per-probe bound the pass ran under."""
+
+    results: tuple[CommandResult, ...]
+    failed: CommandResult | None
+    timeout_s: int
+    reason: str = ""
+
+    @property
+    def interrupted(self) -> bool:
+        return any(result.interrupted for result in self.results)
+
+    @property
+    def ok(self) -> bool:
+        return self.failed is None and not self.interrupted
+
+
+# The sink a caller hands :func:`verify_commands_outcome` to observe an
+# environment preflight — the engine journals a failed probe through it.
+ProbeSink = Callable[[ProbeOutcome], None]
+
+
+def preflight_required(policy: Policy) -> bool:
+    """Whether a verify composition runs the environment preflight: only when it
+    would run a ``[verify]`` command at all, and only when probes are configured.
+    With no probes (the default) nothing extra spawns, journals or changes."""
+    return bool(policy.verify.commands) and bool(policy.environment.probes)
+
+
+def _probe_timed_out(result: CommandResult) -> bool:
+    # `_run_shell_command`'s timeout leg: rc -1 with the literal tail. A
+    # signal-killed child (rc -1 is SIGHUP) carries its own output instead.
+    return result.returncode == -1 and result.output_tail == "timed out" and not result.spawn_error
+
+
+def probe_failure_reason(result: CommandResult, timeout_s: int, *, cwd: Path | None = None) -> str:
+    """Why a probe counts as failed, phrased for an operator: ``"rc=N"``,
+    ``"timed out after Ns"``, or ``"could not be started: ..."``. ``cwd`` lets a
+    probe that exited 0 yet was never run (win32 cmd handed a non-PATHEXT file,
+    #302) name why; without it that leg reads ``"rc=0"``."""
+    if result.spawn_error is not None:
+        return f"could not be started: {result.spawn_error}"
+    if _probe_timed_out(result):
+        return f"timed out after {timeout_s}s"
+    if result.returncode == 0 and cwd is not None:
+        unrunnable = env_fault_reason(result, cwd)
+        if unrunnable is not None:
+            return unrunnable
+    return f"rc={result.returncode}"
+
+
+def _probe_failed(result: CommandResult, cwd: Path) -> bool:
+    return (
+        result.spawn_error is not None
+        or result.returncode != 0
+        or _probe_timed_out(result)
+        # rc 0 is not proof on win32: cmd exits 0 for a file it cannot execute
+        or env_fault_reason(result, cwd) is not None
+    )
+
+
+def run_environment_probes(policy: Policy, cwd: Path) -> ProbeOutcome:
+    """Run ``[environment] probes`` in ``cwd`` in order, stopping at the first
+    failure: a nonzero exit, a timeout (``probe_timeout_s``), a probe that could
+    not be started, or one the host shell could not run (see
+    :func:`env_fault_reason`). An interrupted probe (hard stop) also ends the
+    pass; it is not a failure — :attr:`ProbeOutcome.interrupted` says so. No
+    probes configured spawns nothing and returns an ``ok`` outcome."""
+    timeout_s = policy.environment.probe_timeout_s
+    results: list[CommandResult] = []
+    for probe in policy.environment.probes:
+        result = _run_shell_command(probe, cwd, timeout_s)
+        results.append(result)
+        if result.interrupted:
+            break
+        if _probe_failed(result, cwd):
+            return ProbeOutcome(
+                tuple(results),
+                result,
+                timeout_s,
+                probe_failure_reason(result, timeout_s, cwd=cwd),
+            )
+    return ProbeOutcome(tuple(results), None, timeout_s)
+
+
+def environment_preflight_outcome(probe: ProbeOutcome) -> VerifyOutcome:
+    """The escalation for a failed environment preflight: an env fault with
+    cause ``"probe"``, so the run pauses without charging the attempt and no
+    ``[verify]`` command ran. Built directly, never through
+    :func:`verify_command_results_outcome` — a probe is not a verify result, and
+    the classifier's callers are pinned (tests/test_portability_guard.py).
+
+    An interrupted pass raises :class:`VerifyInterrupted`, the classifier's
+    backstop for the same missed boundary."""
+    if probe.interrupted:
+        commands = ", ".join(r.command for r in probe.results if r.interrupted)
+        raise VerifyInterrupted(
+            f"environment probes interrupted by a hard stop request: {commands}"
+        )
+    if probe.failed is None:
+        raise ValueError("environment_preflight_outcome needs a failed probe pass")
+    return _env_fault_outcome(probe.failed, f"environment probe {probe.reason}", "probe")
+
+
 def verify_commands_outcome(
-    policy: Policy, cwd: Path, *, on_results: CommandSink | None = None
+    policy: Policy,
+    cwd: Path,
+    *,
+    on_results: CommandSink | None = None,
+    on_probes: ProbeSink | None = None,
 ) -> VerifyOutcome:
     """Run the policy's deterministic verify commands and classify the results.
 
@@ -9137,15 +9794,32 @@ def verify_commands_outcome(
     dir still propagates. That is the same fail-loud boundary the dev leg already
     stands on, and wrapping the call here would trade it for silence: a lost
     journal write is a lost audit record, which is exactly the class of failure
-    that must not pass quietly."""
+    that must not pass quietly.
+
+    The environment preflight (DW-523) runs first when :func:`preflight_required`:
+    ``on_probes`` observes the probe pass whatever it found, and a failed pass
+    returns :func:`environment_preflight_outcome` straight away — no ``[verify]``
+    command runs, so ``on_results`` is NOT called (nothing ran to record). The
+    same must-not-raise contract applies to ``on_probes``, save that the
+    engine's sink raises ``RunStopped`` on an interrupted pass, deliberately."""
+    if preflight_required(policy):
+        probe = run_environment_probes(policy, cwd)
+        if on_probes is not None:
+            on_probes(probe)
+        if not probe.ok:
+            return environment_preflight_outcome(probe)
     results = run_verify_commands(policy, cwd)
     if on_results is not None:
         on_results(tuple(results))
-    return verify_command_results_outcome(results, cwd)
+    return verify_command_results_outcome(results, cwd, env_fault_rc=policy.verify.env_fault_rc)
 
 
 def _verify_review_commands(
-    policy: Policy, paths: ProjectPaths, *, on_results: CommandSink | None = None
+    policy: Policy,
+    paths: ProjectPaths,
+    *,
+    on_results: CommandSink | None = None,
+    on_probes: ProbeSink | None = None,
 ) -> VerifyOutcome:
     """Run a review gate's ``[verify] commands`` in ``paths.repo_root``.
 
@@ -9160,9 +9834,10 @@ def _verify_review_commands(
     at both of its call sites. The three review gates were the sole outlier
     (#695).
 
-    The two roots are the same path in the default layout and under worktree
-    isolation (``ProjectPaths.rebased`` sets both); they diverge only under an
-    explicit ``repo_root:`` with ``isolation = "none"``. One helper rather than
+    The two roots are the same path in the default layout, under either isolation
+    mode; they diverge only under an explicit ``repo_root:`` — in place, or under
+    worktree isolation, where ``ProjectPaths.rebased`` keeps the project's offset
+    (``<worktree>/<offset>`` against the worktree, DW-379). One helper rather than
     three edited lines so the three gates cannot drift apart on the split.
 
     On win32 the cwd carries one more thing with it, so the split is not purely a
@@ -9179,7 +9854,8 @@ def _verify_review_commands(
     whole dataclass to keep the three call sites uniform, not because it consults
     anything else. A future caller must not infer that artifact paths reach here.
 
-    ``on_results`` is forwarded, not consumed: an engine-supplied sink is how
+    ``on_results`` (and ``on_probes``, the environment preflight's) is forwarded,
+    not consumed: an engine-supplied sink is how
     review-gate results reach the journal, which the dev side has always had and
     these gates had not. Optional, so the gates stay callable from core (and from
     tests) with no engine at all — no sink simply means nothing is recorded,
@@ -9189,7 +9865,9 @@ def _verify_review_commands(
     fourth gate reaching past it would re-open #695. Enforced, not merely stated
     — see ``tests/test_portability_guard.py``.
     """
-    return verify_commands_outcome(policy, paths.repo_root, on_results=on_results)
+    return verify_commands_outcome(
+        policy, paths.repo_root, on_results=on_results, on_probes=on_probes
+    )
 
 
 def verify_review(
@@ -9200,6 +9878,7 @@ def verify_review(
     sprint_reached_done: bool = False,
     operator_park: bool = False,
     on_results: CommandSink | None = None,
+    on_probes: ProbeSink | None = None,
 ) -> VerifyOutcome:
     """Gate a completed review pass: spec at ``done``, sprint-status at ``done``,
     deterministic verify commands green.
@@ -9207,7 +9886,9 @@ def verify_review(
     ``sprint_reached_done`` tells the gate that the orchestrator had already
     advanced this story's sprint-status to ``done`` before the review ran (it is
     the sole ``sprint_advance`` caller, ``verify_dev`` asserted the write landed,
-    and ``advance`` never regresses). A board now sitting *earlier* than ``done``
+    and ``advance`` never regresses save the one allowlisted opt-in
+    ``done -> awaiting-operator`` of a review demotion, DW-383 — whose own pair
+    this gate accepts below). A board now sitting *earlier* than ``done``
     is therefore not a stage the story never reached — it is a review session
     deliberately revoking the sign-off. Nothing in the review loop re-advances
     the board, so retrying only replays the same failure until the budget runs
@@ -9217,7 +9898,10 @@ def verify_review(
 
     ``(awaiting-operator, awaiting-operator)`` is the second accepted pair, on
     the same observed-spec-status selection ``verify_dev`` uses: this is the gate
-    the park path runs before committing (``Engine._park_awaiting_operator``), so
+    both park paths run before committing — the dev-declared park
+    (``Engine._park_awaiting_operator``) and the review demotion under
+    ``[operator] on_review_demotion = "park"`` (``Engine._park_review_demotion``,
+    DW-383, which has moved the board to the park stage first) — so
     parked work clears exactly the deterministic checks every other commit path
     clears *at this gate* — the pair, a non-empty action list, and the verify
     commands. The scope is load-bearing: a ``done`` story additionally clears
@@ -9273,7 +9957,7 @@ def verify_review(
             f"sprint-status for {task.story_key} is {sprint!r}, expected {expected!r}"
         )
 
-    return _verify_review_commands(policy, paths, on_results=on_results)
+    return _verify_review_commands(policy, paths, on_results=on_results, on_probes=on_probes)
 
 
 def _is_signoff_regression(sprint: str | None, sprint_reached_done: bool, policy: Policy) -> bool:
@@ -9298,6 +9982,7 @@ def verify_review_stories(
     policy: Policy,
     *,
     on_results: CommandSink | None = None,
+    on_probes: ProbeSink | None = None,
 ) -> VerifyOutcome:
     """verify_review for stories mode: same spec-done + verify-commands gates,
     minus the sprint-status gate (stories mode has no sprint board — the story
@@ -9316,7 +10001,7 @@ def verify_review_stories(
     status = status_of(fm)
     if status != "done":
         return VerifyOutcome.retry(f"spec status is {status!r}, expected 'done'")
-    return _verify_review_commands(policy, paths, on_results=on_results)
+    return _verify_review_commands(policy, paths, on_results=on_results, on_probes=on_probes)
 
 
 def verify_review_bundle(
@@ -9325,6 +10010,7 @@ def verify_review_bundle(
     policy: Policy,
     *,
     on_results: CommandSink | None = None,
+    on_probes: ProbeSink | None = None,
 ) -> VerifyOutcome:
     """verify_review for a deferred-work bundle: no sprint-status check, but
     every dw id the bundle owns must be marked done in the ledger on disk. The
@@ -9384,7 +10070,7 @@ def verify_review_bundle(
             fixable=True,
         )
 
-    return _verify_review_commands(policy, paths, on_results=on_results)
+    return _verify_review_commands(policy, paths, on_results=on_results, on_probes=on_probes)
 
 
 def commit_story(repo: Path, message: str) -> str:
@@ -9971,7 +10657,8 @@ def commit_paths(repo: Path, message: str, paths: list[Path]) -> str | None:
 @dataclass(frozen=True)
 class _BoundLiveLedger:
     """One raw observation of the live ledger: its bytes beside the stat fields an
-    in-place rewrite of the same inode moves."""
+    in-place rewrite of the same inode moves, and the raw ``st_mode`` — a chmod
+    moves ctime only where ctime is fine-grained, so the mode is held itself."""
 
     data: bytes
     dev: int
@@ -9979,10 +10666,26 @@ class _BoundLiveLedger:
     size: int
     mtime_ns: int
     ctime_ns: int
+    mode: int
 
 
-def _bound_live_ledger_stat(st: os.stat_result) -> tuple[int, int, int, int, int]:
-    return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+def _bound_live_ledger_stat(st: os.stat_result) -> tuple[int, int, int, int, int, int]:
+    return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns, st.st_mode)
+
+
+def _bound_live_mode(repo: Path, observed: _BoundLiveLedger, committed_mode: str) -> None:
+    """Refuse a live exec bit that disagrees with the committed mode (DW-328).
+
+    Git reads the exec bit only where it honours ``core.fileMode``; elsewhere
+    (every Windows init) the live bit is ignored exactly as Git ignores it. A
+    target HEAD does not track commits as ``100644``, so a new ledger must not be
+    executable. The committed mode is the authority — candidate validation pins it to the
+    parent's — so a mismatch is refused, never repaired or published over.
+    """
+    if not _honors_file_mode(repo):
+        return
+    if bool(observed.mode & stat.S_IXUSR) != (committed_mode == "100755"):
+        raise GitError("accepted publication target mode does not match its committed mode")
 
 
 def _bound_live_ledger_identity(
@@ -10124,9 +10827,39 @@ class _BoundGitEntry:
     oid: str
 
 
+def _bound_git_env() -> dict[str, str]:
+    """The environment for the bound publication's raw-object reads (DW-331).
+
+    `git replace` refs are ordinary repository state a session can write, and
+    with them honoured a replaced captured parent checks out, diffs and lists
+    as its replacement while the published commit still records the raw
+    parent — so unrelated changes would ride into the raw commit with every
+    probe agreeing it is exact. `GIT_NO_REPLACE_OBJECTS` makes these reads see
+    the raw objects the published commit actually carries: the candidate
+    checkout and candidate `git commit`, `_bound_parent`,
+    `_bound_changed_paths` and `_bound_tree_entry` (DW-331); the baseline blob
+    `cat-file` in `_bound_baseline_blob`, so a replaced baseline blob cannot
+    vouch for rival committed content (DW-398); `_accepted_bound_transition`'s
+    first-parent `rev-list` and the `path_clean` and
+    `path_has_non_tree_ancestor_at_revision` probes, so a replaced ancestry
+    cannot surface a transition outside HEAD's raw history (DW-399); and
+    `_bound_locked_index_reset`'s target `reset`, so the index stages the raw
+    entry the raw comparison expects (DW-400). That helper's compare and verify
+    `ls-files` reads of its side index share the same env plus
+    `GIT_INDEX_FILE` (DW-327).
+
+    The other publication calls keep the inherited environment because they
+    read no replaceable object content: the ref-name and ref-value probes
+    (`symbolic-ref`, `rev-parse`, including `_bound_ref_oid` and
+    `_bound_head_oid`), the real-index reads (`ls-files`, `check-ignore`), blob
+    hashing, and the `update-ref` transaction. At worst a forced type-changing
+    replace makes a `^{commit}` peel refuse loudly."""
+    return {**os.environ, "GIT_NO_REPLACE_OBJECTS": "1"}
+
+
 def _bound_tree_entry(repo: Path, revision: str, rel: str) -> _BoundGitEntry | None:
     try:
-        entry = _entry_at_revision(repo, revision, rel)
+        entry = _entry_at_revision(repo, revision, rel, env=_bound_git_env())
     except GitError as exc:
         raise GitError(f"committed publication target could not be observed in {repo}") from exc
     if entry is None:
@@ -10173,7 +10906,7 @@ def _bound_baseline_blob(
         return None
     if entry.kind != "blob" or entry.mode not in {"100644", "100755"}:
         raise GitError("accepted baseline is not a regular file at its commit")
-    proc = git_bytes(repo, "cat-file", "blob", entry.oid)
+    proc = git_bytes(repo, "cat-file", "blob", entry.oid, env=_bound_git_env())
     if proc.returncode != 0:
         raise GitError(f"accepted baseline blob could not be read in {repo}")
     try:
@@ -10230,6 +10963,7 @@ def _bound_changed_paths(repo: Path, parent: str, revision: str) -> set[str]:
         parent,
         revision,
         "--",
+        env=_bound_git_env(),
     )
     if proc.returncode != 0:
         raise GitError(f"git candidate scope probe failed in {repo}")
@@ -10241,7 +10975,9 @@ class _BoundCandidateMismatch(GitError):
 
 
 def _bound_parent(repo: Path, revision: str) -> str:
-    rc, lineage, _detail = _git_out(repo, "rev-list", "--parents", "--max-count=1", revision)
+    rc, lineage, _detail = _git_out(
+        repo, "rev-list", "--parents", "--max-count=1", revision, env=_bound_git_env()
+    )
     if rc != 0:
         raise GitError(f"git candidate parent probe failed in {repo}")
     parts = lineage.split()
@@ -10300,6 +11036,7 @@ def _accepted_bound_transition(
         head,
         "--",
         *_literal_specs([rel]),
+        env=_bound_git_env(),
     )
     if rc != 0:
         raise GitError(f"git accepted-transition probe failed in {repo}")
@@ -10318,9 +11055,15 @@ def _accepted_bound_transition(
     return None
 
 
-def _bound_index_entry(repo: Path, rel: str) -> _BoundGitEntry | None:
+def _bound_index_entry(
+    repo: Path, rel: str, env: dict[str, str] | None = None
+) -> _BoundGitEntry | None:
+    """The target's stage-zero index entry, or `None` when it is not staged.
+
+    `env` points the read at another index (the locked side index of
+    `_bound_locked_index_reset`); omitted, the real index is read."""
     try:
-        proc = git_bytes(repo, "ls-files", "-s", "-z", "--", *_literal_specs([rel]))
+        proc = git_bytes(repo, "ls-files", "-s", "-z", "--", *_literal_specs([rel]), env=env)
     except GitError as exc:
         raise GitError(f"publication target index could not be observed in {repo}") from exc
     if proc.returncode != 0:
@@ -10343,6 +11086,129 @@ def _bound_index_entry(repo: Path, rel: str) -> _BoundGitEntry | None:
     return _BoundGitEntry(mode, kind, oid)
 
 
+def _bound_real_index_path(repo: Path) -> Path:
+    """The real index file, as Git itself resolves it for `repo`.
+
+    `rev-parse --git-path index` honours an inherited `GIT_INDEX_FILE` and
+    names a linked worktree's own index, so the lock taken beside it is the one
+    every cooperating Git writer in this checkout contends for."""
+    try:
+        proc = git_bytes(repo, "rev-parse", "--git-path", "index")
+    except GitError as exc:
+        raise GitError(f"real index path could not be resolved in {repo}") from exc
+    out = proc.stdout
+    if out.endswith(b"\n"):
+        out = out[:-1]
+    if proc.returncode != 0 or not out or b"\n" in out:
+        raise GitError(f"real index path could not be resolved in {repo}")
+    return repo / os.fsdecode(out)
+
+
+def _bound_locked_index_reset(
+    repo: Path,
+    rel: str,
+    expected_entry: _BoundGitEntry | None,
+    oid: str,
+    target_entry: _BoundGitEntry | None,
+) -> None:
+    """Compare the target entry and reset it to `oid` as one step (DW-327).
+
+    A bare compare followed by `git reset <oid> -- <rel>` leaves a window in
+    which a cooperating Git writer can stage the target, and the reset then
+    silently overwrites that stage. This closes the window with Git's own
+    lockfile protocol, the one `git commit -- <paths>` uses:
+
+    1. Create `<index>.lock` with `O_CREAT|O_EXCL`, as every Git index writer
+       does. While it exists, cooperating writers refuse ("Unable to create
+       '…/index.lock': File exists"). A lock that already exists belongs to
+       someone else; refuse and leave it untouched.
+    2. Copy the real index bytes into a throwaway `GIT_INDEX_FILE` (a missing
+       index means no copy), and compare, `reset`, and verify against that
+       copy. `git reset` takes `index.lock` itself, so it must never run
+       against the real index while this lock is held.
+    3. Write the copy's bytes into the held lock, fsync and close it, stamp it
+       with the copy's post-`reset` timestamps, and rename the lock over the
+       index (`atomic_replace`, which retries Windows sharing violations). The
+       real index is only ever replaced whole.
+
+    Every failure path unlinks the lock this call created and leaves the real
+    index as it was. Writers that ignore `index.lock` are out of scope.
+    """
+    index = _bound_real_index_path(repo)
+    lock = index.with_name(index.name + ".lock")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+    try:
+        fd = os.open(lock, flags, 0o666)
+    except FileExistsError as exc:
+        raise GitError(
+            f"real index {index} is locked by another git process (lock file {lock})"
+        ) from exc
+    except OSError as exc:
+        raise GitError(f"real index lock could not be taken for {index}: {exc}") from exc
+    committed = False
+    try:
+        with tempfile.TemporaryDirectory(prefix="bmad-loop-bound-index-") as td:
+            side_index = Path(td) / "index"
+            original_stat: os.stat_result | None
+            try:
+                original = index.read_bytes()
+                original_stat = index.stat()
+            except FileNotFoundError:
+                original = None
+                original_stat = None
+            except OSError as exc:
+                raise GitError(f"real index could not be read in {repo}") from exc
+            original_mode = None if original_stat is None else stat.S_IMODE(original_stat.st_mode)
+            if original is not None and original_stat is not None:
+                side_index.write_bytes(original)
+                # Keep the original index timestamps: Git's racy-clean check compares
+                # entry mtimes against the index file's mtime, and a fresh one would
+                # stop `reset` from smudging racily clean entries, hiding worktree edits.
+                os.utime(side_index, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+            env = {**_bound_git_env(), "GIT_INDEX_FILE": str(side_index)}
+            if _bound_index_entry(repo, rel, env=env) != expected_entry:
+                raise GitError("real index target changed during exact-path publication")
+            rc, _out = _git_env(repo, "reset", oid, "--", *_literal_specs([rel]), env=env)
+            if rc != 0:
+                raise GitError(f"git target-local index synchronization failed in {repo}")
+            if _bound_index_entry(repo, rel, env=env) != target_entry:
+                raise GitError("real index target synchronization did not match committed content")
+            try:
+                published = side_index.read_bytes()
+                published_stat = side_index.stat()
+            except FileNotFoundError:
+                if original is not None:
+                    raise GitError(
+                        f"git target-local index synchronization failed in {repo}"
+                    ) from None
+                # No index before and none after: nothing to publish.
+                return
+        view = memoryview(published)
+        while view:
+            written = os.write(fd, view)
+            view = view[written:]
+        if original_mode is not None and os.name == "posix":
+            os.fchmod(fd, original_mode)
+        os.fsync(fd)
+        to_close, fd = fd, -1
+        os.close(to_close)
+        # Publish with the mtime `reset` gave the side index, not the later copy
+        # time: racy-clean detection reads the index mtime as Git's write time.
+        os.utime(lock, ns=(published_stat.st_atime_ns, published_stat.st_mtime_ns))
+        atomic_replace(lock, index)
+        committed = True
+    except OSError as exc:
+        raise GitError(f"real index could not be published in {repo}: {exc}") from exc
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        if not committed:
+            try:
+                lock.unlink()
+            except FileNotFoundError:
+                pass
+
+
 def _synchronize_bound_index(
     repo: Path,
     expected_checkout: _BoundCheckoutIdentity,
@@ -10356,6 +11222,11 @@ def _synchronize_bound_index(
     move is repaired toward the newest observation but still refuses the attempt,
     leaving commit-only replay to decide authority.  The explicit bound prevents
     a hostile ref mover from turning housekeeping into a livelock.
+
+    Each compare-then-reset pair runs under the real index's `index.lock`
+    (`_bound_locked_index_reset`), so it is atomic against cooperating Git
+    writers: one that tries to stage the target between the compare and the
+    reset is refused by the lock instead of being silently overwritten (DW-327).
     """
     expected_index_entry = observed_index_entry
     moved = False
@@ -10364,15 +11235,11 @@ def _synchronize_bound_index(
         moved = True
 
     for _attempt in range(_BOUND_INDEX_RECONCILE_LIMIT):
-        if _bound_index_entry(repo, rel) != expected_index_entry:
-            raise GitError("real index target changed during exact-path publication")
         target = newest
         target_entry = _bound_tree_entry(repo, target.oid, rel)
         if target_entry is not None and target_entry.kind == "tree":
             raise GitError("committed publication target became a directory")
-        rc, _out = _git(repo, "reset", target.oid, "--", *_literal_specs([rel]))
-        if rc != 0:
-            raise GitError(f"git target-local index synchronization failed in {repo}")
+        _bound_locked_index_reset(repo, rel, expected_index_entry, target.oid, target_entry)
         expected_index_entry = target_entry
         if _bound_index_entry(repo, rel) != target_entry:
             raise GitError("real index target synchronization did not match committed content")
@@ -10385,14 +11252,10 @@ def _synchronize_bound_index(
 
     # One final target-local repair makes the index correspond to the latest
     # observation even when the movement never settled inside the retry bound.
-    if _bound_index_entry(repo, rel) != expected_index_entry:
-        raise GitError("real index target changed during exact-path publication")
     newest_entry = _bound_tree_entry(repo, newest.oid, rel)
     if newest_entry is not None and newest_entry.kind == "tree":
         raise GitError("committed publication target became a directory")
-    rc, _out = _git(repo, "reset", newest.oid, "--", *_literal_specs([rel]))
-    if rc != 0:
-        raise GitError(f"git target-local index synchronization failed in {repo}")
+    _bound_locked_index_reset(repo, rel, expected_index_entry, newest.oid, newest_entry)
     if _bound_index_entry(repo, rel) != newest_entry:
         raise GitError("real index target synchronization did not match committed content")
     raise GitError("checkout did not stabilize during target index reconciliation")
@@ -10447,6 +11310,359 @@ def _publish_bound_candidate(
         raise GitError("captured branch changed during exact-path publication") from exc
 
 
+def _make_candidate_parents(
+    root: Path, parent: Path, *, root_identity: os.stat_result | None = None
+) -> None:
+    """Create the missing directories from `root` down to `parent`, confined.
+
+    `parent.mkdir(parents=True)` follows a redirected ancestor and would create
+    empty directories outside `root` before the confined write refuses (DW-404).
+    With descriptor-anchored writes each component is created and then opened
+    `O_NOFOLLOW` relative to the one above it, so a link below `root` refuses
+    before anything is created through it. On win32 with `win32_at`
+    (`WIN32_HANDLE_PARENTS`) each component is created-or-opened in ONE
+    handle-relative call (`O_CREAT` without `O_EXCL`, `AT_DIRECTORY`,
+    `AT_NOFOLLOW`), so a junction or symlink at a component is opened as the
+    reparse point itself and refused, never traversed (DW-420). Only hosts with
+    neither handle arm keep the path walk: each component's ancestry is checked
+    with `path_is_confined` before it is created, a check-then-act residual — a
+    link planted between check and create still redirects it.
+
+    `root_identity` pins `root` itself (DW-338): the candidate worktree is
+    orchestrator-minted, so the caller takes `pinned_root_identity` once after
+    `worktree add` and a root replaced by a link afterwards is refused — by the
+    `fstat` compare in `open_dir_confined` on both handle arms, by an `lstat`
+    compare (check-then-act, the arm's existing residual) on the path arm. With
+    no identity, `root` may be reached through a link, as `open_dir_confined`
+    allows.
+
+    Raises `OSError` on failure. A refused redirect surfaces as the kernel's
+    `OSError` (ELOOP/ENOTDIR from the `O_NOFOLLOW` open) on the POSIX arm, as
+    `win32_at`'s ELOOP `OSError` on the win32 handle arm, and as
+    `UnconfinedWriteError` on the path-based arm.
+    """
+    try:
+        relative = parent.relative_to(root)
+    except ValueError as exc:
+        raise UnconfinedWriteError(f"{parent} is not under {root}") from exc
+    if WIN32_HANDLE_PARENTS:
+        fd = open_dir_confined(root, root, root_identity=root_identity)
+        if fd is None:
+            raise OSError(f"candidate root {root} could not be opened")
+        try:
+            for part in relative.parts:
+                nested = platform_util.open_at(
+                    fd, part, os.O_RDONLY | os.O_CREAT | AT_DIRECTORY | AT_NOFOLLOW
+                )
+                fd, previous = nested, fd
+                os.close(previous)
+        finally:
+            os.close(fd)
+        return
+    if not DIR_FD_ANCHORED_WRITES:
+        if root_identity is not None:
+            if not platform_util._root_still_pinned(root, root_identity):
+                raise UnconfinedWriteError(f"candidate root {root} was replaced")
+        current = root
+        for part in relative.parts:
+            current = current / part
+            if not path_is_confined(root, current.parent):
+                raise UnconfinedWriteError(f"{current.parent} is redirected below {root}")
+            current.mkdir(exist_ok=True)
+        return
+    fd = open_dir_confined(root, root, root_identity=root_identity)
+    if fd is None:
+        raise OSError(f"candidate root {root} could not be opened")
+    try:
+        for part in relative.parts:
+            try:
+                os.mkdir(part, 0o777, dir_fd=fd)
+            except FileExistsError:
+                pass
+            nested = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            fd, previous = nested, fd
+            os.close(previous)
+    finally:
+        os.close(fd)
+
+
+# A worktree gitfile is one `gitdir: <path>` line; anything past this is not one.
+_CANDIDATE_GITFILE_MAX_BYTES = 64 * 1024
+
+
+@dataclass(frozen=True)
+class _PinnedFile:
+    """A small file as pinned by `_read_pinned_file`: its `(st_dev, st_ino)` and
+    its exact bytes — the candidate `.git` gitfile (DW-442) and its admin dir's
+    `commondir` (DW-493)."""
+
+    dev: int
+    ino: int
+    data: bytes
+
+
+@dataclass(frozen=True)
+class _CandidateGitdirPin:
+    """What the candidate worktree's git calls are held to after `worktree add`
+    (`_pin_candidate_gitfile`): the `.git` gitfile (DW-442); the admin dir its
+    `gitdir:` line names, as the path that line resolves to (`admin_dir`) and
+    the `pinned_root_identity` taken through that same path (DW-493, DW-495);
+    and that admin dir's `commondir` file (DW-493)."""
+
+    gitfile: _PinnedFile
+    admin_dir: Path
+    admin_identity: os.stat_result
+    commondir: _PinnedFile
+
+
+def _read_pinned_file(path: Path, what: str) -> _PinnedFile:
+    """`path` as a pin, read without following a final-component link and
+    without blocking on a FIFO: `O_NOFOLLOW | O_NONBLOCK` and `S_ISREG` on the
+    DESCRIPTOR (the `diagnostics._count_lines` idiom), bounded to
+    `_CANDIDATE_GITFILE_MAX_BYTES`. The POSIX-only flags degrade to 0 on win32,
+    where opening a directory already fails and the fd check carries alone.
+    Anything else — a link, FIFO, directory, oversized or unreadable file —
+    raises `GitError` naming `what` (chained from the `OSError` or `ValueError`
+    where there is one)."""
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    flags |= getattr(os, "O_BINARY", 0)  # win32: no CRLF translation on the raw fd
+    try:
+        fd = os.open(path, flags)
+    except (OSError, ValueError) as exc:
+        raise GitError(f"{what} {path} could not be opened") from exc
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise GitError(f"{what} {path} is not a regular file")
+        chunks: list[bytes] = []
+        size = 0
+        while size <= _CANDIDATE_GITFILE_MAX_BYTES:
+            chunk = os.read(fd, _CANDIDATE_GITFILE_MAX_BYTES + 1 - size)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            size += len(chunk)
+    except OSError as exc:
+        raise GitError(f"{what} {path} could not be read") from exc
+    finally:
+        os.close(fd)
+    if size > _CANDIDATE_GITFILE_MAX_BYTES:
+        raise GitError(f"{what} {path} is too large")
+    return _PinnedFile(info.st_dev, info.st_ino, b"".join(chunks))
+
+
+def _read_candidate_gitfile(root: Path) -> _PinnedFile:
+    """`root/.git` as a pin, through `_read_pinned_file`."""
+    return _read_pinned_file(root / ".git", "candidate checkout gitfile")
+
+
+def _read_candidate_commondir(admin_dir: Path) -> _PinnedFile:
+    """`admin_dir/commondir` as a pin, through `_read_pinned_file`."""
+    return _read_pinned_file(admin_dir / "commondir", "candidate worktree commondir")
+
+
+def _same_pinned_file(current: _PinnedFile, pinned: _PinnedFile) -> bool:
+    """Whether a re-read file still is the pinned one: equal `(st_dev, st_ino)`
+    and bytes. A zero inode on either side carries no identity and never
+    matches."""
+    return (
+        current.ino != 0
+        and pinned.ino != 0
+        and (current.dev, current.ino) == (pinned.dev, pinned.ino)
+        and current.data == pinned.data
+    )
+
+
+def _pin_candidate_gitfile(
+    repo_root: Path, candidate_root: Path, root_identity: os.stat_result
+) -> _CandidateGitdirPin:
+    """Pin the candidate's `.git` gitfile, the admin dir it names and that dir's
+    `commondir` right after the root pin (DW-442, DW-493).
+
+    Git picks the repository for `git -C <candidate_root>` from this file's
+    `gitdir:` line, so a same-uid writer that rewrites it steers every later
+    candidate git call — and its index and object writes — into whatever
+    repository it names. The root pin cannot see that: the root is untouched.
+
+    The root pin is re-checked first, so a root swapped since `root_identity`
+    was taken refuses as a replaced root rather than as a foreign gitfile read
+    through it. The pin is then taken only when the file is a regular file with
+    a nonzero inode whose `gitdir:` (parsed as git does: the `gitdir: ` prefix,
+    trailing CR/LF dropped, a relative path resolved against the candidate
+    root, as `worktree.useRelativePaths` writes it) names a real directory — not
+    a link, not a reparse link, not `..` — directly under this repository's
+    `<git-common-dir>/worktrees/`, and whose `gitdir` back-pointer (read the
+    same no-follow, non-blocking, bounded way; a relative value resolved against
+    the admin dir) names this candidate's `.git`, and whose `commondir` (read
+    and resolved the same way) names this repository's common dir. The
+    back-pointer is what keeps a sibling linked worktree's admin dir from
+    passing: its index and HEAD would otherwise take the candidate's writes;
+    the `commondir` is what keeps a forged admin dir planted under `worktrees/`
+    from routing the object and ref writes into another repository's common
+    dir. That location check covers the
+    window between `worktree add` and the pin, which no later compare can.
+
+    The returned pin holds the gitfile's exact bytes and identity, the admin
+    dir's `pinned_root_identity` taken through the very path the `gitdir:` line
+    resolves to — the path git itself re-resolves on every later call, so an
+    intermediate directory of it that is a link is held through its target at
+    the pin (DW-495) — and the `commondir` file's exact bytes and identity
+    (DW-493); `_require_pinned_candidate` holds every later call to all three.
+    The location is not canonicalized: holding the identity is what closes a
+    later retarget, and a canonical-path compare would only narrow it while
+    risking false refusals (`/var` vs `/private/var`, win32 case). An admin dir
+    or `commondir` with a zero inode carries no identity and is refused here,
+    as the gitfile is. Anything else — a NUL byte or an undecodable value
+    included — raises `GitError`."""
+    if not platform_util._root_still_pinned(candidate_root, root_identity):
+        raise GitError("detached candidate checkout root was replaced")
+    pin = _read_candidate_gitfile(candidate_root)
+    if pin.ino == 0:
+        raise GitError("candidate checkout gitfile carries no file identity")
+    rc, raw, detail = _git_raw_out(
+        repo_root, "rev-parse", "--path-format=absolute", "--git-common-dir"
+    )
+    if rc != 0:
+        raise GitError(f"git common directory probe failed in {repo_root}: {detail}")
+    common_dir = Path(raw.removesuffix("\n"))
+    refused = GitError(
+        f"candidate checkout gitfile {candidate_root / '.git'} does not name a "
+        f"worktree of {repo_root}"
+    )
+    prefix = b"gitdir: "
+    if not pin.data.startswith(prefix):
+        raise refused
+    value = pin.data[len(prefix) :].rstrip(b"\r\n")
+    if not value:
+        raise refused
+    try:
+        gitdir = candidate_root / os.fsdecode(value)
+        if gitdir.name in ("", ".."):
+            raise refused
+        admin_identity = pinned_root_identity(gitdir)
+        if admin_identity is None:
+            raise refused
+        if not os.path.samefile(gitdir.parent, common_dir / "worktrees"):
+            raise refused
+        back_value = _read_pinned_file(gitdir / "gitdir", "candidate worktree back-pointer")
+        back_raw = back_value.data.rstrip(b"\r\n")
+        if not back_raw:
+            raise refused
+        back = gitdir / os.fsdecode(back_raw)
+        if not os.path.samefile(back, candidate_root / ".git"):
+            raise refused
+        commondir_value = _read_candidate_commondir(gitdir)
+        commondir_raw = commondir_value.data.rstrip(b"\r\n")
+        if not commondir_raw:
+            raise refused
+        if not os.path.samefile(gitdir / os.fsdecode(commondir_raw), common_dir):
+            raise refused
+    except (GitError, OSError, ValueError) as exc:
+        if exc is refused:
+            raise
+        raise refused from exc
+    if admin_identity.st_ino == 0:
+        raise GitError("candidate worktree admin dir carries no file identity")
+    if commondir_value.ino == 0:
+        raise GitError("candidate worktree commondir carries no file identity")
+    return _CandidateGitdirPin(pin, gitdir, admin_identity, commondir_value)
+
+
+def _require_pinned_candidate(
+    root: Path, identity: os.stat_result, pin: _CandidateGitdirPin
+) -> None:
+    """Refuse a git call on the candidate worktree unless `root` is still the
+    directory pinned right after `worktree add` (DW-425), its `.git` gitfile
+    still has the pinned `(st_dev, st_ino)` and bytes (DW-442), the admin dir
+    that gitfile names still resolves to the pinned directory, and that dir's
+    `commondir` still has the pinned `(st_dev, st_ino)` and bytes (DW-493,
+    DW-495).
+
+    Git takes the root by path, so a root swapped for a link would steer the
+    call into whatever the link names; it takes the repository from the
+    gitfile's `gitdir:` line, so a rewritten gitfile would steer it into another
+    repository's index and object store; and it re-resolves that line's admin
+    dir path and the `commondir` inside it on every call, so an admin dir
+    swapped for a link, an intermediate directory link of its path retargeted,
+    or a rewritten `commondir` would steer it the same way with the gitfile
+    untouched. The root is checked first, then the gitfile, re-read no-follow
+    and non-blocking; then the admin dir, an `lstat` of `pin.admin_dir` against
+    its pinned identity (`_root_still_pinned`: a link or a different directory
+    refuses); then the `commondir`, re-read the gitfile's way. A zero inode
+    never matches. All four are check-then-act — the residual
+    `_root_still_pinned` documents: a swap or rewrite landing between this check
+    and git's own read of the path still wins. The common dir the `commondir`
+    names is taken by path, as every git call on the repository root takes it."""
+    if not platform_util._root_still_pinned(root, identity):
+        raise GitError("detached candidate checkout root was replaced")
+    try:
+        current = _read_candidate_gitfile(root)
+    except GitError as exc:
+        raise GitError("candidate checkout gitfile was rewritten or replaced") from exc
+    if not _same_pinned_file(current, pin.gitfile):
+        raise GitError("candidate checkout gitfile was rewritten or replaced")
+    if not platform_util._root_still_pinned(pin.admin_dir, pin.admin_identity):
+        raise GitError("candidate worktree admin dir was replaced")
+    try:
+        commondir = _read_candidate_commondir(pin.admin_dir)
+    except GitError as exc:
+        raise GitError("candidate worktree commondir was rewritten or replaced") from exc
+    if not _same_pinned_file(commondir, pin.commondir):
+        raise GitError("candidate worktree commondir was rewritten or replaced")
+
+
+def _linked_worktree_admin_fault(repo_root: Path) -> str | None:
+    """Why `worktree remove`/`worktree prune` must not run on `repo_root`, or
+    None when its `<git-common-dir>/worktrees/` holds no link-like entry
+    (DW-494).
+
+    Git 2.55 follows a symlinked (or win32 junction) entry under `worktrees/`
+    during `worktree prune`, and during `worktree remove --force` when the
+    entry's back-pointer claims the removed path, emptying whatever the link
+    names — another repository's `.git` included. Each entry is classified by
+    `link_like_stat` over its no-follow `DirEntry` stat. A missing `worktrees/`
+    holds nothing; a failed common-dir probe or an unlistable `worktrees/` is a
+    fault, since it proves nothing safe. The fault names each linked entry and
+    the manual recovery. A check, not a lock: a link planted between it and
+    git's own walk still wins."""
+    try:
+        rc, raw, detail = _git_raw_out(
+            repo_root, "rev-parse", "--path-format=absolute", "--git-common-dir"
+        )
+    except GitError as exc:
+        return f"git common directory probe failed: {exc}"
+    if rc != 0:
+        return f"git common directory probe failed: {detail}"
+    worktrees = Path(raw.removesuffix("\n")) / "worktrees"
+    linked: list[str] = []
+    try:
+        entries = os.scandir(worktrees)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        return f"worktree admin directory {worktrees} could not be listed: {exc}"
+    try:
+        with entries:
+            for entry in entries:
+                try:
+                    info = entry.stat(follow_symlinks=False)
+                except FileNotFoundError:
+                    continue  # gone since the listing: nothing left for git to follow
+                if platform_util.link_like_stat(info):
+                    linked.append(entry.name)
+    except OSError as exc:
+        return f"worktree admin directory {worktrees} could not be listed: {exc}"
+    linked.sort()
+    if not linked:
+        return None
+    names = ", ".join(str(worktrees / name) for name in linked)
+    return (
+        f"linked worktree admin entry {names} would be followed by git, which "
+        "empties its target; git worktree cleanup skipped — remove the link "
+        "(not its target), then run `git worktree prune`"
+    )
+
+
 def commit_path_bound(
     repo: Path,
     message: str,
@@ -10479,6 +11695,113 @@ def commit_path_bound(
     tracked has since been deleted by a rival commit, and the publication
     refuses rather than re-adding it. Without it an absent target has no
     authority and is refused the same way.
+
+    The candidate checkout — the `worktree add` and the index population —
+    runs with repository hooks disabled (`-c core.hooksPath=<empty dir>`,
+    command-line config outranking any repo-configured path): the index write
+    would otherwise fire a `post-index-change` hook (and a full checkout a
+    `post-checkout` one) before the accepted bytes land, which could leave any
+    pathname behind (DW-326). It is
+    also filter-free and fsmonitor-free (DW-401): `worktree add --no-checkout`
+    under `-c core.fsmonitor=` (empty: off on every supported git — before 2.36
+    the key is a hook path, so `false` would name a command) writes nothing but
+    `.git`, and the
+    candidate index is filled from the captured commit by `read-tree` without
+    `-u`, so no repo-configured smudge/process filter or fsmonitor command runs
+    before the accepted bytes land. The orchestrator writes only the target
+    path (and its missing parents) into the candidate worktree. Only that checkout is
+    hook-, filter- and fsmonitor-free — the candidate `git add` still applies
+    the clean filter (checkin attributes fall back to the index when a
+    directory's `.gitattributes` is absent from the worktree), and the
+    candidate `git commit` still runs the repo's pre-commit and commit-msg
+    hooks, and validation catches what they change. Those hooks now see a
+    worktree holding only the target, so the rest of the tree reads as
+    unstaged deletions; a hook that stages them (`git add -A`) is refused by
+    the one-path scope validation before anything publishes.
+    The accepted bytes are written through the descriptor-anchored confined
+    writer, so on POSIX a symlink or FIFO at the leaf is replaced rather than
+    written through and a redirected ancestor refuses the write (win32 gets the
+    confined writer's documented check-then-write degrade); the staged mode is
+    pinned to the captured target's with `git add --chmod`.
+
+    The candidate root is pinned once, right after `worktree add` (DW-338),
+    and re-checked against that pin before every later git call on it — the
+    index population, `git add`, the staged-entry read, `git commit` and the
+    candidate `rev-parse` — and before the cleanup `worktree remove` (DW-425):
+    git takes the root by path, so a root swapped for a link would steer those
+    calls elsewhere. A replaced root refuses with a typed `GitError`, and
+    cleanup skips the remove and leaves the registration to the prune below.
+    Each re-check is an `lstat` compare, check-then-act: a swap landing between
+    the check and git's own open of the path is the accepted residual. The pin is
+    the candidate's MINT-TIME identity, held for the checkout's whole one-call
+    lifetime (a per-call `TemporaryDirectory`), so it needs no persisted record
+    (DW-446): a PARENT directory swapped after the pin for a link to a tree
+    holding a real `candidate/` resolves every re-check to that other directory,
+    whose identity does not match, and refuses.
+
+    The candidate `.git` gitfile is pinned right after the root (DW-442): git
+    picks the repository for those calls from its `gitdir:` line, so a rewrite
+    would steer their index and object writes into another repository. At the
+    pin (taken after a root re-check) it must be a regular file whose `gitdir:`
+    names a real directory directly under this repository's
+    `<git-common-dir>/worktrees/` whose `gitdir` back-pointer names this
+    candidate's `.git` and whose `commondir` names this repository's common dir
+    (covering the add-to-pin window, a sibling linked worktree's admin dir and
+    a forged one included); each of the five re-checks above then
+    re-reads it no-follow and non-blocking and refuses with a typed `GitError`
+    unless its `(st_dev, st_ino)` and bytes still match the pin. Git re-resolves
+    the admin dir the gitfile names, and that dir's `commondir`, by path on
+    every later call, so both are pinned beside it (DW-493): the admin dir's
+    identity taken through the path the `gitdir:` line resolves to, and the
+    `commondir`'s `(st_dev, st_ino)` and bytes. The same five re-checks refuse
+    an admin dir swapped for a link, an intermediate directory link of its path
+    retargeted to another tree (DW-495), or a rewritten `commondir`. The
+    residual is the same check-then-act one — a rewrite between the re-check
+    and git's own read of the path still wins. The
+    cleanup `worktree remove` is left as it is — git refuses to remove a
+    worktree whose gitfile does not point back, which lands as a noted cleanup
+    fault and the prune.
+
+    The object-content reads run under `GIT_NO_REPLACE_OBJECTS=1`
+    (`_bound_git_env`), so those decisions are made on the raw objects the
+    published commit carries rather than on `git replace` substitutes: the
+    candidate checkout and candidate commit, and the validator's parent,
+    path-scope and tree-entry reads (DW-331); the baseline blob read (DW-398);
+    the accepted-transition ancestry walk and the cleanliness and
+    non-tree-ancestor probes (DW-399); and the target-local index `reset`
+    (DW-400). Ref-name/ref-value probes, index-only reads, blob hashing and the
+    `update-ref` transaction keep the inherited environment; `_bound_git_env`
+    says why.
+
+    Cleanup of the candidate worktree is never silently dropped (DW-324/325): a
+    `worktree remove` that exits non-zero or raises is raised as `GitError` when
+    nothing else is propagating, and otherwise attached as a note to the error
+    that is. Either way, once the temporary directory is gone, a best-effort
+    `worktree prune` drops the stale administrative entry — also after a
+    `worktree add` that exits non-zero or raises (a timeout included), since it
+    may already have registered one (DW-402). The temporary directory's own
+    removal never replaces the propagating error: a directory that survives it
+    is named in a note on that error, and tolerated silently on success because
+    the published commit is truthful (DW-403). A root that was never pinned or
+    has been replaced skips `worktree remove` and counts as such a cleanup
+    fault (DW-425). A link-like entry under `<git-common-dir>/worktrees/` —
+    which git follows during both commands, emptying its target — skips the
+    remove the same way, and skips the prune with a note on the propagating
+    error naming the entry and the manual recovery (DW-494); both checks are
+    check-then-act, re-taken right before each command. Missing candidate
+    parents are created component by component beneath the candidate root
+    without following a redirected ancestor, so a swapped-in link refuses
+    before any directory is created outside it (DW-404) — handle-anchored on
+    POSIX and on win32 (DW-420).
+
+    Every success return is closed by a final observation. Where Git honours
+    `core.fileMode` the live exec bit must match the committed mode, refused
+    before any ref moves (DW-328); the clean/ignored `None` re-observes the
+    checkout identity and the target index entry after the cleanliness probe
+    (DW-329); and both publishing returns re-validate the live target after
+    index synchronization, so a rival writer during it refuses — the commit
+    already published stays, and replay decides (DW-330). A writer landing
+    after those final observations is the accepted DW-306 residual.
     """
     try:
         rc, top, _detail = _git_out(repo, "rev-parse", "--show-toplevel")
@@ -10538,94 +11861,258 @@ def commit_path_bound(
         raise GitError("real index holds foreign content at the publication target")
 
     if accepted is not None:
+        _bound_live_mode(repo_root, observed, expected_mode)
         _bound_live_ledger_identity(lexical, target, accepted_text, observed=observed)
         _synchronize_bound_index(repo_root, captured, rel, observed_index_entry)
+        _bound_live_ledger_identity(lexical, target, accepted_text, observed=observed)
         return accepted
 
     # Preserve generic clean/ignored behavior when no migration transition needs
     # replay.  In particular, an ignored ledger never earns a synthetic commit.
     try:
-        clean = path_clean(repo_root, rel)
+        clean = path_clean(repo_root, rel, env=_bound_git_env())
         ignored_untracked = clean and head_blob is None and path_ignored(repo_root, target)
     except GitError as exc:
         raise GitError("publication target cleanliness could not be validated") from exc
     if clean and (head_blob == accepted_oid or ignored_untracked):
+        # Bind the `None` to the captured commit: a checkout move or a target
+        # stage landing after the cleanliness probe refuses (DW-329). A clean
+        # status implies the index holds `head_entry` — None exactly when the
+        # target is ignored-untracked, which has no committed mode to hold.
+        if _bound_checkout_identity(repo_root) != captured:
+            raise GitError("checkout changed during exact-path clean validation")
+        if _bound_index_entry(repo_root, rel) != head_entry:
+            raise GitError("real index target changed during exact-path publication")
+        if not ignored_untracked:
+            _bound_live_mode(repo_root, observed, expected_mode)
         _bound_live_ledger_identity(lexical, target, accepted_text, observed=observed)
         return None
 
+    _bound_live_mode(repo_root, observed, expected_mode)
     active_error: BaseException | None = None
     candidate: str | None = None
     try:
-        has_non_tree_parent = path_has_non_tree_ancestor_at_revision(repo_root, captured.oid, rel)
+        has_non_tree_parent = path_has_non_tree_ancestor_at_revision(
+            repo_root, captured.oid, rel, env=_bound_git_env()
+        )
     except GitError as exc:
         raise GitError("candidate publication parent shape could not be validated") from exc
     if has_non_tree_parent:
         raise GitError("candidate publication path has a non-directory committed parent")
-    with tempfile.TemporaryDirectory() as td:
-        candidate_root = Path(td) / "candidate"
-        rc, _out = _git(
-            repo_root,
-            "worktree",
-            "add",
-            "--detach",
-            str(candidate_root),
-            captured.oid,
-        )
-        if rc != 0:
-            raise GitError(f"git detached candidate checkout failed in {repo_root}")
-        try:
-            candidate_path = candidate_root / rel
+    cleanup_fault = False
+    propagating: BaseException | None = None
+    temp_dir: str | None = None
+    try:
+        # A failed rmtree must not replace the typed error propagating out of
+        # the block (DW-403); a leftover is named on that error below.
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            temp_dir = td
+            candidate_root = Path(td) / "candidate"
+            hooks_dir = Path(td) / "no-hooks"
             try:
-                candidate_path.parent.mkdir(parents=True, exist_ok=True)
-                candidate_path.write_bytes(accepted_bytes)
-            except (OSError, RuntimeError, ValueError) as exc:
-                raise GitError("exact-path candidate content could not be written") from exc
-            rc, _out = _git(candidate_root, "add", "--", *_literal_specs([rel]))
-            if rc != 0:
-                raise GitError(f"git exact-path candidate staging failed in {repo_root}")
-            staged_entry = _bound_index_entry(candidate_root, rel)
-            if staged_entry != _BoundGitEntry(expected_mode, "blob", accepted_oid):
-                raise GitError("exact-path candidate staging changed accepted content")
-            _bound_live_ledger_identity(lexical, target, accepted_text, observed=observed)
-            if _bound_checkout_identity(repo_root) != captured:
-                raise GitError("checkout changed before exact-path candidate hooks")
-            rc, _out = _git(candidate_root, "commit", "-m", message)
-            if rc != 0:
-                raise GitError(f"git exact-path candidate commit failed in {repo_root}")
+                hooks_dir.mkdir()
+            except OSError as exc:
+                raise GitError("detached candidate hook isolation could not be prepared") from exc
+            # An add can register `.git/worktrees/<name>` and still fail or time
+            # out, so any failure marks the fault the outer prune clears (DW-402).
+            # `--no-checkout` with fsmonitor off: the add writes nothing but
+            # `.git`, so no repo-configured smudge/process filter or fsmonitor
+            # command runs before the accepted bytes land (DW-401).
             try:
-                candidate = rev_parse_head(candidate_root)
-            except GitError as exc:
-                raise GitError("exact-path candidate identity could not be validated") from exc
-            _validate_bound_candidate(
-                repo_root,
-                candidate,
-                captured.oid,
-                rel,
-                accepted_oid,
-                baseline_oid,
+                rc, _out = _git_env(
+                    repo_root,
+                    "-c",
+                    f"core.hooksPath={hooks_dir}",
+                    "-c",
+                    "core.fsmonitor=",
+                    "worktree",
+                    "add",
+                    "--no-checkout",
+                    "--detach",
+                    str(candidate_root),
+                    captured.oid,
+                    env=_bound_git_env(),
+                )
+            except BaseException:
+                cleanup_fault = True
+                raise
+            if rc != 0:
+                cleanup_fault = True
+                raise GitError(f"git detached candidate checkout failed in {repo_root}")
+            candidate_identity: os.stat_result | None = None
+            try:
+                candidate_path = candidate_root / rel
+                executable = expected_mode == "100755"
+
+                def _pin_exec_bit(fd: int | None) -> None:
+                    # The confined writer creates at 0600; carry the captured
+                    # target's exec bit onto the inode so a hook that re-adds
+                    # the file stages the same mode `--chmod` pins below.
+                    # Windows has no exec bit (and no `os.fchmod` before
+                    # 3.13); its `core.fileMode=false` keeps the pinned mode.
+                    if fd is None or not executable or os.name != "posix":
+                        return
+                    os.fchmod(fd, (os.fstat(fd).st_mode & 0o777) | 0o100)
+
+                # Pin the engine-minted candidate root once, right after the
+                # add: a root replaced by a link afterwards is refused by both
+                # the parent creation and the write (DW-338).
+                candidate_identity = pinned_root_identity(candidate_root)
+                if candidate_identity is None:
+                    raise GitError("detached candidate checkout root is missing or redirected")
+                # Pin the gitfile beside it: git picks the repository from its
+                # `gitdir:` line, so a rewrite would steer every later candidate
+                # git call into another repository (DW-442) — and the admin dir
+                # that line names and its `commondir`, which git re-resolves by
+                # path on every call (DW-493, DW-495).
+                candidate_pin = _pin_candidate_gitfile(
+                    repo_root, candidate_root, candidate_identity
+                )
+                # `--no-checkout` leaves the candidate index empty; fill it from
+                # the captured commit without `-u`, so the worktree stays
+                # untouched and no smudge runs (DW-401). It stands in for the
+                # checkout's index half, so it reads raw objects (DW-331), and
+                # runs hook-free like the add: its index write would otherwise
+                # fire `post-index-change` before the accepted bytes land (DW-326).
+                _require_pinned_candidate(candidate_root, candidate_identity, candidate_pin)
+                rc, _out = _git_env(
+                    candidate_root,
+                    "-c",
+                    f"core.hooksPath={hooks_dir}",
+                    "-c",
+                    "core.fsmonitor=",
+                    "read-tree",
+                    captured.oid,
+                    env=_bound_git_env(),
+                )
+                if rc != 0:
+                    raise GitError(
+                        f"detached candidate index could not be populated in {repo_root}"
+                    )
+                try:
+                    _make_candidate_parents(
+                        candidate_root, candidate_path.parent, root_identity=candidate_identity
+                    )
+                    atomic_write_bytes_confined(
+                        candidate_path,
+                        accepted_bytes,
+                        confine_root=candidate_root,
+                        root_identity=candidate_identity,
+                        _after_replace=_pin_exec_bit,
+                    )
+                except (OSError, RuntimeError, ValueError) as exc:
+                    raise GitError("exact-path candidate content could not be written") from exc
+                _require_pinned_candidate(candidate_root, candidate_identity, candidate_pin)
+                rc, _out = _git(
+                    candidate_root,
+                    "add",
+                    "--chmod=+x" if executable else "--chmod=-x",
+                    "--",
+                    *_literal_specs([rel]),
+                )
+                if rc != 0:
+                    raise GitError(f"git exact-path candidate staging failed in {repo_root}")
+                _require_pinned_candidate(candidate_root, candidate_identity, candidate_pin)
+                staged_entry = _bound_index_entry(candidate_root, rel)
+                if staged_entry != _BoundGitEntry(expected_mode, "blob", accepted_oid):
+                    raise GitError("exact-path candidate staging changed accepted content")
+                _bound_live_ledger_identity(lexical, target, accepted_text, observed=observed)
+                if _bound_checkout_identity(repo_root) != captured:
+                    raise GitError("checkout changed before exact-path candidate hooks")
+                _require_pinned_candidate(candidate_root, candidate_identity, candidate_pin)
+                rc, _out = _git_env(candidate_root, "commit", "-m", message, env=_bound_git_env())
+                if rc != 0:
+                    raise GitError(f"git exact-path candidate commit failed in {repo_root}")
+                _require_pinned_candidate(candidate_root, candidate_identity, candidate_pin)
+                try:
+                    candidate = rev_parse_head(candidate_root)
+                except GitError as exc:
+                    raise GitError("exact-path candidate identity could not be validated") from exc
+                _validate_bound_candidate(
+                    repo_root,
+                    candidate,
+                    captured.oid,
+                    rel,
+                    accepted_oid,
+                    baseline_oid,
+                )
+                _bound_live_ledger_identity(lexical, target, accepted_text, observed=observed)
+                _publish_bound_candidate(
+                    repo_root,
+                    captured,
+                    candidate,
+                    rel,
+                    accepted_oid,
+                    baseline_oid,
+                )
+            except BaseException as exc:
+                active_error = exc
+                raise
+            finally:
+                cleanup_detail: str | None = None
+                cleanup_exc: GitError | None = None
+                # `worktree remove --force` takes the root by path too: a root
+                # never pinned, or replaced since, would have git delete
+                # whatever it now names (DW-425). Skip it and leave the entry
+                # to the prune below, once the temporary directory is gone.
+                if candidate_identity is None:
+                    cleanup_detail = "candidate root was never pinned; worktree remove skipped"
+                elif not platform_util._root_still_pinned(candidate_root, candidate_identity):
+                    cleanup_detail = "candidate root was replaced; worktree remove skipped"
+                elif (link_fault := _linked_worktree_admin_fault(repo_root)) is not None:
+                    # Git follows a linked admin entry during the remove too,
+                    # when its back-pointer claims the candidate (DW-494).
+                    cleanup_detail = link_fault
+                else:
+                    try:
+                        rc, out = _git(
+                            repo_root,
+                            "worktree",
+                            "remove",
+                            "--force",
+                            str(candidate_root),
+                        )
+                        if rc != 0:
+                            cleanup_detail = out
+                    except GitError as exc:
+                        cleanup_exc = exc
+                        cleanup_detail = str(exc)
+                if cleanup_detail is not None:
+                    cleanup_fault = True
+                    if active_error is None:
+                        raise GitError(
+                            f"git detached candidate cleanup failed in {repo_root}: "
+                            f"{cleanup_detail}"
+                        ) from cleanup_exc
+                    active_error.add_note(
+                        f"git detached candidate cleanup also failed in {repo_root}: "
+                        f"{cleanup_detail}"
+                    )
+    except BaseException as exc:
+        propagating = exc
+        # Only a failing publication names the leftover; a published commit is
+        # truthful, so the success path tolerates it silently.
+        if temp_dir is not None and os.path.lexists(temp_dir):
+            exc.add_note(
+                f"detached candidate temporary directory was left at {temp_dir}; "
+                "its candidate worktree registration may also remain — remove the "
+                "directory, then run `git worktree prune`"
             )
-            _bound_live_ledger_identity(lexical, target, accepted_text, observed=observed)
-            _publish_bound_candidate(
-                repo_root,
-                captured,
-                candidate,
-                rel,
-                accepted_oid,
-                baseline_oid,
-            )
-        except BaseException as exc:
-            active_error = exc
-            raise
-        finally:
-            rc, _out = _git(
-                repo_root,
-                "worktree",
-                "remove",
-                "--force",
-                str(candidate_root),
-            )
-            if rc != 0 and active_error is None:
-                raise GitError(f"git detached candidate cleanup failed in {repo_root}")
+        raise
+    finally:
+        # `worktree prune` only drops entries whose directory is gone, so it
+        # runs here, after `TemporaryDirectory` has deleted the checkout. A
+        # cleanup fault is always propagating; a linked admin entry git would
+        # follow skips the prune and is named on that error (DW-494).
+        if cleanup_fault:
+            link_fault = _linked_worktree_admin_fault(repo_root)
+            if link_fault is None:
+                worktree_prune(repo_root)
+            else:
+                note = f"git worktree prune skipped in {repo_root}: {link_fault}"
+                if propagating is None:
+                    raise GitError(note)
+                propagating.add_note(note)
 
     assert candidate is not None
     _bound_live_ledger_identity(lexical, target, accepted_text, observed=observed)
@@ -10635,4 +12122,5 @@ def commit_path_bound(
         candidate,
     )
     _synchronize_bound_index(repo_root, expected_checkout, rel, observed_index_entry)
+    _bound_live_ledger_identity(lexical, target, accepted_text, observed=observed)
     return candidate

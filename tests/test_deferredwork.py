@@ -1289,6 +1289,34 @@ def test_next_seq_empty_starts_at_one():
     assert next_seq("# Deferred Work\n") == 1
 
 
+def test_next_seq_ignores_ids_mentioned_outside_headings(tmp_path):
+    """DW-384: a far-higher id named in prose, a body field or a heading's own
+    title does not steer allocation — only heading ids do. Ablation: scan the
+    whole text again and this mints DW-901."""
+    text = (
+        "# Deferred Work\n\nSee DW-900 in the old tracker.\n\n"
+        "### DW-3: supersedes DW-800\norigin: o\nreason: dup of DW-900\nstatus: open\n"
+    )
+    assert next_seq(text) == 4
+    p = tmp_path / "deferred-work.md"
+    p.write_text(text, encoding="utf-8")
+    assert append_entry(p, title="t", origin="o2", source_spec="s.md", reason="r") == "DW-4"
+
+
+def test_next_seq_counts_malformed_headings():
+    """A heading `parse_ledger` cannot read still spoke for its number, so it is
+    never reused."""
+    for heading in (
+        "### DW-9 no colon",
+        "### DW-9:",
+        "###  DW-9: two spaces",
+        "###\tDW-9: tab",
+        "   ### DW-9: indented",
+        "```\n### DW-9: fenced example\n```",
+    ):
+        assert next_seq(f"### DW-2: a\n\n{heading}\nstatus: open\n") == 10, heading
+
+
 def test_append_entry_numbers_and_writes(tmp_path):
     p = tmp_path / "deferred-work.md"
     p.write_text("# Deferred Work\n\n### DW-4: existing\norigin: test\nstatus: open\n")
@@ -1644,18 +1672,101 @@ def test_append_entry_encode_failure_cannot_truncate_the_ledger(tmp_path, monkey
 
 
 def test_field_line_present_matches_field_not_substring():
-    body = (
+    (entry,) = parse_ledger(
         "### DW-1: x\norigin: review-budget-followup\n"
         "source_spec: `spec-foo.md`\nreason: mentions spec-foobar.md and review-budget-followup-x\n"
         "status: open\n"
     )
     # exact field-line matches (plain and backtick-wrapped)
-    assert field_line_present(body, "origin", "review-budget-followup")
-    assert field_line_present(body, "source_spec", "spec-foo.md")
+    assert field_line_present(entry, "origin", "review-budget-followup")
+    assert field_line_present(entry, "source_spec", "spec-foo.md")
     # a superstring value must not match the shorter field line
-    assert not field_line_present(body, "origin", "review-budget")
+    assert not field_line_present(entry, "origin", "review-budget")
     # a value that only appears incidentally inside `reason:` is not a field line
-    assert not field_line_present(body, "source_spec", "spec-foobar.md")
+    assert not field_line_present(entry, "source_spec", "spec-foobar.md")
+
+
+FENCED_KEYS_LEDGER = (
+    "# Deferred Work\n\n"
+    "### DW-1: documents the dedupe keys\n\n"
+    "origin: something else\n"
+    "```markdown\n"
+    "origin: harvest x\n"
+    "source_spec: `spec-y.md`\n"
+    "```\n"
+    "reason: quotes a worked example\n"
+    "status: open\n"
+)
+
+
+def test_field_line_present_skips_fenced_examples():
+    """DW-408. A fenced example's `origin:`/`source_spec:` lines sit in column 0,
+    where the anchor looks, but a quoted example is no key the entry holds.
+
+    Ablation: drop the `_quoted` filter in `field_line_present` and this fails."""
+    (entry,) = parse_ledger(FENCED_KEYS_LEDGER)
+    assert not field_line_present(entry, "origin", "harvest x")
+    assert not field_line_present(entry, "source_spec", "spec-y.md")
+    assert field_line_present(entry, "origin", "something else")  # the live line still counts
+
+
+def test_append_entry_not_suppressed_by_a_fenced_origin(tmp_path):
+    """DW-408. The appender's idempotence scan reads through the same fence rule,
+    so an open entry quoting the marker does not swallow a legitimate append.
+
+    Ablation: drop the `_quoted` filter in `field_line_present` and this returns
+    None instead of minting DW-2."""
+    path = write_ledger(tmp_path, FENCED_KEYS_LEDGER)
+    minted = append_entry(
+        path, title="real finding", origin="harvest x", source_spec="spec-y.md", reason="r"
+    )
+    assert minted == "DW-2"
+    assert "### DW-2: real finding" in path.read_text(encoding="utf-8")
+
+
+ONLY_FENCED_KEYS_LEDGER = (
+    "# Deferred Work\n\n"
+    "### DW-1: quotes its only dedupe keys\n\n"
+    "```markdown\n"
+    "origin: harvest x\n"
+    "source_spec: `spec-y.md`\n"
+    "```\n"
+    "reason: every origin/source_spec line is an example\n"
+    "status: open\n"
+)
+
+
+def test_fenced_only_origin_is_no_key(tmp_path):
+    """DW-408. An open entry whose ONLY `origin:` and `source_spec:` lines are
+    fenced holds no dedupe key: the predicate says so, and the appender mints.
+
+    Ablation: drop the `_quoted` filter in `field_line_present` and both halves
+    fail."""
+    (entry,) = parse_ledger(ONLY_FENCED_KEYS_LEDGER)
+    assert entry.open
+    assert not field_line_present(entry, "origin", "harvest x")
+    assert not field_line_present(entry, "source_spec", "spec-y.md")
+    path = write_ledger(tmp_path, ONLY_FENCED_KEYS_LEDGER)
+    minted = append_entry(
+        path, title="real finding", origin="harvest x", source_spec="spec-y.md", reason="r"
+    )
+    assert minted == "DW-2"
+
+
+def test_append_entry_still_dedupes_against_a_live_origin(tmp_path):
+    """The fence rule narrows the match to live lines; it does not stop a live
+    `origin:` + `source_spec:` pair from deduping."""
+    path = write_ledger(
+        tmp_path,
+        "# Deferred Work\n\n### DW-1: live keys\n\n"
+        "origin: harvest x\nsource_spec: `spec-y.md`\nreason: r\nstatus: open\n",
+    )
+    before = path.read_bytes()
+    minted = append_entry(
+        path, title="replay", origin="harvest x", source_spec="spec-y.md", reason="r"
+    )
+    assert minted is None
+    assert path.read_bytes() == before
 
 
 # ------------------------------ closes_deferred declaration primitives (#234)
@@ -2410,6 +2521,34 @@ def test_gates_stop_at_the_canonical_span_boundary():
     (entry,) = parse_ledger(text)
 
     assert deferredwork.gates(entry).tokens == ()
+
+
+def test_field_values_reads_live_dedupe_keys_and_skips_fenced_examples():
+    """DW-363. `validate_migration` holds a rewrite to what this returns, so a
+    fenced worked example's `origin:` must not become a key the entry owns (a
+    faithful rewrite that trimmed the example would be refused), and the
+    backtick-wrapped `source_spec` must unwrap to the value `field_line_present`
+    matches. Indented or capitalised spellings are not keys: the dedupe scan's
+    column-0 anchor never matched them either.
+
+    Ablation: drop the `_quoted` skip and the fenced `origin: quoted` appears;
+    drop the unwrap and `spec.md` keeps its backticks."""
+    text = (
+        "# Deferred Work\n\n### DW-1: keyed\n\n"
+        "origin: live, 2026-06-01\n"
+        "source_spec: `spec.md`\n"
+        "reason: quotes an example:\n\n"
+        "```markdown\norigin: quoted\n```\n\n"
+        "  origin: indented\nOrigin: capitalised\n"
+        "origin: live, 2026-06-01  \n"
+        "status: open\n"
+    )
+
+    (entry,) = parse_ledger(text)
+
+    assert deferredwork.field_values(entry, "origin") == ("live, 2026-06-01",)
+    assert deferredwork.field_values(entry, "source_spec") == ("spec.md",)
+    assert deferredwork.field_values(entry, "gate") == ()
 
 
 # ------------------------------------------- ATX heading boundary shapes (#516)
@@ -3353,6 +3492,166 @@ def test_mark_open_leaves_a_pointer_to_the_archived_body(tmp_path):
     assert "reason: waiting on the codec seam" in blocks[0].body
 
 
+SEVERITY_STUB_LEDGER = (
+    "# Deferred Work\n\n"
+    "### DW-1: metadata recovered on reopen\n\n"
+    "origin: a\n"
+    "location: src/x.py:1\n"
+    "reason: waiting on the codec seam\n"
+    "severity: high\n"
+    "status: open\n"
+)
+
+
+def _archived_stub(tmp_path: Path, name: str, *, legacy: bool, text: str = SEVERITY_STUB_LEDGER):
+    """Close DW-1 reopenably and archive it, leaving a stub stamped 2026-08-24.
+    `legacy` deletes the stub's preserved severity line — the shape a stub had
+    before 695d4d6e — while the archive keeps its block intact."""
+    root = tmp_path / name
+    root.mkdir()
+    path = write_ledger(root, text)
+    close_reopenable(path, "DW-1", "bundle close")
+    assert archive_closed(path, archive_date="2026-08-24") == ["DW-1"]
+    if legacy:
+        stub_text = path.read_text(encoding="utf-8")
+        stub = parse_ledger(stub_text)[0]
+        assert "severity: high\n" in stub.body
+        path.write_text(stub_text.replace("severity: high\n", "", 1), encoding="utf-8")
+        assert parse_ledger(path.read_text(encoding="utf-8"))[0].severity is None
+    return path
+
+
+def test_mark_open_recovers_severity_of_a_legacy_stub_from_its_archive_block(tmp_path):
+    """DW-334/DW-394. A stub written before severity preservation reopens with
+    the severity its archive block carries, byte-identical to reopening the
+    modern stub, so a severity-floored sweep still selects it.
+
+    Ablation: drop the `restored` prefix, or the `_needs_severity_recovery`
+    check, inside `_apply_open` and the reopened legacy stub has no severity,
+    failing both the bytes and the selection. The read gate in `mark_open_many`
+    is pinned separately, by `test_mark_open_modern_stub_never_reads_the_archive`."""
+    modern = _archived_stub(tmp_path, "modern", legacy=False)
+    legacy = _archived_stub(tmp_path, "legacy", legacy=True)
+
+    assert mark_open(modern, "DW-1", "bundle close", OPERATION_ID) is True
+    assert mark_open(legacy, "DW-1", "bundle close", OPERATION_ID) is True
+
+    assert legacy.read_bytes() == modern.read_bytes()
+    reopened = parse_ledger(legacy.read_text(encoding="utf-8"))[0]
+    assert reopened.open
+    assert reopened.severity == "high"
+    assert "severity: high\narchived-body: 2026-08-24\n" in reopened.body
+    selection = select_entries([reopened], min_severity="high")
+    assert [entry.id for entry in selection.selected] == ["DW-1"]
+
+
+def test_mark_open_recovers_severity_from_the_last_stamp_matching_block(tmp_path):
+    """Several blocks per id is by design; the stub's stamp narrows, and file
+    order (closure order) breaks a same-stamp tie — the LAST match wins."""
+    path = _archived_stub(tmp_path, "several", legacy=True)
+    block = "### DW-1: metadata recovered on reopen\n\nstatus: done 2026-06-11\n"
+    (path.parent / ARCHIVE_REL).write_text(
+        "# Deferred Work Archive\n\n"
+        f"{block}archived: 2026-08-01\nseverity: low\n\n"
+        f"{block}archived: 2026-08-24\nseverity: high\n\n"
+        "### DW-2: another id, same stamp\n\nstatus: done 2026-06-11\n"
+        "archived: 2026-08-24\nseverity: critical\n\n"
+        f"{block}archived: 2026-08-24\nseverity: medium\n\n"
+        f"{block}archived: 2026-09-01\nseverity: critical\n",
+        encoding="utf-8",
+    )
+    assert mark_open(path, "DW-1", "bundle close", OPERATION_ID) is True
+    reopened = parse_ledger(path.read_text(encoding="utf-8"))[0]
+    assert reopened.severity == "medium"
+    assert [ln for ln in reopened.body.splitlines() if "severity" in ln] == ["severity: medium"]
+
+
+def test_mark_open_does_not_recover_a_fenced_archive_severity(tmp_path):
+    """A block whose only severity line is a fenced example has nothing a modern
+    stub would have preserved, so nothing is restored."""
+    text = SEVERITY_STUB_LEDGER.replace("severity: high\n", "```\nseverity: high\n```\n")
+    path = _archived_stub(tmp_path, "fenced", legacy=False, text=text)
+    assert "severity: high" in (path.parent / ARCHIVE_REL).read_text(encoding="utf-8")
+    assert mark_open(path, "DW-1", "bundle close", OPERATION_ID) is True
+    reopened = parse_ledger(path.read_text(encoding="utf-8"))[0]
+    assert reopened.open
+    assert reopened.severity is None
+    assert "severity" not in reopened.body
+
+
+@pytest.mark.parametrize("archive_state", ["missing", "no-matching-block"])
+def test_mark_open_legacy_stub_without_an_archive_block_reopens_severity_less(
+    tmp_path, archive_state
+):
+    """No archive, or no block for the id under the stub's stamp: the reopen
+    still succeeds and simply restores nothing."""
+    path = _archived_stub(tmp_path, archive_state, legacy=True)
+    archive_path = path.parent / ARCHIVE_REL
+    if archive_state == "missing":
+        archive_path.unlink()
+    else:
+        archive_text = archive_path.read_text(encoding="utf-8")
+        assert "archived: 2026-08-24" in archive_text
+        archive_path.write_text(
+            archive_text.replace("archived: 2026-08-24", "archived: 2026-08-23"),
+            encoding="utf-8",
+        )
+    assert mark_open(path, "DW-1", "bundle close", OPERATION_ID) is True
+    reopened = parse_ledger(path.read_text(encoding="utf-8"))[0]
+    assert reopened.open
+    assert reopened.severity is None
+    assert "archived-body: 2026-08-24" in reopened.body
+
+
+def test_mark_open_modern_stub_never_reads_the_archive(tmp_path):
+    """A stub that already carries its severity needs nothing from the archive,
+    so an undecodable archive cannot block its reopen."""
+    reference = _archived_stub(tmp_path, "reference", legacy=False)
+    path = _archived_stub(tmp_path, "modern", legacy=False)
+    (path.parent / ARCHIVE_REL).write_bytes(b"\xff")
+    assert mark_open(reference, "DW-1", "bundle close", OPERATION_ID) is True
+    assert mark_open(path, "DW-1", "bundle close", OPERATION_ID) is True
+    assert path.read_bytes() == reference.read_bytes()
+
+
+def test_mark_open_legacy_stub_over_an_undecodable_archive_refuses(tmp_path):
+    """When the recovery IS needed, an archive that exists but cannot be read
+    escalates and nothing is published — a severity-less reopen there is the
+    silent degrade the recovery exists to end."""
+    path = _archived_stub(tmp_path, "undecodable", legacy=True)
+    (path.parent / ARCHIVE_REL).write_bytes(b"\xff")
+    before = path.read_bytes()
+    with pytest.raises(deferredwork.LedgerReadError):
+        mark_open(path, "DW-1", "bundle close", OPERATION_ID)
+    assert path.read_bytes() == before
+
+
+def test_mark_open_many_recovers_only_the_legacy_stub(tmp_path):
+    """One locked pass, mixed stubs: the legacy one gets its block's severity,
+    the modern one keeps its own, and nothing else is rehydrated."""
+    text = SEVERITY_STUB_LEDGER + (
+        "\n### DW-2: modern stub\n\norigin: b\nlocation: src/y.py:2\n"
+        "reason: other\nseverity: low\nstatus: open\n"
+    )
+    path = write_ledger(tmp_path, text)
+    assert mark_done_many_reopenable(
+        path, ["DW-1", "DW-2"], "2026-06-11", "bundle close", OPERATION_ID
+    ) == ["DW-1", "DW-2"]
+    assert archive_closed(path, archive_date="2026-08-24") == ["DW-1", "DW-2"]
+    stubbed = path.read_text(encoding="utf-8")
+    path.write_text(stubbed.replace("severity: high\n", "", 1), encoding="utf-8")
+
+    assert mark_open_many(path, ["DW-1", "DW-2"], "bundle close", OPERATION_ID) == [
+        "DW-1",
+        "DW-2",
+    ]
+    entries = {e.id: e for e in parse_ledger(path.read_text(encoding="utf-8"))}
+    assert entries["DW-1"].severity == "high"
+    assert entries["DW-2"].severity == "low"
+    assert "reason:" not in entries["DW-1"].body  # severity only, never the body
+    assert "location:" not in entries["DW-1"].body
+
+
 def test_archive_reopened_stub_recloses_and_archives(tmp_path):
     """Full cycle: archive, reopen, re-close reopenably at a later date. Without
     the reopen-side strip the re-close rebuilds the exact stub shape and
@@ -3742,6 +4041,140 @@ def test_cross_spec_advisory_suppression_is_rechecked_under_the_lock(tmp_path, m
     entries = parse_ledger(path.read_text(encoding="utf-8"))
     assert [entry.id for entry in entries] == ["DW-1", "DW-2"]
     assert not entries[0].open and entries[1].open
+
+
+# --------------------------------------------- dedupe_any_status (DW-388)
+
+RETRO_ORIGIN = "retro action item epic-1-retro-item-1-add-x"
+
+RETRO_SEED = """\
+# Deferred Work
+
+### DW-1: Add X to the checklist
+origin: retro action item epic-1-retro-item-1-add-x
+location: n/a
+source_spec: `docs/retro-epic-1.md`
+severity: low
+reason: retrospective action item.
+status: {status}
+"""
+
+
+def _retro_spec(source_spec: str = "docs/retro-epic-1.md", **over) -> EntrySpec:
+    return EntrySpec(
+        title="Add X to the checklist",
+        origin=RETRO_ORIGIN,
+        source_spec=source_spec,
+        reason="retrospective action item.",
+        severity="low",
+        **over,
+    )
+
+
+@pytest.mark.parametrize("status", ["open", "done 2026-06-01"], ids=["open", "done"])
+def test_any_status_dedupe_suppresses_open_and_closed_twins(tmp_path, status):
+    """An any-status spec is suppressed by a twin of ANY status — and by origin
+    alone, so a twin filed under another `source_spec` counts too.
+
+    Ablation: drop the `dedupe_any_status` arm in `_apply_append` and the `done`
+    row files DW-2 (the default arm is open-only); the `open` row still dedupes
+    only because the source_spec matches, which the cross-spec row below pins."""
+    path = write_ledger(tmp_path, RETRO_SEED.format(status=status))
+    before = path.read_bytes()
+
+    assert append_entries(path, [_retro_spec(dedupe_any_status=True)]) == [None]
+    assert path.read_bytes() == before
+
+
+def test_any_status_dedupe_matches_origin_across_source_specs(tmp_path):
+    """Ablation: drop the `dedupe_any_status` arm and the differing
+    `source_spec` makes the default exact-pair scan miss the twin, minting DW-2."""
+    path = write_ledger(tmp_path, RETRO_SEED.format(status="done 2026-06-01"))
+
+    spec = _retro_spec(source_spec="sprint-status.yaml", dedupe_any_status=True)
+    assert append_entries(path, [spec]) == [None]
+
+
+def test_any_status_dedupe_suppresses_an_archived_stub_twin(tmp_path):
+    """An `archive_closed` stub keeps `origin:`, and that line alone must keep a
+    finished item from being re-filed after its body moved to the archive.
+
+    Ablation: drop the `dedupe_any_status` arm and this mints DW-2."""
+    path = write_ledger(tmp_path, RETRO_SEED.format(status="done 2026-06-01"))
+    assert archive_closed(path, archive_date="2026-08-24") == ["DW-1"]
+    (stub,) = parse_ledger(path.read_text(encoding="utf-8"))
+    assert "reason:" not in stub.body  # premise: the body really was archived
+    assert f"origin: {RETRO_ORIGIN}" in stub.body
+
+    assert append_entries(path, [_retro_spec(dedupe_any_status=True)]) == [None]
+    assert [e.id for e in parse_ledger(path.read_text(encoding="utf-8"))] == ["DW-1"]
+
+
+def test_any_status_dedupe_files_an_unseen_origin(tmp_path):
+    """The opt-in only suppresses on a real twin: a different origin files."""
+    path = write_ledger(tmp_path, RETRO_SEED.format(status="done 2026-06-01"))
+    spec = EntrySpec(
+        title="Something else",
+        origin="retro action item epic-1-retro-item-2-other",
+        source_spec="docs/retro-epic-1.md",
+        reason="r",
+        dedupe_any_status=True,
+    )
+    assert append_entries(path, [spec]) == ["DW-2"]
+
+
+def test_default_spec_still_refiles_over_a_closed_twin(tmp_path):
+    """The default (and cross-spec) semantics are unchanged: a closed twin does
+    not suppress, because recurring work comes back.
+
+    Ablation: make the any-status arm unconditional and this returns `[None]`."""
+    (tmp_path / "default").mkdir()
+    (tmp_path / "cross").mkdir()
+    default = write_ledger(tmp_path / "default", RETRO_SEED.format(status="done 2026-06-01"))
+    assert append_entries(default, [_retro_spec()]) == ["DW-2"]
+    cross = write_ledger(tmp_path / "cross", RETRO_SEED.format(status="done 2026-06-01"))
+    assert append_entries(cross, [_retro_spec(source_spec="x.md", cross_spec_dedupe=True)]) == [
+        "DW-2"
+    ]
+
+
+def test_any_status_dedupe_no_op_takes_no_lock(tmp_path, monkeypatch):
+    """The advisory pre-lock no-op stays in force for an any-status batch: its
+    twin cannot vanish before the lock (entries are never deleted, stubs keep
+    `origin:`), so a replay is answered from one read.
+
+    Ablation: widen the early return's exclusion to `dedupe_any_status` specs and
+    the lock is acquired."""
+    path = write_ledger(tmp_path, RETRO_SEED.format(status="done 2026-06-01"))
+    acquisitions = []
+    real_lock = deferredwork.ledger_lock
+
+    @contextlib.contextmanager
+    def counting_lock(p):
+        acquisitions.append(p)
+        with real_lock(p):
+            yield
+
+    monkeypatch.setattr(deferredwork, "ledger_lock", counting_lock)
+
+    assert append_entries(path, [_retro_spec(dedupe_any_status=True)]) == [None]
+    assert acquisitions == []
+
+
+def test_appended_text_equals_what_append_entries_publishes(tmp_path):
+    """`appended_text` is the writer's own fold, so a caller recomputing what a batch
+    WROTE (the DW-355 carry proof) lands on exactly the published text — including a
+    batch where one spec dedupes against an already-open entry (`BATCH_SPECS`' second
+    spec, minted None)."""
+    path = write_ledger(tmp_path, BATCH_SEED)
+    specs = [EntrySpec(**spec) for spec in BATCH_SPECS]
+
+    minted, published, _ = deferredwork.append_entries_published(path, specs)
+
+    assert None in minted  # the batch really does carry a deduped spec
+    assert published is not None
+    assert deferredwork.appended_text(BATCH_SEED, specs) == published
+    assert deferredwork.appended_text(BATCH_SEED, []) == BATCH_SEED
 
 
 def test_append_entries_validates_all_specs_before_writing(tmp_path, monkeypatch):

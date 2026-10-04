@@ -5,13 +5,23 @@ import json
 import re
 import subprocess
 import sys
+import time
+from pathlib import Path
 
 import pytest
-from conftest import machine_json, needs_strict_codec, write_script_launcher
+from conftest import (
+    machine_json,
+    needs_strict_codec,
+    read_pid,
+    wait_pid_gone,
+    write_script_launcher,
+)
+from test_childrun import _RETURN_CEILING_S
 from test_probe_hook import run_hook
 
-from bmad_loop import cli, probe, sanitize
+from bmad_loop import childrun, cli, probe, sanitize
 from bmad_loop.adapters.profile import get_profile
+from bmad_loop.process_host import ProcessHostError
 
 # ----------------------------------------------------------- fixtures / helpers
 
@@ -804,7 +814,11 @@ def test_binary_runs_returns_the_exit_code_of_a_real_child(tmp_path, exit_code):
     of this function is that a process actually launched and exited, and a mock
     proves nothing about that.
     """
-    launcher = write_script_launcher(tmp_path, "shim", f"import sys\nsys.exit({exit_code})\n")
+    # A spaced directory: the argv reaches the launcher as one element, never as a
+    # shell string that the space would split.
+    shim_dir = tmp_path / "shim dir"
+    shim_dir.mkdir()
+    launcher = write_script_launcher(shim_dir, "shim", f"import sys\nsys.exit({exit_code})\n")
 
     assert probe.binary_runs(str(launcher), timeout_s=30) == exit_code
 
@@ -828,63 +842,138 @@ def test_binary_runs_returns_none_when_the_process_cannot_be_launched(tmp_path):
     assert probe.binary_runs(str(missing), timeout_s=30) is None
 
 
-def test_binary_runs_returns_none_when_the_child_outlives_the_timeout(tmp_path):
-    """A child that never exits is killed at `timeout_s` and reported as None.
-
-    TimeoutExpired is a `subprocess.SubprocessError`, not an OSError, so this row is
-    what proves the guard names BOTH families — a hang is the failure mode of a shim
-    that prompts, which is exactly the shape `stdin=DEVNULL` exists to avoid.
-
-    Ablation target: narrow the guard to `except OSError` and this reddens with a
-    raised subprocess.TimeoutExpired.
-    """
-    launcher = write_script_launcher(tmp_path, "hang", "import time\ntime.sleep(120)\n")
-
-    assert probe.binary_runs(str(launcher), timeout_s=0.5) is None
+def _write_posix_wrapper(directory: Path, name: str, body: str) -> Path:
+    """A POSIX launcher that does NOT exec: sh stays the root and the program is
+    its child — the topology a Windows `.cmd` launcher always has (cmd.exe root),
+    reproduced where CI can show it on every host."""
+    sidecar = directory / f"{name}.py"
+    sidecar.write_text(body, encoding="utf-8")
+    launcher = directory / name
+    launcher.write_text(f'#!/bin/sh\n"{sys.executable}" "{sidecar}" "$@"\n', encoding="utf-8")
+    launcher.chmod(0o755)
+    return launcher
 
 
-def test_binary_runs_pins_devnull_stdin_and_the_caller_timeout():
-    """The one contract row over the call itself: argv is `<binary> --version`, stdin
-    is DEVNULL, the caller's timeout is honored, and a nonzero exit is data rather
-    than an exception (`check=False`).
+_HANG_BODY = (
+    "import os, sys, time\n"
+    "with open(os.environ['BMAD_TEST_PID_FILE'], 'w') as fh:\n"
+    "    fh.write(str(os.getpid()))\n"
+    "time.sleep(120)\n"
+)
 
-    `stdin=DEVNULL` is required, not cosmetic: with the caller's tty inherited a shim
-    that prompts blocks on the read for the entire timeout (measured 4.00s against
-    0.00s), inside an interactive command. Nothing else observes it — the real-child
-    rows above pass either way — so it is pinned here or not at all.
 
-    Asserted as a SUBSET of the recorded kwargs, never dict equality: a future kwarg
-    (`env`, `cwd`, ...) is additive, and equality would turn every such addition into
-    a multi-row breakage in this file.
+@pytest.mark.parametrize(
+    "topology",
+    [
+        # win32: a real `.cmd` — cmd.exe root, the python program its child, the
+        # shape that made a 0.5 s timeout take 120 s. POSIX: an exec'ing launcher,
+        # so the root is the native interpreter itself.
+        "host-launcher",
+        pytest.param(
+            "sh-wrapper",
+            marks=pytest.mark.skipif(sys.platform == "win32", reason="a /bin/sh launcher"),
+        ),
+    ],
+)
+def test_binary_runs_returns_none_when_the_child_outlives_the_timeout(
+    tmp_path, monkeypatch, reap_leftovers, topology
+):
+    """A child that never exits is killed at `timeout_s` and reported as None —
+    promptly, and with the program behind the launcher dead.
 
-    Ablation target: drop `stdin=subprocess.DEVNULL` from `probe.binary_runs` and the
-    stdin assertion reddens with a KeyError. `check=False` is the stdlib default, so
-    dropping it reddens only this row (KeyError) and nothing else — it is pinned as
-    intent against a future flip to `check=True`, which is the mutation that bites:
-    that turns every nonzero exit into a CalledProcessError, a SubprocessError the
-    guard swallows into None, reddening both real-child rows above as well.
-    """
+    The program records its pid first (startup proof: without it a launcher that
+    failed to start would pass as a "timeout"). The return is bounded by the
+    timeout plus the runner's kill/drain allowance (`_RETURN_CEILING_S`, the one
+    tests/test_childrun.py holds), while the child would sleep 120 s. Under
+    `subprocess.run` only the launcher root was killed: on win32 `run` then
+    waited on the pipes until the orphaned program exited by itself (the
+    observed 120 s); on POSIX it waits for the root alone, so it returned on time
+    and left the program running. The 120 s lifetime is the defect's witness and
+    must not be shortened. The pid goes to `reap_leftovers`
+    before any assertion, so a red row leaves no sleeper behind.
+
+    The timeout is 2 s, not the 0.5 s of old, so the program provably starts
+    before it fires on a slow Windows runner; that the caller's timeout reaches
+    the runner exactly is pinned by the seam row below.
+
+    Ablation target: route `binary_runs` back through `subprocess.run(...,
+    capture_output=True, timeout=timeout_s)` and the sh-wrapper row reddens with
+    the program still alive; the win32 `.cmd` row also blows the elapsed bound."""
+    pid_file = tmp_path / "program.pid"
+    monkeypatch.setenv("BMAD_TEST_PID_FILE", str(pid_file))
+    launcher_dir = tmp_path / "hang dir"
+    launcher_dir.mkdir()
+    if topology == "sh-wrapper":
+        launcher = _write_posix_wrapper(launcher_dir, "hang", _HANG_BODY)
+    else:
+        launcher = write_script_launcher(launcher_dir, "hang", _HANG_BODY)
+
+    timeout_s = 2.0
+    started = time.monotonic()
+    try:
+        rc = probe.binary_runs(str(launcher), timeout_s=timeout_s)
+        elapsed = time.monotonic() - started
+    finally:
+        program = read_pid(pid_file)
+        if program is not None:
+            reap_leftovers.append(program)
+
+    assert program is not None, "the program behind the launcher never started"
+    assert rc is None
+    assert elapsed < timeout_s + _RETURN_CEILING_S, f"returned after {elapsed:.2f}s"
+    assert wait_pid_gone(program), f"program {program} outlived the probe's timeout"
+
+
+@pytest.mark.parametrize(
+    ("run", "expected"),
+    [
+        (childrun.ChildRun(0, "", ""), 0),
+        (childrun.ChildRun(5, "", "boom"), 5),
+        (childrun.ChildRun(1, "", "", timed_out=True), None),
+        (childrun.ChildRun(None, "", "", interrupted=True), None),
+        (childrun.ChildRun(None, "", ""), None),
+    ],
+    ids=["rc-0", "rc-5", "timed-out", "interrupted", "unreaped"],
+)
+def test_binary_runs_pins_the_argv_the_caller_timeout_and_the_verdict(monkeypatch, run, expected):
+    """The contract row over the call itself: argv is exactly `[binary,
+    "--version"]` (a list — `run_argv` spawns it with no shell and stdin DEVNULL,
+    pinned in tests/test_childrun.py), the caller's timeout reaches the runner
+    exactly, no cwd/env is added, and the verdict maps the runner's outcome: a
+    return code passes through, a timeout or pre-spawn interrupt is None ("there
+    is no return code to report"), never the killed root's code.
+
+    Ablation target: return `run.returncode` without the `timed_out`/`interrupted`
+    check and the timed-out row reports the killed root's 1."""
     recorded: dict = {}
 
-    def fake_run(argv, **kwargs):
-        recorded["argv"] = argv
-        recorded["kwargs"] = kwargs
-        return subprocess.CompletedProcess(argv, 0)
+    def fake_run_argv(argv, **kwargs):
+        recorded["argv"], recorded["kwargs"] = argv, kwargs
+        return run
 
-    with pytest.MonkeyPatch.context() as mp:
-        mp.setattr(probe.subprocess, "run", fake_run)
-        assert probe.binary_runs("some-cli", timeout_s=3.5) == 0
+    monkeypatch.setattr(probe.childrun, "run_argv", fake_run_argv)
+    assert probe.binary_runs("some cli", timeout_s=3.5) == expected
+    assert recorded["argv"] == ["some cli", "--version"]
+    assert recorded["kwargs"] == {"cwd": None, "timeout": 3.5}
 
-    assert recorded["argv"] == ["some-cli", "--version"]
-    kwargs = recorded["kwargs"]
-    assert kwargs["stdin"] is subprocess.DEVNULL
-    assert kwargs["timeout"] == 3.5
-    assert kwargs["check"] is False
-    assert kwargs["capture_output"] is True
-    # No `text=True`: nothing reads the output, so the locale decode that forced
-    # `errors="replace"` onto `_run_capture` (#383) never happens here and cannot
-    # raise the UnicodeDecodeError the guard above does not name.
-    assert kwargs.get("text") is None
+
+@pytest.mark.parametrize(
+    "fault",
+    [OSError("spawn"), subprocess.SubprocessError("x"), ProcessHostError("bogus host")],
+    ids=["os-error", "subprocess-error", "process-host-error"],
+)
+def test_binary_runs_never_raises_what_the_runner_raises(monkeypatch, fault):
+    """`binary_runs` never raises (cmd_validate has no error path of its own): the
+    guard names the spawn families plus `ProcessHostError`, which the tree kill
+    raises for a bogus `BMAD_LOOP_PROCESS_HOST` override.
+
+    Ablation target: drop `ProcessHostError` from the guard and its row raises."""
+
+    def raising(*_a, **_kw):
+        raise fault
+
+    monkeypatch.setattr(probe.childrun, "run_argv", raising)
+    assert probe.binary_runs("some-cli", timeout_s=1) is None
 
 
 def test_probe_launcher_pins_the_window_to_this_state_root(tmp_path, monkeypatch):
@@ -944,3 +1033,124 @@ def test_probe_launcher_pins_the_window_to_this_state_root(tmp_path, monkeypatch
         tmp_path / "log.txt",
     )
     assert mux.window_env == {"CALLER": "1"}
+
+
+# ------------------------------------------------ --workspace (DW-390)
+
+
+@pytest.fixture
+def agy_home(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    settings = home / ".gemini" / "antigravity-cli" / "settings.json"
+    settings.parent.mkdir(parents=True)
+    return settings
+
+
+def _agy_workspace(tmp_path):
+    ws = (tmp_path / "proj" / "wt-1").resolve()
+    ws.mkdir(parents=True)
+    return ws
+
+
+def _probe_ws(tmp_path, ws, *extra):
+    project = tmp_path / "proj"
+    return [
+        "probe-adapter",
+        "antigravity",
+        "--project",
+        str(project),
+        "--workspace",
+        str(ws),
+        *extra,
+    ]
+
+
+def test_cli_workspace_trusted_exits_zero(tmp_path, capsys, agy_home):
+    ws = _agy_workspace(tmp_path)
+    agy_home.write_text(json.dumps({"trustedWorkspaces": [str(ws)]}), encoding="utf-8")
+
+    rc = cli.main(_probe_ws(tmp_path, ws))
+
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "- **workspace trust:** trusted" in out
+    assert str(ws) not in out
+
+
+@pytest.mark.parametrize("state", ["absent", "file-missing"])
+def test_cli_workspace_untrusted_exits_one_with_next_step(tmp_path, capsys, agy_home, state):
+    ws = _agy_workspace(tmp_path)
+    if state == "absent":
+        agy_home.write_text(json.dumps({"trustedWorkspaces": ["/elsewhere"]}), encoding="utf-8")
+
+    rc = cli.main(_probe_ws(tmp_path, ws))
+
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "- **workspace trust:** untrusted" in out
+    assert "workspace trust untrusted for the requested workspace" in out
+    assert "Run `agy` in the project root and trust it" in out
+    assert str(ws) not in out
+    if state == "file-missing":
+        assert not agy_home.exists()  # read-only
+
+
+def test_cli_workspace_malformed_is_unverifiable(tmp_path, capsys, agy_home):
+    ws = _agy_workspace(tmp_path)
+    agy_home.write_text("{broken", encoding="utf-8")
+
+    rc = cli.main(_probe_ws(tmp_path, ws))
+
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "- **workspace trust:** unverifiable" in out
+    assert agy_home.read_text(encoding="utf-8") == "{broken"
+
+
+@pytest.mark.parametrize(
+    ("argv_cli", "detail"),
+    [
+        (["claude"], "profile 'claude' declares none"),
+        (["no-such-cli", "--binary", "true"], "no loadable profile for 'no-such-cli'"),
+    ],
+    ids=["no-decl", "unknown"],
+)
+def test_cli_workspace_without_declaration_fails(tmp_path, capsys, argv_cli, detail):
+    rc = cli.main(
+        ["probe-adapter", *argv_cli, "--project", str(tmp_path), "--workspace", str(tmp_path)]
+    )
+    out, err = capsys.readouterr()
+    assert rc == 1
+    assert out == ""
+    assert "FAIL:" in err and "[workspace_trust]" in err
+    assert detail in err
+
+
+@pytest.mark.parametrize("trusted", [True, False])
+def test_cli_workspace_json_carries_the_verdict(tmp_path, capsys, agy_home, trusted):
+    ws = _agy_workspace(tmp_path)
+    listed = [str(ws)] if trusted else []
+    agy_home.write_text(json.dumps({"trustedWorkspaces": listed}), encoding="utf-8")
+
+    doc = machine_json(
+        _probe_ws(tmp_path, ws, "--json"),
+        capsys,
+        rc=0 if trusted else 1,
+        err_contains="ok:" if trusted else "FAIL:",
+    )
+
+    assert doc["workspace_trust"] == ("trusted" if trusted else "untrusted")
+    assert doc["schema_version"] == probe.SCHEMA_VERSION
+    assert str(ws) not in json.dumps(doc)
+
+
+def test_cli_json_without_workspace_reports_null(tmp_path, capsys):
+    doc = machine_json(
+        ["probe-adapter", "antigravity", "--project", str(tmp_path), "--json"],
+        capsys,
+        err_contains="ok:",
+    )
+    assert doc["workspace_trust"] is None

@@ -16,6 +16,7 @@ import pytest
 import yaml
 from conftest import (
     _OK,
+    _REVERIFY_KEY,
     MISSING_TOOL_CMD,
     NUL_PATH_RESOLVE_FAULTS,
     PROJECT_MARKER_CMD,
@@ -23,6 +24,7 @@ from conftest import (
     REPO_ROOT_MARKER_CMD,
     UNDECODABLE_LEDGER,
     UNRESOLVABLE,
+    _reverify_run,
     assert_run_state_lock_held,
     escalated_run,
     fault_metadata_probe,
@@ -34,8 +36,11 @@ from conftest import (
     install_build_auto_skill,
     install_dev_base_skills,
     install_dev_shim,
+    install_render_probe_fixture,
+    install_sweep_skill,
     machine_json,
     mark_ledger_done,
+    nested_repo_root_paths,
     plant_root_markers,
     refuse_to_resolve,
     spec_path,
@@ -47,7 +52,9 @@ from conftest import (
     write_sprint,
 )
 
-from bmad_loop import bmadconfig, cli, deferredwork, envvars, platform_util
+from bmad_loop import bmadconfig
+from bmad_loop import checks as checks_mod
+from bmad_loop import cli, deferredwork, envvars, platform_util
 from bmad_loop import policy as policy_mod
 from bmad_loop import probe as probe_mod
 from bmad_loop import runs, runsetup, verify
@@ -139,8 +146,12 @@ def test_dry_run_renders_per_stage_commands(project, capsys):
     dev_line = next(line for line in out.splitlines() if "dev:" in line)
     review_line = next(line for line in out.splitlines() if "review:" in line)
     assert "claude" in dev_line and "--model opus" in dev_line
+    # DW-505: claude's launch appends the pinned id after the model flag; codex
+    # declares no session_id_flag, so its preview carries none.
+    assert dev_line.endswith("--model opus --session-id <auto>")
     assert review_line.split("review:")[1].strip().startswith("codex ")
     assert "--model gpt-5-codex" in review_line
+    assert "--session-id" not in review_line
 
 
 def _shim_only(paths) -> None:
@@ -204,6 +215,55 @@ def test_sweep_dry_run_warns_when_preflight_would_abort(project, capsys):
     assert not project.deferred_work.is_file()  # the early-return leg
     assert cli._sweep_dry_run(project, pol) == 0
     assert "NOT runnable" in capsys.readouterr().err
+
+
+def _break_sweep_skill(root: Path, tree: str, how: str) -> None:
+    """Leave ``root/tree``'s `bmad-loop-sweep` deleted outright or partial (its
+    automation mode file gone) — the two DW-367 damage shapes."""
+    import shutil
+
+    skill = root / tree / "bmad-loop-sweep"
+    if how == "deleted":
+        shutil.rmtree(skill)
+    else:
+        (skill / "automation-mode.md").unlink()
+
+
+def test_sweep_dry_run_banner_names_a_broken_sweep_skill(project, capsys):
+    """DW-367: `sweep --dry-run` returns before `_require_sweep_skill`, so the banner
+    mirrors it. rc stays 0 (the preview is still rendered) and the FAIL line goes to
+    stderr. Ablation: drop `require_sweep=True` from `_sweep_dry_run` and this reddens."""
+    from conftest import install_base_skills
+
+    install_base_skills(project)
+    _write_policy(project.project, CLAUDE_ONLY_POLICY)
+    pol = policy_mod.load(project.project / ".bmad-loop" / "policy.toml")
+    assert cli._sweep_dry_run(project, pol) == 0
+    assert "NOT runnable" not in capsys.readouterr().err  # complete → no banner
+
+    _break_sweep_skill(project.project, ".claude/skills", "deleted")
+    assert cli._sweep_dry_run(project, pol) == 0
+    err = capsys.readouterr().err
+    assert "NOT runnable" in err
+    assert "FAIL: .claude/skills/bmad-loop-sweep not found" in err
+    assert "bmad-loop init --force-skills" in err
+
+
+def test_run_dry_run_banner_ignores_the_sweep_skill(project, capsys):
+    """The sweep skill is a sweep-only gate: a story-run preview must not promise an
+    abort `run` never makes. Ablation: default `require_sweep` to True and this reddens."""
+    from conftest import install_base_skills
+
+    install_base_skills(project)
+    _break_sweep_skill(project.project, ".claude/skills", "deleted")
+    _break_sweep_skill(project.project, ".agents/skills", "deleted")
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    _write_policy(project.project)
+    pol = policy_mod.load(project.project / ".bmad-loop" / "policy.toml")
+    args = argparse.Namespace(epic=None, story=None, max_stories=None)
+
+    assert cli._dry_run(project, pol, args) == 0
+    assert "NOT runnable" not in capsys.readouterr().err
 
 
 def test_sweep_dry_run_refuses_an_undecodable_ledger(project, capsys):
@@ -2108,7 +2168,7 @@ def test_status_json_exposes_adapter_identity(project, capsys):
             "name": pol.adapter.resolved(role).name,
             "model": pol.adapter.resolved(role).model,
         }
-        for role in ("dev", "review", "triage")
+        for role in ("dev", "review", "triage", "retro")
     }
     # Concretely: dev/triage inherit claude/opus; the review client switch to codex
     # resets the model to "".
@@ -2557,7 +2617,91 @@ def test_list_json_empty_runs_is_valid_empty_document(project, capsys):
     """No runs is a valid empty document with exit 0 — never the text
     "no runs found" (which would corrupt the stream; exit-code parity holds)."""
     doc = _list_json(project, capsys)
-    assert doc == {"schema_version": 1, "runs": []}
+    assert doc == {"schema_version": 1, "runs": [], "listing_fault": None}
+
+
+def _deny_stat_under(monkeypatch, root: Path) -> None:
+    """Every `stat()` of `root` or below raises EACCES — an unreadable dir, as
+    3.14's `is_dir`/`is_file` would fold it into False."""
+    real = Path.stat
+
+    def stat(self, *args, **kwargs):
+        if self == root or root in self.parents:
+            raise PermissionError(13, "Permission denied", str(self))
+        return real(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", stat)
+
+
+def test_list_names_an_unreadable_runs_dir_instead_of_no_runs(project, capsys, monkeypatch):
+    """DW-468: `list` over an unreadable runs dir warns with the fault rather than
+    printing "no runs found"; `--json` carries it as `listing_fault`, stderr
+    empty. Ablate the listing fault in `list_run_dirs` and this fails."""
+    _make_list_run(project, "20260101-000000-aaaa", started_at="x", finished=True)
+    _deny_stat_under(monkeypatch, project.project / ".bmad-loop" / "runs")
+
+    assert cli.main(["list", "--project", str(project.project)]) == 0
+    captured = capsys.readouterr()
+    assert "no runs found" not in captured.out
+    assert "run listing incomplete" in captured.err and "PermissionError" in captured.err
+
+    doc = _list_json(project, capsys)
+    assert doc["runs"] == [] and "PermissionError" in doc["listing_fault"]
+
+
+def test_status_names_an_unreadable_runs_dir_instead_of_no_such_run(project, capsys, monkeypatch):
+    """The user-facing "no such run" produced by an unreadable runs dir names the
+    fault instead — by ref, and on the no-ref newest-run fallback."""
+    _make_list_run(project, "20260101-000000-aaaa", started_at="x", finished=True)
+    _deny_stat_under(monkeypatch, project.project / ".bmad-loop" / "runs")
+
+    assert cli.main(["status", "aaaa", "--project", str(project.project)]) == 1
+    err = capsys.readouterr().err
+    assert "no such run" not in err and "PermissionError" in err
+
+    assert cli.main(["status", "--project", str(project.project)]) == 1
+    err = capsys.readouterr().err
+    assert "run listing incomplete" in err and "PermissionError" in err
+
+
+def test_decisions_notes_a_run_whose_triage_could_not_be_read(project, capsys, monkeypatch):
+    """DW-468: a run dir the listing cannot read contributes no decisions, so the
+    readable run's listing is incomplete and `decisions` says so on stderr, naming
+    the unread run. Ablate the `run listing incomplete` note in `cmd_decisions`
+    and this fails."""
+    from conftest import write_ledger
+
+    install_bmad_config(project)
+    write_ledger(project, {"DW-1": "open"})
+    _make_run_with_decision(project, run_id="20260101-000000-aaaa")
+    _make_run_with_decision(project, run_id="20260102-000000-bbbb")
+    _deny_stat_under(monkeypatch, project.project / ".bmad-loop" / "runs" / "20260102-000000-bbbb")
+
+    assert cli.main(["decisions", "--project", str(project.project), "--list"]) == 0
+    captured = capsys.readouterr()
+    assert "DW-1: build the widening?" in captured.out
+    assert "note: run listing incomplete" in captured.err
+    assert "20260102-000000-bbbb" in captured.err
+
+
+def test_reconcile_stale_warns_when_the_run_listing_is_incomplete(project, capsys, monkeypatch):
+    """DW-468: "reclaimed nothing" over an unreadable runs dir is not the answer,
+    so the run-start reconcile warns with the fault. Ablate the warning in
+    `_reconcile_stale` and this fails."""
+    install_bmad_config(project)
+    paths = bmadconfig.load_paths(project.project)
+    pol = policy_mod.load(None)
+    assert pol.cleanup.auto_clean_on_finish, "premise: the reconcile runs"
+    _make_list_run(project, "20260101-000000-aaaa", started_at="x", finished=True)
+
+    cli._reconcile_stale(project.project, paths, pol)
+    assert "stale-worktree reconcile" not in capsys.readouterr().err
+
+    _deny_stat_under(monkeypatch, project.project / ".bmad-loop" / "runs")
+    cli._reconcile_stale(project.project, paths, pol)
+    err = capsys.readouterr().err
+    assert "warning: stale-worktree reconcile incomplete" in err
+    assert "PermissionError" in err
 
 
 def test_list_json_unparseable_state_reported_unknown(project, capsys):
@@ -2646,7 +2790,7 @@ def test_list_document_library_call_matches_the_cli(project, capsys):
     )
 
     from_cli = _list_json(project, capsys)
-    from_library = list_document(discover_runs(project.project))
+    from_library = list_document(*discover_runs(project.project))
 
     assert from_library == from_cli
 
@@ -3130,8 +3274,9 @@ def test_cmd_sweep_forwards_selector_to_start_sweep(
     captured = {}
     monkeypatch.setattr(cli, "_reject_under_floor_git", lambda _project: None)
     monkeypatch.setattr(cli, "_reject_isolation_conflict", lambda _paths, _pol: None)
-    monkeypatch.setattr(cli.verify, "worktree_clean", lambda _root: True)
+    monkeypatch.setattr(cli.verify, "worktree_clean", lambda _root, **_kw: True)
     monkeypatch.setattr(cli, "_require_base_skills", lambda _project, _pol: True)
+    monkeypatch.setattr(cli, "_require_sweep_skill", lambda _project, _pol: True)
     monkeypatch.setattr(cli, "_reconcile_stale", lambda *_args: None)
     monkeypatch.setattr(
         cli,
@@ -3172,6 +3317,7 @@ def test_start_sweep_crash_exit_preserves_existing_modes(project, monkeypatch, o
         lambda **_kwargs: types.SimpleNamespace(
             run_id="selector-crash",
             engine=engine,
+            journal=None,  # ComposedRun always carries one; DW-410's launch warning reads it
         ),
     )
 
@@ -3204,6 +3350,9 @@ def test_make_adapters_review_synthesizes_from_spec(project, monkeypatch):
     assert isinstance(adapters["review"], GenericDevAdapter)
     assert isinstance(adapters["triage"], GenericAdapter)
     assert not isinstance(adapters["triage"], GenericDevAdapter)
+    # the auto-retro skill writes a real result.json too (DW-389)
+    assert isinstance(adapters["retro"], GenericAdapter)
+    assert not isinstance(adapters["retro"], GenericDevAdapter)
 
 
 def test_make_adapters_hookless_synthesizing_roles_get_dev_adapter(project, monkeypatch):
@@ -3995,6 +4144,24 @@ def test_resolve_rejects_non_escalation_stage(tmp_path, capsys):
     assert "not paused at an escalation" in capsys.readouterr().err
 
 
+def test_resolve_refuses_environment_pause_with_resume_hint(tmp_path, capsys):
+    """DW-523: an environment pause is lifted by a plain resume, so resolve refuses
+    it AND names the remedy; any other non-escalation stage gets the bare refusal."""
+    _make_run_with_state(tmp_path, "r1", paused_stage="environment", paused_reason="x")
+    assert cli.main(["resolve", "--project", str(tmp_path), "r1"]) == 1
+    err = capsys.readouterr().err
+    assert "not paused at an escalation (stage: environment)" in err
+    assert "an environment pause needs no resolve" in err
+    assert "`bmad-loop resume r1`" in err
+
+    _make_run_with_state(tmp_path, "r2", paused_stage="spec-approval", paused_reason="x")
+    assert cli.main(["resolve", "--project", str(tmp_path), "r2"]) == 1
+    err = capsys.readouterr().err
+    assert "not paused at an escalation (stage: spec-approval)" in err
+    assert "needs no resolve" not in err
+    assert "bmad-loop resume" not in err
+
+
 # resolve refuses 'unknown' too, not just 'alive' — re-driving a possibly-live engine.
 @pytest.mark.parametrize(
     "liveness,msg",
@@ -4151,6 +4318,213 @@ def test_resolve_no_interactive_rearms_and_resumes(tmp_path, monkeypatch, capsys
     assert "ready-for-dev" in spec.read_text()
 
 
+def _adoptable_run(tmp_path, run_id="r1", *, run_type="story", worktree=True, spec=True):
+    """An escalation-paused run whose ESCALATED task keeps a worktree + branch (DW-386)."""
+    from bmad_loop.journal import load_state, save_state
+
+    wt = tmp_path / "wt"
+    spec_file = None
+    if worktree:
+        wt.mkdir()
+    if spec:
+        spec_path = tmp_path / "spec.md"
+        spec_path.write_text("---\nstatus: in-review\n---\n", encoding="utf-8")
+        spec_file = str(spec_path)
+    run_dir = _escalated_run(
+        tmp_path, run_id, spec_file=spec_file, worktree_path=str(wt), run_type=run_type
+    )
+    state = load_state(run_dir)
+    state.tasks["s1"].branch = "bmad-loop/r1/s1"
+    save_state(run_dir, state)
+    return run_dir
+
+
+def _state_bytes(run_dir):
+    return (run_dir / "state.json").read_bytes()
+
+
+def test_resolve_adopt_branch_moves_to_committing_and_resumes(tmp_path, monkeypatch, capsys):
+    from bmad_loop.journal import Journal, load_state
+    from bmad_loop.model import Phase
+
+    run_dir = _adoptable_run(tmp_path)
+    resumed = []
+    monkeypatch.setattr(cli, "_resume_paused_run", lambda proj, rd: resumed.append(rd) or 0)
+
+    rc = cli.main(["resolve", "--project", str(tmp_path), "r1", "--adopt-branch", "--resume"])
+
+    assert rc == 0
+    assert resumed == [run_dir]
+    task = load_state(run_dir).tasks["s1"]
+    assert task.phase == Phase.COMMITTING and task.adopt_pending
+    assert "in-review" in (tmp_path / "spec.md").read_text()  # the engine flips it, not resolve
+    [row] = [e for e in Journal(run_dir).entries() if e["kind"] == "escalation-adopted"]
+    assert row["story_key"] == "s1" and row["branch"] == "bmad-loop/r1/s1"
+    err = capsys.readouterr().err
+    assert "bypasses automated checks" in err
+    assert "review" in err and "[verify]" in err and "pre_commit_gate" in err
+
+
+def test_resolve_adopt_branch_force_unknown_proceeds(tmp_path, monkeypatch, capsys):
+    """`--force` is the only way past an unverifiable engine pid, so the adopt leg's
+    under-lock liveness re-check must honor it exactly as the re-arm leg does.
+
+    Ablation, performed: drop `and not args.force` from `_resolve_adopt`'s in-lock
+    `unknown` refusal and this reddens on rc."""
+    from bmad_loop import runs
+    from bmad_loop.journal import load_state
+    from bmad_loop.model import Phase
+
+    monkeypatch.setattr(runs, "engine_liveness", lambda _rd: "unknown")
+    run_dir = _adoptable_run(tmp_path)
+    resumed = []
+    monkeypatch.setattr(cli, "_resume_paused_run", lambda proj, rd: resumed.append(rd) or 0)
+
+    rc = cli.main(
+        ["resolve", "--project", str(tmp_path), "r1", "--adopt-branch", "--force", "--resume"]
+    )
+
+    assert rc == 0
+    assert "proceeding anyway (--force)" in capsys.readouterr().err
+    assert resumed == [run_dir]
+    task = load_state(run_dir).tasks["s1"]
+    assert task.phase == Phase.COMMITTING and task.adopt_pending
+
+
+def test_resolve_adopt_branch_no_resume_persists_the_latch(tmp_path, monkeypatch, capsys):
+    from bmad_loop.journal import load_state
+    from bmad_loop.model import PAUSE_ESCALATION, Phase
+
+    run_dir = _adoptable_run(tmp_path)
+    monkeypatch.setattr(
+        cli, "_resume_paused_run", lambda *a, **k: pytest.fail("--no-resume must not resume")
+    )
+
+    rc = cli.main(["resolve", "--project", str(tmp_path), "r1", "--adopt-branch", "--no-resume"])
+
+    assert rc == 0
+    state = load_state(run_dir)
+    assert state.paused_stage == PAUSE_ESCALATION
+    task = state.tasks["s1"]
+    assert task.phase == Phase.COMMITTING and task.adopt_pending
+    assert "bmad-loop resume r1" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    "shape,msg",
+    [
+        ("no-worktree", "is gone"),
+        ("sweep", "not supported for sweep runs"),
+        ("no-spec", "no story spec"),
+    ],
+)
+def test_resolve_adopt_branch_refusals_leave_state_untouched(
+    tmp_path, monkeypatch, capsys, shape, msg
+):
+    run_dir = _adoptable_run(
+        tmp_path,
+        run_type="sweep" if shape == "sweep" else "story",
+        worktree=shape != "no-worktree",
+        spec=shape != "no-spec",
+    )
+    before = _state_bytes(run_dir)
+    monkeypatch.setattr(
+        cli, "_resume_paused_run", lambda *a, **k: pytest.fail("a refusal must not resume")
+    )
+
+    rc = cli.main(["resolve", "--project", str(tmp_path), "r1", "--adopt-branch", "--resume"])
+
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert msg in err
+    if shape != "sweep":
+        assert "bmad-loop resolve r1" in err  # names the re-arm alternative
+    assert _state_bytes(run_dir) == before
+
+
+def test_resolve_adopt_branch_refuses_a_task_with_no_recorded_worktree(tmp_path, capsys):
+    from bmad_loop.journal import load_state, save_state
+
+    run_dir = _adoptable_run(tmp_path)
+    state = load_state(run_dir)
+    state.tasks["s1"].worktree_path = ""
+    save_state(run_dir, state)
+    before = _state_bytes(run_dir)
+
+    rc = cli.main(["resolve", "--project", str(tmp_path), "r1", "--adopt-branch", "--resume"])
+
+    assert rc == 1
+    assert "no kept worktree branch" in capsys.readouterr().err
+    assert _state_bytes(run_dir) == before
+
+
+def test_resolve_adopt_branch_refuses_a_newer_escalation_after_waiting_for_the_lock(
+    tmp_path, monkeypatch, capsys
+):
+    """The adopt leg's mutation-boundary generation re-check (DW-386).
+
+    Ablation, performed: delete the generation comparison in `_resolve_adopt` and this
+    stale gesture adopts the newer escalation its checks never saw."""
+    import contextlib
+
+    from bmad_loop.journal import load_state, save_state
+
+    run_dir = _adoptable_run(tmp_path)
+    original_generation = load_state(run_dir).tasks["s1"].generation
+    monkeypatch.setattr(runs, "engine_liveness", lambda _rd: "dead")
+    monkeypatch.setattr(cli, "_resume_paused_run", lambda *_a: pytest.fail("resumed"))
+    monkeypatch.setattr(
+        runs, "adopt_escalated_branch", lambda *_a, **_k: pytest.fail("stale adopt")
+    )
+    rival_bytes: list[bytes] = []
+
+    @contextlib.contextmanager
+    def rival_first(_run_dir):
+        rival = load_state(run_dir)
+        rival.tasks["s1"].generation = original_generation + 1
+        save_state(run_dir, rival)
+        rival_bytes.append(_state_bytes(run_dir))
+        yield
+
+    monkeypatch.setattr(cli, "state_lock", rival_first)
+
+    rc = cli.main(["resolve", "--project", str(tmp_path), "r1", "--adopt-branch", "--resume"])
+
+    assert rc == 1
+    assert "changed while resolve was in progress" in capsys.readouterr().err
+    assert rival_bytes and _state_bytes(run_dir) == rival_bytes[-1]
+
+
+def test_resolve_adopt_branch_cancel_writes_nothing(tmp_path, monkeypatch, capsys):
+    run_dir = _adoptable_run(tmp_path)
+    before = _state_bytes(run_dir)
+    monkeypatch.setattr(cli, "_confirm", lambda _q: False)
+
+    rc = cli.main(["resolve", "--project", str(tmp_path), "r1", "--adopt-branch"])
+
+    assert rc == 0
+    assert "cancelled" in capsys.readouterr().out
+    assert _state_bytes(run_dir) == before
+
+
+def test_resolve_adopt_branch_and_restore_patch_are_mutually_exclusive(tmp_path, capsys):
+    _adoptable_run(tmp_path)
+    with pytest.raises(SystemExit) as exc:
+        cli.main(
+            [
+                "resolve",
+                "--project",
+                str(tmp_path),
+                "r1",
+                "--adopt-branch",
+                "--restore-patch",
+                "p.patch",
+            ]
+        )
+    assert exc.value.code == 2
+    assert "not allowed with argument" in capsys.readouterr().err
+
+
 def test_resolve_rearms_the_spec_in_the_project_it_was_invoked_on(tmp_path, monkeypatch):
     """`--project` names the tree this invocation acts in, and the re-arm's spec writes
     have to land there.
@@ -4202,14 +4576,19 @@ def test_resolve_rearms_the_spec_in_the_project_it_was_invoked_on(tmp_path, monk
 # instead of guessing a tree.
 
 
-def _resolve_run_with_a_moved_code_root(project, monkeypatch):
+def _resolve_run_with_a_moved_code_root(project, monkeypatch, moved=None):
     """An escalated run whose recorded code root is NOT the one config.yaml now names.
-    Returns (run_dir, the tree config names, the tree the run recorded)."""
+    Returns (run_dir, the tree config names, the tree the run recorded).
+
+    ``moved`` defaults to ``<project>/moved-code`` — a `repo_root` INSIDE the project,
+    one of the two disjoint layouts worktree isolation refuses. Pass an existing
+    directory to name another tree (a sibling, or an ancestor for the nested layout)."""
     from bmad_loop.journal import load_state, save_state
 
     install_bmad_config(project)
-    moved = project.project / "moved-code"
-    moved.mkdir()
+    if moved is None:
+        moved = project.project / "moved-code"
+        moved.mkdir()
     _configure_repo_root(project, moved)
     run_dir = _escalated_run(project.project, "r1")
     recorded = project.project / "old-code"
@@ -4290,8 +4669,23 @@ def test_resolve_declined_at_the_confirm_leaves_the_code_root_for_resume(
     assert "code root" not in capsys.readouterr().err
 
 
+def _resolve_code_root_for(project, shape):
+    """The code root a resolve row names: None (the helper's `<project>/moved-code`, a
+    `repo_root` inside the project), a SIBLING directory beside the project — the two
+    disjoint layouts — or the project's parent, an ANCESTOR (the nested layout)."""
+    if shape == "inside":
+        return None
+    if shape == "sibling":
+        sibling = project.project.parent / f"{project.project.name}-code"
+        sibling.mkdir()
+        return sibling
+    assert shape == "nested"
+    return project.project.parent
+
+
+@pytest.mark.parametrize("shape", ["inside", "sibling"])
 def test_resolve_refuses_worktree_isolation_before_it_mutates_anything(
-    project, monkeypatch, capsys
+    project, monkeypatch, capsys, shape
 ):
     """`resolve` re-arms and THEN resumes, so the isolation refusal `_resume_paused_run`
     makes used to land after the whole re-arm had already been persisted.
@@ -4320,7 +4714,9 @@ def test_resolve_refuses_worktree_isolation_before_it_mutates_anything(
     from bmad_loop.journal import load_state
     from bmad_loop.model import Phase
 
-    run_dir, _moved, recorded = _resolve_run_with_a_moved_code_root(project, monkeypatch)
+    run_dir, _moved, recorded = _resolve_run_with_a_moved_code_root(
+        project, monkeypatch, _resolve_code_root_for(project, shape)
+    )
     _write_policy(project.project, ISOLATION_WORKTREE_POLICY)
     monkeypatch.setattr(
         runs,
@@ -4337,8 +4733,9 @@ def test_resolve_refuses_worktree_isolation_before_it_mutates_anything(
     assert state.tasks["s1"].phase == Phase.ESCALATED  # still armed for a corrected config
 
 
+@pytest.mark.parametrize("shape", ["inside", "sibling"])
 def test_resolve_refuses_worktree_isolation_before_the_interactive_session(
-    project, monkeypatch, capsys
+    project, monkeypatch, capsys, shape
 ):
     """The sibling above passes `--no-interactive`, so it pins the refusal only against
     the WRITES. Nothing pinned it against the agent conversation, and that is the half an
@@ -4364,7 +4761,9 @@ def test_resolve_refuses_worktree_isolation_before_the_interactive_session(
     from bmad_loop.journal import load_state
     from bmad_loop.model import Phase
 
-    run_dir, _moved, recorded = _resolve_run_with_a_moved_code_root(project, monkeypatch)
+    run_dir, _moved, recorded = _resolve_run_with_a_moved_code_root(
+        project, monkeypatch, _resolve_code_root_for(project, shape)
+    )
     _write_policy(project.project, ISOLATION_WORKTREE_POLICY)
     monkeypatch.setattr(
         cli, "_make_adapters", lambda *a, **k: pytest.fail("built adapters for a refused config")
@@ -4386,6 +4785,76 @@ def test_resolve_refuses_worktree_isolation_before_the_interactive_session(
     state = load_state(run_dir)
     assert state.repo_root == str(recorded)  # nothing was written on the way out
     assert state.tasks["s1"].phase == Phase.ESCALATED
+
+
+def test_resolve_rearms_under_worktree_isolation_beside_a_nested_repo_root(
+    project, monkeypatch, capsys
+):
+    """DW-379: a `repo_root` that CONTAINS the project (here its parent) is the nested
+    layout worktree isolation supports, so `resolve` re-stamps the code root and
+    re-arms exactly as it does in place, telling the re-drive it will mount.
+
+    Graded on the positive outcome — the re-arm ran, against the configured root, with
+    `isolated_redrive=True`, and the command returned 0 — not only on the refusal text
+    being absent.
+
+    Ablation: widen `worktree_isolation_conflict` back to "any `repo_root` override"
+    and this reddens on the rc and on the re-arm that never happened."""
+    from bmad_loop import runs
+    from bmad_loop.journal import load_state
+
+    ancestor = _resolve_code_root_for(project, "nested")
+    run_dir, moved, _recorded = _resolve_run_with_a_moved_code_root(project, monkeypatch, ancestor)
+    _write_policy(project.project, ISOLATION_WORKTREE_POLICY)
+    seen: list = []
+
+    def fake_rearm(rd, key, *, isolated_redrive=False, **_kw):
+        seen.append((load_state(rd).code_root, isolated_redrive))
+        return _rearm_outcome(key)
+
+    monkeypatch.setattr(runs, "rearm_escalation", fake_rearm)
+
+    argv = ["resolve", "--project", str(project.project), "r1", "--no-interactive", "--resume"]
+    assert cli.main(argv) == 0
+
+    assert seen == [(moved.resolve(), True)]
+    assert REFUSAL not in capsys.readouterr().err
+    assert load_state(run_dir).repo_root == str(moved.resolve())
+
+
+def test_resolve_reaches_the_interactive_session_beside_a_nested_repo_root(
+    project, monkeypatch, capsys
+):
+    """The pre-session twin of the row above: under the nested layout the hoisted
+    refusal stays silent, so the interactive arm proceeds to build its adapters —
+    graded by reaching `_make_adapters` (recorded, then stopped with a raise the
+    command reports), not by an absent message.
+
+    Ablation: widen `worktree_isolation_conflict` back to "any `repo_root` override"
+    and this reddens: the command returns 1 before `_make_adapters` is reached."""
+    from bmad_loop import runs
+
+    reached: list[bool] = []
+
+    def make_adapters(*_a, **_k):
+        reached.append(True)
+        raise RuntimeError("stop after the refusal point")
+
+    _resolve_run_with_a_moved_code_root(
+        project, monkeypatch, _resolve_code_root_for(project, "nested")
+    )
+    _write_policy(project.project, ISOLATION_WORKTREE_POLICY)
+    monkeypatch.setattr(cli, "_make_adapters", make_adapters)
+    monkeypatch.setattr(
+        runs, "rearm_escalation", lambda *a, **k: pytest.fail("re-armed before the session")
+    )
+
+    try:
+        cli.main(["resolve", "--project", str(project.project), "r1", "--resume"])
+    except (RuntimeError, SystemExit):
+        pass
+    assert reached == [True]
+    assert REFUSAL not in capsys.readouterr().err
 
 
 def test_resolve_degrades_when_the_config_cannot_name_the_code_root(tmp_path, monkeypatch, capsys):
@@ -6440,6 +6909,7 @@ def test_cleanup_json_dry_run_plans_without_pruning(tmp_path, monkeypatch, capsy
         "live": ["live-1"],
         "unverifiable_pid": [],
         "legacy_leftovers": [],
+        "legacy_unverified": [],
     }
     assert doc["ctl_windows"] == {
         "removed": ["sweep-fin-1"],
@@ -6496,6 +6966,7 @@ def test_cleanup_json_nothing_to_clean_up_is_a_valid_empty_document(tmp_path, mo
         "live": [],
         "unverifiable_pid": [],
         "legacy_leftovers": [],
+        "legacy_unverified": [],
     }
     assert doc["ctl_windows"] == {
         "removed": [],
@@ -7031,7 +7502,7 @@ def test_resume_liveness_and_publication_share_one_lock_acquisition(tmp_path, mo
         assert active
         return "dead"
 
-    def prepare(_project, _run_dir):
+    def prepare(_project, _run_dir, *, accept_baseline=False):
         assert active
         return 1
 
@@ -7197,6 +7668,45 @@ def test_resume_restamps_policy_snapshot_for_sweep_runs(project, monkeypatch):
     assert cli._resume_paused_run(project.project, run_dir) == 0
 
     assert load_state(run_dir).cache_read_weight() == 0.5
+
+
+@pytest.mark.parametrize("how", ["deleted", "partial"])
+def test_sweep_resume_refuses_a_broken_sweep_skill_before_any_write(
+    project, monkeypatch, capsys, how
+):
+    """DW-367: a resumed sweep re-dispatches `/bmad-loop-sweep`, so resume refuses a
+    deleted or partial skill — and before the journal row, the pin re-stamp and the
+    engine arm, exactly like the base-skills gate it sits beside.
+    Ablation: delete the `state.run_type == "sweep"` gate in `_prepare_resume_locked`
+    and this reddens on the rc (the stub engine runs)."""
+    from bmad_loop import runs
+
+    run_dir = _paused_run_for_resume(project, monkeypatch, run_type="sweep")
+    runs.write_trusted_config_digest(project.project, run_dir.name, "OLDPIN")
+    _break_sweep_skill(project.project, ".claude/skills", how)
+    armed: list[str] = []
+    monkeypatch.setattr(runs, "write_pid", lambda _d: armed.append("armed"))
+    monkeypatch.setattr(cli, "SweepEngine", _StubEngine)
+
+    assert cli._resume_paused_run(project.project, run_dir) == 1
+    err = capsys.readouterr().err
+    assert "FAIL: .claude/skills/bmad-loop-sweep" in err
+    assert "bmad-loop init --force-skills" in err
+    assert "run `bmad-loop validate` for details" in err
+    assert armed == []
+    assert _resume_entries(run_dir) == []
+    assert runs.read_trusted_config_digest(project.project, run_dir.name)[0] == "OLDPIN"
+
+
+def test_story_resume_is_not_gated_on_the_sweep_skill(project, monkeypatch):
+    """A story run never dispatches `/bmad-loop-sweep`, so its resume ignores the
+    skill. Ablation: drop the `run_type` guard on the resume gate and this reddens."""
+    run_dir = _paused_run_for_resume(project, monkeypatch)
+    _break_sweep_skill(project.project, ".claude/skills", "deleted")
+    _break_sweep_skill(project.project, ".agents/skills", "deleted")
+    monkeypatch.setattr(cli, "Engine", _StubEngine)
+
+    assert cli._resume_paused_run(project.project, run_dir) == 0
 
 
 # ------------------------------------------- resume re-stamps the code root
@@ -7409,7 +7919,7 @@ def test_resume_leaves_the_owed_root_and_marker_intact_when_the_discharge_fails(
     with pytest.raises(OSError):
         cli._resume_paused_run(project.project, run_dir)
 
-    assert runs.read_trusted_config_digest(project.project, run_dir.name) == "OLDPIN"
+    assert runs.read_trusted_config_digest(project.project, run_dir.name)[0] == "OLDPIN"
     persisted = load_state(run_dir)
     assert persisted.repo_root == str(owed)
     assert persisted.code_root_restamp_pending is True
@@ -7587,7 +8097,8 @@ def test_resume_crash_exit_is_failure_only_for_persisted_named_scope(
     monkeypatch.setattr(
         runsetup,
         "compose_resume",
-        lambda **_kwargs: types.SimpleNamespace(engine=engine),
+        # ComposedRun always carries a journal; DW-410's launch warning reads it.
+        lambda **_kwargs: types.SimpleNamespace(engine=engine, journal=None),
     )
 
     assert cli._resume_paused_run(project.project, run_dir) == expected
@@ -7686,7 +8197,7 @@ def test_resume_warns_when_the_pinned_host_exec_config_changed(project, monkeypa
     # First resume stamps the pin (the run predates the field, so it has none).
     assert cli._resume_paused_run(project.project, run_dir) == 0
     assert _resume_entry(run_dir)["security_config_changed"] is False
-    pinned = runs.read_trusted_config_digest(project.project, run_dir.name)
+    pinned = runs.read_trusted_config_digest(project.project, run_dir.name)[0]
     assert pinned  # the launch/resume baseline is persisted, not just in memory
     capsys.readouterr()
 
@@ -7700,7 +8211,7 @@ def test_resume_warns_when_the_pinned_host_exec_config_changed(project, monkeypa
     assert "verify commands" in err and "plugin allowlist" in err
     assert "touch pwned" not in err
     # ...and the resume re-blesses it, so the next one is quiet again.
-    assert runs.read_trusted_config_digest(project.project, run_dir.name) != pinned
+    assert runs.read_trusted_config_digest(project.project, run_dir.name)[0] != pinned
 
 
 def test_resume_still_warns_when_a_session_rewrote_the_digest_in_state_json(
@@ -7726,7 +8237,7 @@ def test_resume_still_warns_when_a_session_rewrote_the_digest_in_state_json(
     run_dir = _paused_run_for_resume(project, monkeypatch)
     monkeypatch.setattr(cli, "Engine", _StubEngine)
     assert cli._resume_paused_run(project.project, run_dir) == 0
-    assert runs.read_trusted_config_digest(project.project, run_dir.name)
+    assert runs.read_trusted_config_digest(project.project, run_dir.name)[0]
     capsys.readouterr()
 
     # The session rewrites the verify commands...
@@ -7761,16 +8272,51 @@ def test_resume_migrates_a_pre_498_baseline_out_of_state_json(project, monkeypat
     # A run persisted by the old code: a pin in state.json, nothing out of tree.
     run_dir = _paused_run_for_resume(project, monkeypatch, trusted_config_digest="stale-pin")
     monkeypatch.setattr(cli, "Engine", _StubEngine)
-    assert runs.read_trusted_config_digest(project.project, run_dir.name) is None
+    assert runs.read_trusted_config_digest(project.project, run_dir.name) == (None, None)
 
     assert cli._resume_paused_run(project.project, run_dir) == 0
 
     # It compared against the legacy field, so the change is caught on this resume.
     assert _resume_entries(run_dir)[-1]["security_config_changed"] is True
-    assert "host-exec config pinned at launch has changed" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "host-exec config pinned at launch has changed" in err
+    # Genuine absence is the legacy case, not a fault: no DW-467 warning for it.
+    assert "baseline could not be read" not in err
     # ...and migrated: the baseline now lives out of tree, and is the fresh one.
-    migrated = runs.read_trusted_config_digest(project.project, run_dir.name)
+    migrated = runs.read_trusted_config_digest(project.project, run_dir.name)[0]
     assert migrated and migrated != "stale-pin"
+
+
+def test_resume_warns_when_the_trusted_baseline_is_unreadable(project, monkeypatch, capsys):
+    """DW-467. A FAULT at the out-of-tree path — here undecodable bytes, the
+    portable stand-in for a planted FIFO or a link — takes the same fallback to
+    `state.json` that genuine absence does, and that copy is session-writable. It
+    used to take it silently, so the operator could not tell "compared against the
+    trusted baseline" from "compared against whatever the session left in the
+    tree". The fallback itself is unchanged (this run's legacy field still decides
+    the verdict); the warning names the path and the fault.
+
+    ABLATION: drop the `digest_fault` print in `_resume_paused_run` and the first
+    assert fails; make the reader return `(None, None)` from its decode arm and
+    it fails the same way."""
+    from bmad_loop import runs
+
+    run_dir = _paused_run_for_resume(project, monkeypatch, trusted_config_digest="stale-pin")
+    monkeypatch.setattr(cli, "Engine", _StubEngine)
+    path = runs.config_digest_path_for(project.project, run_dir.name)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"\xff\xfe garbage")
+
+    assert cli._resume_paused_run(project.project, run_dir) == 0
+
+    err = capsys.readouterr().err
+    assert (
+        f"warning: run {run_dir.name}: the trusted host-exec config baseline could not be"
+        f" read ({path}: not UTF-8 text); falling back to the copy in state.json"
+    ) in err
+    # The decision is the unchanged fallback: the legacy field was compared.
+    assert _resume_entries(run_dir)[-1]["security_config_changed"] is True
+    assert "host-exec config pinned at launch has changed" in err
 
 
 def test_resume_still_warns_after_the_project_is_renamed(project, monkeypatch, capsys):
@@ -7797,7 +8343,7 @@ def test_resume_still_warns_after_the_project_is_renamed(project, monkeypatch, c
     run_dir = _paused_run_for_resume(project, monkeypatch)
     monkeypatch.setattr(cli, "Engine", _StubEngine)
     assert cli._resume_paused_run(project.project, run_dir) == 0
-    assert runs.read_trusted_config_digest(project.project, run_dir.name)
+    assert runs.read_trusted_config_digest(project.project, run_dir.name)[0]
     capsys.readouterr()
 
     # The operator renames the project directory; the run dir goes with it.
@@ -7809,7 +8355,7 @@ def test_resume_still_warns_after_the_project_is_renamed(project, monkeypatch, c
     # Precondition, or this test would pass for the wrong reason: the rename really
     # did put the out-of-tree baseline out of reach.
     assert runs.project_tag(dst) != runs.project_tag(src)
-    assert runs.read_trusted_config_digest(dst, run_dir.name) is None
+    assert runs.read_trusted_config_digest(dst, run_dir.name) == (None, None)
 
     # ...and the host-exec config changes, exactly as in the no-move case.
     _write_policy(dst, RESUME_POLICY.replace('["true"]', '["touch pwned"]'))
@@ -7818,7 +8364,7 @@ def test_resume_still_warns_after_the_project_is_renamed(project, monkeypatch, c
     assert _resume_entries(moved)[-1]["security_config_changed"] is True
     assert "host-exec config pinned at launch has changed" in capsys.readouterr().err
     # The resume re-keys the run: from here the baseline is out of tree again.
-    assert runs.read_trusted_config_digest(dst, run_dir.name)
+    assert runs.read_trusted_config_digest(dst, run_dir.name)[0]
 
 
 def test_resume_under_an_unchanged_host_exec_config_reports_no_security_change(
@@ -7951,7 +8497,7 @@ def test_refused_resume_leaves_the_pin_and_the_journal_untouched(project, monkey
 
     assert cli._resume_paused_run(project.project, run_dir) == 1
     assert "could not be discarded" in capsys.readouterr().err
-    assert runs.read_trusted_config_digest(project.project, run_dir.name) == "OLDPIN"
+    assert runs.read_trusted_config_digest(project.project, run_dir.name)[0] == "OLDPIN"
     assert _resume_entries(run_dir) == []
 
 
@@ -9837,8 +10383,8 @@ def test_validate_effort_warning_does_not_change_the_exit_code(project, capsys, 
     doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys)
     assert doc["ok"] is True
     warned = [f for f in doc["findings"] if f["check"] == "policy.effort-unsupported"]
-    # base effort inherits into every stage that keeps the client, so all three warn
-    assert sorted(f["detail"]["role"] for f in warned) == ["dev", "review", "triage"]
+    # base effort inherits into every stage that keeps the client, so all four warn
+    assert sorted(f["detail"]["role"] for f in warned) == ["dev", "retro", "review", "triage"]
     assert {f["severity"] for f in warned} == {"warning"}
 
 
@@ -9865,6 +10411,627 @@ def test_validate_effort_silent_when_unset(project, capsys):
 
     doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys, rc=1)
     assert not any(f["check"] == "policy.effort-unsupported" for f in doc["findings"])
+
+
+def _bypass_findings(project, capsys, policy: str) -> list[dict]:
+    install_bmad_config(project)
+    _write_policy(project.project, policy)
+    write_sprint(project, {"epic-1": "backlog"})
+    doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys, rc=1)
+    return [f for f in doc["findings"] if f["check"] == "policy.bypass-dropped"]
+
+
+def test_validate_warns_when_extra_args_drops_the_bypass_flags(project, capsys):
+    """DW-349: a base `extra_args` REPLACES claude's bypass_args, so every role
+    inheriting it launches without `--permission-mode bypassPermissions` — validate
+    says so per role, advisory, naming the role, profile and dropped tokens."""
+    findings = _bypass_findings(
+        project, capsys, '[adapter]\nname = "claude"\nextra_args = ["--verbose"]\n'
+    )
+    assert sorted(f["detail"]["role"] for f in findings) == ["dev", "retro", "review", "triage"]
+    assert {f["severity"] for f in findings} == {"warning"}
+    dev = next(f for f in findings if f["detail"]["role"] == "dev")
+    assert dev["detail"] == {
+        "role": "dev",
+        "profile": "claude",
+        "missing": ["--permission-mode", "bypassPermissions"],
+    }
+    assert (
+        "dev adapter.extra_args replaces claude's bypass_args and drops "
+        "--permission-mode bypassPermissions" in dev["message"]
+    )
+
+
+def test_validate_bypass_warning_names_only_the_partially_dropped_token(project, capsys):
+    findings = _bypass_findings(
+        project,
+        capsys,
+        '[adapter]\nname = "claude"\n[adapter.dev]\nextra_args = ["--permission-mode", "acceptEdits"]\n',
+    )
+    assert [f["detail"]["role"] for f in findings] == ["dev"]
+    assert findings[0]["detail"]["missing"] == ["bypassPermissions"]
+
+
+def test_validate_bypass_warning_on_an_explicit_empty_override(project, capsys):
+    findings = _bypass_findings(
+        project, capsys, '[adapter]\nname = "claude"\n[adapter.review]\nextra_args = []\n'
+    )
+    assert [f["detail"]["role"] for f in findings] == ["review"]
+
+
+def test_validate_bypass_silent_when_the_tokens_are_kept(project, capsys):
+    """An override that carries every bypass token draws no warning.
+
+    ABLATION: make the check ignore `extra_args` content (warn whenever it is not
+    None) and this reddens; the control asserts the override really loaded."""
+    policy = (
+        '[adapter]\nname = "claude"\n'
+        'extra_args = ["--permission-mode", "bypassPermissions", "--verbose"]\n'
+    )
+    assert _bypass_findings(project, capsys, policy) == []
+    loaded = policy_mod.load(project.project / ".bmad-loop" / "policy.toml")
+    assert loaded.adapter.extra_args is not None and "--verbose" in loaded.adapter.extra_args
+
+
+def test_validate_bypass_silent_when_extra_args_unset(project, capsys):
+    """No override → the profile's bypass flags are used → no finding, on the
+    very profile that would warn.
+
+    ABLATION: drop the `extra_args is None` short-circuit in
+    `missing_bypass_tokens` (treat None as `()`) and this reddens."""
+    assert _bypass_findings(project, capsys, CLAUDE_ONLY_POLICY) == []
+
+
+def test_validate_bypass_silent_on_the_opencode_kind(project, capsys):
+    """The opencode-http kind never consumes bypass_args, so an override there drops
+    nothing — even on a profile that (pointlessly) declares some.
+
+    ABLATION: drop the GENERIC-kind predicate in `_bypass_drops` and this
+    reddens; the controls pin that the overlay really carries a bypass token the override
+    lacks, so the silence is the kind predicate and nothing else."""
+    profiles_dir = project.project / ".bmad-loop" / "profiles"
+    profiles_dir.mkdir(parents=True, exist_ok=True)
+    (profiles_dir / "ocbypass.toml").write_text(
+        'name = "ocbypass"\nbinary = "opencode"\nadapter = "opencode-http"\n'
+        'bypass_args = ["--yes"]\n[hooks]\ndialect = "none"\n',
+        encoding="utf-8",
+    )
+    policy = '[adapter]\nname = "ocbypass"\nmodel = "a/b"\nextra_args = ["--verbose"]\n'
+    assert _bypass_findings(project, capsys, policy) == []
+    from bmad_loop.adapters.profile import get_profile
+
+    prof = get_profile("ocbypass", project.project)
+    assert prof.adapter == "opencode-http"
+    assert prof.missing_bypass_tokens(("--verbose",)) == ("--yes",)
+
+
+def test_validate_bypass_warning_does_not_change_the_exit_code(project, capsys, monkeypatch):
+    """Advisory: an otherwise-clean project whose extra_args drops the bypass still
+    exits 0 with `ok` true."""
+    _make_validate_pass(
+        project, monkeypatch, capsys, policy=CLAUDE_ONLY_POLICY + 'extra_args = ["--verbose"]\n'
+    )
+
+    doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys)
+    assert doc["ok"] is True
+    warned = [f for f in doc["findings"] if f["check"] == "policy.bypass-dropped"]
+    assert sorted(f["detail"]["role"] for f in warned) == ["dev", "retro", "review", "triage"]
+
+
+def test_validate_bypass_message_names_the_full_include_sequence(project, capsys):
+    """A partial drop must not advise "add them": adding only `bypassPermissions`
+    after `acceptEdits` still leaves a broken argv, so the message names the whole
+    bypass sequence to include."""
+    findings = _bypass_findings(
+        project,
+        capsys,
+        '[adapter]\nname = "claude"\n[adapter.dev]\nextra_args = ["--permission-mode", "acceptEdits"]\n',
+    )
+    (dev,) = findings
+    assert "drops bypassPermissions" in dev["message"]
+    assert "include `--permission-mode bypassPermissions` in extra_args" in dev["message"]
+
+
+def test_validate_bypass_silent_for_a_stage_that_switches_client(project, capsys):
+    """A stage that switches client inherits no `extra_args` (policy resolves it to
+    None), so it launches with its own client's bypass flags — no dev finding.
+
+    ABLATION: have validate pass the base table (`pol.adapter`) to `_bypass_drops`
+    instead of the resolved role config and this reddens; the control pins that
+    the base override really is live for the roles that keep the base client."""
+    policy = (
+        '[adapter]\nname = "codex"\nextra_args = ["--verbose"]\n[adapter.dev]\nname = "claude"\n'
+    )
+    findings = _bypass_findings(project, capsys, policy)
+    roles = sorted(f["detail"]["role"] for f in findings)
+    assert roles == ["retro", "review", "triage"]
+    assert {f["detail"]["profile"] for f in findings} == {"codex"}
+    loaded = policy_mod.load(project.project / ".bmad-loop" / "policy.toml")
+    assert loaded.adapter.resolved("dev").extra_args is None
+    assert loaded.adapter.resolved("review").extra_args == ("--verbose",)
+
+
+def _bypass_err_lines(err: str) -> list[str]:
+    return [ln for ln in err.splitlines() if "bypass_args" in ln]
+
+
+def _cli_dry_run(project, capsys, *extra: str):
+    rc = cli.main(["run", "--project", str(project.project), *extra, "--dry-run"])
+    assert rc == 0
+    return capsys.readouterr()
+
+
+def _sprint_dry_run(project, capsys, policy: str):
+    install_bmad_config(project)
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    _write_policy(project.project, policy)
+    return _cli_dry_run(project, capsys)
+
+
+def test_dry_run_warns_on_stderr_when_extra_args_drops_the_bypass(project, capsys, monkeypatch):
+    """DW-349: `run --dry-run` names the dropped tokens on stderr, once per role a
+    sprint run launches (dev + review), and stdout is exactly what it is with the
+    warning stubbed out — the argv still shows the replace semantics unchanged."""
+    policy = '[adapter]\nname = "claude"\nextra_args = ["--verbose"]\n'
+    warned = _sprint_dry_run(project, capsys, policy)
+    lines = _bypass_err_lines(warned.err)
+    assert len(lines) == 2
+    assert lines[0].startswith("warning: dev adapter.extra_args replaces claude's bypass_args")
+    assert lines[1].startswith("warning: review adapter.extra_args")
+    assert all("drops --permission-mode bypassPermissions" in ln for ln in lines)
+
+    monkeypatch.setattr(cli, "_warn_bypass_dropped", lambda *a, **k: None)
+    baseline = _cli_dry_run(project, capsys)
+    assert _bypass_err_lines(baseline.err) == []
+    assert warned.out == baseline.out
+    dev_line = next(ln for ln in warned.out.splitlines() if "dev:" in ln)
+    assert (
+        dev_line.endswith("--verbose --session-id <auto>") and "bypassPermissions" not in dev_line
+    )
+
+
+def test_dry_run_warns_for_the_retro_role_under_auto_retrospective(project, capsys):
+    """DW-389: under `gates.retrospective = "auto"` the sprint preview also warns
+    for the retro session a real run would launch.
+
+    ABLATION: pass `("dev", "review")` instead of `_sprint_launch_roles(pol)` in
+    `_dry_run` and this reddens."""
+    policy = (
+        '[gates]\nretrospective = "auto"\n'
+        '[adapter]\nname = "claude"\n'
+        'extra_args = ["--permission-mode", "bypassPermissions", "--verbose"]\n'
+        '[adapter.retro]\nextra_args = ["--verbose"]\n'
+    )
+    lines = _bypass_err_lines(_sprint_dry_run(project, capsys, policy).err)
+    assert len(lines) == 1
+    assert lines[0].startswith("warning: retro adapter.extra_args replaces claude's bypass_args")
+
+
+def test_dry_run_silent_when_extra_args_keeps_the_bypass(project, capsys):
+    """ABLATION: make `_warn_bypass_dropped` warn on any non-None extra_args and
+    this reddens; the dev-line control proves the override was rendered."""
+    policy = (
+        '[adapter]\nname = "claude"\n'
+        'extra_args = ["--permission-mode", "bypassPermissions", "--verbose"]\n'
+    )
+    result = _sprint_dry_run(project, capsys, policy)
+    assert _bypass_err_lines(result.err) == []
+    dev_line = next(ln for ln in result.out.splitlines() if "dev:" in ln)
+    assert dev_line.endswith("--permission-mode bypassPermissions --verbose --session-id <auto>")
+
+
+def test_dry_run_silent_on_the_opencode_kind(project, capsys):
+    """The opencode-http kind never consumes bypass_args, so the preview stays
+    silent even for a profile that declares some and an override that lacks them.
+
+    ABLATION: drop the GENERIC-kind predicate in `_bypass_drops` and this reddens;
+    the control pins that the profile really would report a missing token."""
+    from bmad_loop.adapters.profile import get_profile
+
+    profiles_dir = project.project / ".bmad-loop" / "profiles"
+    profiles_dir.mkdir(parents=True, exist_ok=True)
+    (profiles_dir / "ocbypass.toml").write_text(
+        'name = "ocbypass"\nbinary = "opencode"\nadapter = "opencode-http"\n'
+        'bypass_args = ["--yes"]\n[hooks]\ndialect = "none"\n',
+        encoding="utf-8",
+    )
+    policy = '[adapter]\nname = "ocbypass"\nmodel = "a/b"\nextra_args = ["--verbose"]\n'
+    result = _sprint_dry_run(project, capsys, policy)
+    assert _bypass_err_lines(result.err) == []
+    assert get_profile("ocbypass", project.project).missing_bypass_tokens(("--verbose",)) == (
+        "--yes",
+    )
+
+
+def _stories_dry_run(project, capsys, policy: str):
+    install_bmad_config(project)
+    _setup_stories_fixture(project, [_stories_entry("1")])
+    _write_policy(project.project, policy)
+    return _cli_dry_run(project, capsys, "--spec", STORIES_SPEC_FOLDER)
+
+
+def test_stories_dry_run_warns_for_dev_and_review(project, capsys):
+    """A stories run launches dev AND review sessions, so a base override that
+    drops the bypass warns for both."""
+    result = _stories_dry_run(
+        project, capsys, '[adapter]\nname = "claude"\nextra_args = ["--verbose"]\n'
+    )
+    lines = _bypass_err_lines(result.err)
+    assert [ln.split()[1] for ln in lines] == ["dev", "review"]
+    assert "Story id: 1." in result.out
+
+
+def test_stories_dry_run_warns_for_a_review_only_override(project, capsys):
+    """The stories preview renders no review argv, but the run launches review —
+    a review-only override that drops the bypass still warns, and only for review.
+
+    ABLATION: pass `("dev",)` from `_dry_run_stories` and this reddens."""
+    result = _stories_dry_run(
+        project, capsys, '[adapter]\nname = "claude"\n[adapter.review]\nextra_args = []\n'
+    )
+    lines = _bypass_err_lines(result.err)
+    assert len(lines) == 1
+    assert lines[0].startswith("warning: review adapter.extra_args replaces claude's bypass_args")
+
+
+def _sweep_dry_run_cli(project, capsys, policy: str):
+    from conftest import write_ledger
+
+    install_bmad_config(project)
+    write_ledger(project, {"DW-1": "open"}, commit=False)
+    _write_policy(project.project, policy)
+    rc = cli.main(["sweep", "--dry-run", "--project", str(project.project)])
+    assert rc == 0
+    return capsys.readouterr()
+
+
+def test_sweep_dry_run_warns_for_the_triage_role(project, capsys):
+    result = _sweep_dry_run_cli(
+        project,
+        capsys,
+        '[adapter]\nname = "claude"\n[adapter.triage]\nextra_args = ["--verbose"]\n',
+    )
+    lines = _bypass_err_lines(result.err)
+    assert len(lines) == 1 and lines[0].startswith("warning: triage adapter.extra_args")
+    triage_line = next(ln for ln in result.out.splitlines() if "triage:" in ln)
+    assert triage_line.startswith("  triage: claude ")
+
+
+def test_sweep_dry_run_warns_on_the_projected_legacy_selector_branch(project, capsys):
+    """The projected-legacy `--min-severity` preview returns early after its
+    provisional-ids note, before the triage argv line; the bypass warning still
+    fires there.
+
+    ABLATION: move the `_warn_bypass_dropped` call below that early return and
+    this reddens; the stdout control pins that the early-return branch ran."""
+    from conftest import write_legacy_ledger
+
+    install_bmad_config(project)
+    write_legacy_ledger(
+        project,
+        "# Deferred Work\n\n### D-1: High legacy\n\nseverity: high\nreason: high item\n",
+        commit=False,
+    )
+    _write_policy(
+        project.project,
+        '[adapter]\nname = "claude"\n[adapter.triage]\nextra_args = ["--verbose"]\n',
+    )
+    rc = cli.main(
+        ["sweep", "--min-severity", "high", "--dry-run", "--project", str(project.project)]
+    )
+    assert rc == 0
+    result = capsys.readouterr()
+    assert "triage: projected legacy ids are provisional" in result.out
+    lines = _bypass_err_lines(result.err)
+    assert len(lines) == 1 and lines[0].startswith("warning: triage adapter.extra_args")
+
+
+def test_sweep_dry_run_warns_for_a_bundle_role(project, capsys):
+    """A sweep runs dev + review sessions for its bundles, so a dev-only override
+    that drops the bypass warns although the preview renders only the triage argv.
+
+    ABLATION: pass `("triage",)` from `_sweep_dry_run` and this reddens."""
+    result = _sweep_dry_run_cli(
+        project,
+        capsys,
+        '[adapter]\nname = "claude"\n[adapter.dev]\nextra_args = ["--verbose"]\n',
+    )
+    lines = _bypass_err_lines(result.err)
+    assert len(lines) == 1 and lines[0].startswith("warning: dev adapter.extra_args")
+    triage_line = next(ln for ln in result.out.splitlines() if "triage:" in ln)
+    assert triage_line.startswith("  triage: claude ")
+
+
+# --------------------------------------- DW-410: bypass drop at a REAL launch
+
+_BYPASS_DROP_POLICY = '[adapter]\nname = "claude"\nextra_args = ["--verbose"]\n'
+_BYPASS_KEPT_POLICY = (
+    '[adapter]\nname = "claude"\n'
+    'extra_args = ["--permission-mode", "bypassPermissions", "--verbose"]\n'
+)
+
+
+def _bypass_journal(run_dir) -> list[dict]:
+    from bmad_loop.journal import JOURNAL_FILE
+
+    path = run_dir / JOURNAL_FILE
+    if not path.is_file():
+        return []
+    records = [json.loads(ln) for ln in path.read_text().splitlines() if ln.strip()]
+    return [r for r in records if r["kind"] == "bypass-dropped"]
+
+
+def _err_at_engine_run(monkeypatch, capsys, *engine_attrs: str) -> list[str]:
+    """Install a stub engine (under each of ``engine_attrs``) whose ``run()``
+    snapshots stderr, so a test can pin that the warning precedes the engine."""
+    seen: list[str] = []
+
+    class _SnapshotEngine(_StubEngine):
+        def run(self):
+            seen.append(capsys.readouterr().err)
+            return super().run()
+
+    for attr in engine_attrs:
+        monkeypatch.setattr(cli, attr, _SnapshotEngine)
+    monkeypatch.setattr(cli, "_make_adapters", lambda *a, **k: {r: None for r in cli.ROLES})
+    return seen
+
+
+def _launch_fixture(project, policy: str) -> None:
+    from conftest import git, install_base_skills
+
+    install_bmad_config(project)
+    install_base_skills(project)
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    _write_policy(project.project, policy)
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "setup")
+
+
+def _dry_run_bypass_lines(project, capsys) -> list[str]:
+    assert cli.main(["run", "--project", str(project.project), "--dry-run"]) == 0
+    return _bypass_err_lines(capsys.readouterr().err)
+
+
+def test_real_run_warns_and_journals_when_extra_args_drops_the_bypass(project, monkeypatch, capsys):
+    """DW-410: a real `run` prints the dry-run's exact `warning:` lines on stderr
+    for dev and review BEFORE the engine runs, and journals one `bypass-dropped`
+    per launched role; rc unchanged.
+
+    ABLATION: delete the `_warn_bypass_dropped` call in `cmd_run`, or its
+    `journal.append` — this reddens."""
+    _launch_fixture(project, _BYPASS_DROP_POLICY)
+    expected = _dry_run_bypass_lines(project, capsys)
+    assert len(expected) == 2
+    seen = _err_at_engine_run(monkeypatch, capsys, "Engine")
+
+    run_id = "20990101-000000-b410"
+    assert cli.main(["run", "--project", str(project.project), "--run-id", run_id]) == 0
+    assert len(seen) == 1 and _bypass_err_lines(seen[0]) == expected
+    entries = _bypass_journal(project.project / ".bmad-loop" / "runs" / run_id)
+    assert [(e["role"], e["profile"], e["missing"]) for e in entries] == [
+        ("dev", "claude", ["--permission-mode", "bypassPermissions"]),
+        ("review", "claude", ["--permission-mode", "bypassPermissions"]),
+    ]
+
+
+def test_real_run_warns_and_journals_the_retro_role_under_auto_retrospective(
+    project, monkeypatch, capsys
+):
+    """DW-389: under `gates.retrospective = "auto"` a sprint run also launches the
+    retro session, so an `[adapter.retro] extra_args` that drops the bypass warns
+    and journals `bypass-dropped` for role `retro` at launch.
+
+    ABLATION: pass `("dev", "review")` instead of `_sprint_launch_roles(pol)` in
+    `cmd_run` and this reddens."""
+    _launch_fixture(
+        project,
+        '[gates]\nretrospective = "auto"\n'
+        + _BYPASS_KEPT_POLICY
+        + '[adapter.retro]\nextra_args = ["--verbose"]\n',
+    )
+    seen = _err_at_engine_run(monkeypatch, capsys, "Engine")
+
+    run_id = "20990101-000000-b412"
+    assert cli.main(["run", "--project", str(project.project), "--run-id", run_id]) == 0
+    assert len(seen) == 1 and len(_bypass_err_lines(seen[0])) == 1
+    entries = _bypass_journal(project.project / ".bmad-loop" / "runs" / run_id)
+    assert [(e["role"], e["profile"], e["missing"]) for e in entries] == [
+        ("retro", "claude", ["--permission-mode", "bypassPermissions"]),
+    ]
+
+
+@pytest.mark.parametrize(
+    "policy", [_BYPASS_KEPT_POLICY, '[adapter]\nname = "claude"\n'], ids=["kept", "unset"]
+)
+def test_real_run_silent_when_the_bypass_is_kept_or_unset(project, monkeypatch, capsys, policy):
+    """ABLATION: make `_warn_bypass_dropped` warn on any launch regardless of
+    `_bypass_drops` and this reddens."""
+    _launch_fixture(project, policy)
+    seen = _err_at_engine_run(monkeypatch, capsys, "Engine")
+    run_id = "20990101-000000-b411"
+    assert cli.main(["run", "--project", str(project.project), "--run-id", run_id]) == 0
+    assert _bypass_err_lines(seen[0] + capsys.readouterr().err) == []
+    run_dir = project.project / ".bmad-loop" / "runs" / run_id
+    assert run_dir.is_dir()  # control: the run really composed
+    assert _bypass_journal(run_dir) == []
+
+
+def test_real_sweep_warns_and_journals_for_triage_dev_and_review(project, monkeypatch, capsys):
+    """DW-410: a real `sweep` launches triage + dev + review, so a base override
+    that drops the bypass warns and journals for all three, before the engine runs.
+
+    ABLATION: delete the `_warn_bypass_dropped` call in `_start_sweep` and this
+    reddens."""
+    from conftest import git, write_ledger
+
+    _launch_fixture(project, _BYPASS_DROP_POLICY)
+    write_ledger(project, {"DW-1": "open"}, commit=False)
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "ledger")
+    seen = _err_at_engine_run(monkeypatch, capsys, "SweepEngine")
+
+    run_id = "20990101-000000-b412"
+    assert cli.main(["sweep", "--project", str(project.project), "--run-id", run_id]) == 0
+    lines = _bypass_err_lines(seen[0])
+    assert [ln.split()[1] for ln in lines] == ["triage", "dev", "review"]
+    assert all(ln.startswith("warning: ") for ln in lines)
+    entries = _bypass_journal(project.project / ".bmad-loop" / "runs" / run_id)
+    assert [e["role"] for e in entries] == ["triage", "dev", "review"]
+
+
+def test_real_sweep_silent_when_the_bypass_is_kept(project, monkeypatch, capsys):
+    from conftest import git, write_ledger
+
+    _launch_fixture(project, _BYPASS_KEPT_POLICY)
+    write_ledger(project, {"DW-1": "open"}, commit=False)
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "ledger")
+    seen = _err_at_engine_run(monkeypatch, capsys, "SweepEngine")
+    run_id = "20990101-000000-b413"
+    assert cli.main(["sweep", "--project", str(project.project), "--run-id", run_id]) == 0
+    assert len(seen) == 1 and _bypass_err_lines(seen[0]) == []
+    assert _bypass_journal(project.project / ".bmad-loop" / "runs" / run_id) == []
+
+
+def test_warn_bypass_dropped_follows_the_passed_profiles_mapping(project, capsys):
+    """DW-410: a launch hands `_warn_bypass_dropped` the profiles it resolved
+    once; the warning and the journal must describe THOSE bytes, never a fresh
+    `get_profile` read of disk.
+
+    ABLATION: ignore `profiles` (always call `get_profile`) and this reddens —
+    disk's claude drops `--permission-mode bypassPermissions`, the mapping `--yolo`."""
+    import dataclasses
+
+    from bmad_loop.adapters.profile import get_profile
+    from bmad_loop.journal import Journal
+
+    _write_policy(project.project, _BYPASS_DROP_POLICY)
+    pol = policy_mod.load(project.project / ".bmad-loop" / "policy.toml")
+    frozen = dataclasses.replace(get_profile("claude", project.project), bypass_args=("--yolo",))
+    run_dir = project.project / ".bmad-loop" / "runs" / "20990101-000000-b416"
+    run_dir.mkdir(parents=True)
+
+    cli._warn_bypass_dropped(
+        pol, project.project, ("dev",), profiles={"dev": frozen}, journal=Journal(run_dir)
+    )
+    (line,) = _bypass_err_lines(capsys.readouterr().err)
+    assert line.startswith("warning: dev adapter.extra_args replaces claude's bypass_args")
+    assert "drops --yolo" in line
+    assert [(e["role"], e["profile"], e["missing"]) for e in _bypass_journal(run_dir)] == [
+        ("dev", "claude", ["--yolo"])
+    ]
+
+
+def test_story_resume_warns_and_journals_for_dev_and_review(project, monkeypatch, capsys):
+    """DW-410: a resumed story run (`run_type` "story") warns for dev + review.
+
+    ABLATION: delete the `_warn_bypass_dropped` call in `_resume_paused_run`, or
+    hard-code the sweep role set there — this reddens."""
+    from bmad_loop import runs
+
+    _launch_fixture(project, _BYPASS_DROP_POLICY)
+    run_dir = _make_run_with_state(
+        project.project,
+        "20990101-000000-b414",
+        paused_reason="escalation",
+        paused_stage="escalation",
+    )
+    monkeypatch.setattr(runs, "kill_session", lambda rid: None)
+    seen = _err_at_engine_run(monkeypatch, capsys, "Engine")
+
+    assert cli._resume_paused_run(project.project, run_dir) == 0
+    assert [ln.split()[1] for ln in _bypass_err_lines(seen[0])] == ["dev", "review"]
+    assert [e["role"] for e in _bypass_journal(run_dir)] == ["dev", "review"]
+
+
+@pytest.mark.parametrize(
+    ("source", "roles"),
+    [("sprint-status", ["retro"]), ("stories", [])],
+    ids=["sprint", "stories"],
+)
+def test_resume_warns_and_journals_retro_only_for_sprint_source_under_auto(
+    project, monkeypatch, capsys, source, roles
+):
+    """DW-389: under `gates.retrospective = "auto"` a resumed sprint run launches
+    the retro session too, so a dropping `[adapter.retro] extra_args` warns and
+    journals for `retro`; a stories resume never crosses an epic boundary and
+    stays silent.
+
+    ABLATION: pass `("dev", "review")` for the non-sweep arm of
+    `_resume_paused_run` and the sprint case reddens; drop its
+    `state.source == "stories"` arm and the stories case reddens."""
+    from bmad_loop import runs
+
+    _launch_fixture(
+        project,
+        '[gates]\nretrospective = "auto"\n'
+        + _BYPASS_KEPT_POLICY
+        + '[adapter.retro]\nextra_args = ["--verbose"]\n',
+    )
+    if source == "stories":
+        from conftest import install_build_auto_skill
+
+        install_build_auto_skill(project.project)  # the folder+id dispatch probe
+    run_dir = _make_run_with_state(
+        project.project,
+        "20990101-000000-b417",
+        source=source,
+        paused_reason="escalation",
+        paused_stage="escalation",
+    )
+    monkeypatch.setattr(runs, "kill_session", lambda rid: None)
+    seen = _err_at_engine_run(monkeypatch, capsys, "Engine", "StoriesEngine")
+
+    assert cli._resume_paused_run(project.project, run_dir) == 0
+    assert len(seen) == 1
+    assert [ln.split()[1] for ln in _bypass_err_lines(seen[0])] == roles
+    assert [e["role"] for e in _bypass_journal(run_dir)] == roles
+
+
+def test_sweep_resume_warns_and_journals_for_triage_dev_and_review(project, monkeypatch, capsys):
+    """DW-410: a resumed sweep (`run_type` "sweep") warns for triage + dev + review.
+
+    ABLATION: pass the story role set unconditionally from `_resume_paused_run`
+    and this reddens."""
+    from conftest import install_base_skills
+
+    from bmad_loop import runs
+    from bmad_loop.journal import load_state, save_state
+
+    install_bmad_config(project)
+    install_base_skills(project)
+    write_sprint(project, {})
+    run_dir = _compose_sweep_run(project, _BYPASS_DROP_POLICY)
+    assert _bypass_journal(run_dir) == []  # compose alone journals nothing
+    state = load_state(run_dir)
+    assert state.run_type == "sweep"
+    state.paused_reason, state.paused_stage = "escalation", "escalation"
+    save_state(run_dir, state)
+    monkeypatch.setattr(runs, "kill_session", lambda rid: None)
+    monkeypatch.setattr(runs, "write_pid", lambda _run_dir: None)
+    seen = _err_at_engine_run(monkeypatch, capsys, "SweepEngine")
+
+    assert cli._resume_paused_run(project.project, run_dir) == 0
+    assert [ln.split()[1] for ln in _bypass_err_lines(seen[0])] == ["triage", "dev", "review"]
+    assert [e["role"] for e in _bypass_journal(run_dir)] == ["triage", "dev", "review"]
+
+
+def test_resume_silent_when_the_bypass_is_kept(project, monkeypatch, capsys):
+    from bmad_loop import runs
+
+    _launch_fixture(project, _BYPASS_KEPT_POLICY)
+    run_dir = _make_run_with_state(
+        project.project,
+        "20990101-000000-b415",
+        paused_reason="escalation",
+        paused_stage="escalation",
+    )
+    monkeypatch.setattr(runs, "kill_session", lambda rid: None)
+    seen = _err_at_engine_run(monkeypatch, capsys, "Engine")
+    assert cli._resume_paused_run(project.project, run_dir) == 0
+    assert len(seen) == 1 and _bypass_err_lines(seen[0]) == []
+    assert _bypass_journal(run_dir) == []
 
 
 def test_validate_stories_mode_skips_sprint_gate(project, capsys):
@@ -10153,6 +11320,264 @@ def test_validate_inspects_old_registered_script_before_migration(project, capsy
     )
 
 
+def _register_relay_under(project, monkeypatch, capsys, dirname: str) -> str:
+    """A validate-passing project whose Stop hook names an existing, executable
+    relay under ``dirname`` — so presence stays `ok` and only the path is at issue.
+    Returns the registered spelling."""
+    _make_validate_pass(project, monkeypatch, capsys)
+    relay_dir = project.project.parent / dirname
+    relay_dir.mkdir()
+    relay = relay_dir / ("bmad-loop.exe" if os.name == "nt" else "bmad-loop")
+    relay.write_text("#!/bin/sh\nexit 0\n")
+    relay.chmod(0o755)
+    config = project.project / ".claude/settings.json"
+    data = json.loads(config.read_text())
+    spelling = relay.as_posix()
+    data["hooks"]["Stop"][0]["hooks"][0]["command"] = f"{spelling} relay Stop"
+    config.write_text(json.dumps(data))
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "relay under " + dirname)
+    return spelling
+
+
+def test_validate_warns_on_unsafe_registered_relay_path_under_windows_host(
+    project, capsys, monkeypatch
+):
+    """DW-346: under the Windows host, a registered relay in an unspaced `a&b` dir
+    is quoted by nothing, so validate warns `hooks.relay-path-unsafe` naming the
+    path and chars — advisory: `ok` and rc stay as they were.
+
+    ABLATION: delete the `report.warn("hooks.relay-path-unsafe", …)` in
+    `cmd_validate`, or make `WindowsProcessHost.unsafe_shell_chars` return `()` —
+    this reddens."""
+    from bmad_loop.process_host import get_process_host
+
+    spelling = _register_relay_under(project, monkeypatch, capsys, "a&b")
+    monkeypatch.setenv("BMAD_LOOP_PROCESS_HOST", "windows")
+    get_process_host.cache_clear()
+    try:
+        doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys)
+    finally:
+        monkeypatch.delenv("BMAD_LOOP_PROCESS_HOST")
+        get_process_host.cache_clear()
+    assert doc["ok"] is True
+    unsafe = [f for f in doc["findings"] if f["check"] == "hooks.relay-path-unsafe"]
+    assert len(unsafe) == 1
+    assert unsafe[0]["severity"] == "warning"
+    assert unsafe[0]["detail"] == {"path": spelling, "chars": ["&"]}
+    assert spelling in unsafe[0]["message"]
+    # control: the registration really was inspected as present
+    assert any(
+        f["check"] == "hooks.relay-present"
+        and f["severity"] == "ok"
+        and Path(f["detail"]["path"]) == Path(spelling)
+        for f in doc["findings"]
+    )
+
+
+def test_validate_skips_legacy_script_relay_under_windows_host(
+    project, capsys, monkeypatch, tmp_path
+):
+    """A legacy copied-script registration names its script through
+    `$CLAUDE_PROJECT_DIR`, so a project dir holding `&` is never exposed to the
+    hook shell — no `hooks.relay-path-unsafe`, even under the Windows host.
+
+    ABLATION: drop the `relay.name != "bmad_loop_hook.py"` skip in `cmd_validate`
+    and this reddens; the control pins that the legacy path really was inspected."""
+    import shutil as _shutil
+
+    from bmad_loop.install import install_into
+    from bmad_loop.process_host import get_process_host
+
+    install_bmad_config(project)
+    _write_policy(project.project)
+    assert install_into(project.project, clis=("claude",), skills=False) == 0
+    config = project.project / ".claude/settings.json"
+    data = json.loads(config.read_text())
+    data["hooks"]["Stop"][0]["hooks"][0][
+        "command"
+    ] = 'python3 "$CLAUDE_PROJECT_DIR"/.bmad-loop/bmad_loop_hook.py Stop'
+    config.write_text(json.dumps(data))
+    (project.project / ".bmad-loop/bmad_loop_hook.py").write_text("# legacy script\n")
+    moved = tmp_path / "a&b" / "proj"
+    _shutil.copytree(project.project, moved, symlinks=True)
+    capsys.readouterr()
+
+    monkeypatch.setenv("BMAD_LOOP_PROCESS_HOST", "windows")
+    get_process_host.cache_clear()
+    try:
+        _rc, doc = _validate_json(moved, capsys)
+    finally:
+        monkeypatch.delenv("BMAD_LOOP_PROCESS_HOST")
+        get_process_host.cache_clear()
+    legacy = str(moved / ".bmad-loop/bmad_loop_hook.py")
+    assert any(
+        f["check"] == "hooks.relay-present" and f["detail"]["path"] == legacy
+        for f in doc["findings"]
+    )
+    assert not any(f["check"] == "hooks.relay-path-unsafe" for f in doc["findings"])
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="the POSIX host never runs on Windows")
+def test_validate_silent_on_metachar_relay_path_under_posix_host(project, capsys, monkeypatch):
+    """shlex.quote single-quotes every sh metacharacter: the POSIX host never
+    flags a registered relay path, whatever it contains."""
+    from bmad_loop.process_host import get_process_host
+
+    _register_relay_under(project, monkeypatch, capsys, "a&b")
+    monkeypatch.setenv("BMAD_LOOP_PROCESS_HOST", "posix")
+    get_process_host.cache_clear()
+    try:
+        doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys)
+    finally:
+        monkeypatch.delenv("BMAD_LOOP_PROCESS_HOST")
+        get_process_host.cache_clear()
+    assert doc["ok"] is True
+    assert not any(f["check"] == "hooks.relay-path-unsafe" for f in doc["findings"])
+    assert any(f["check"] == "hooks.relay-stale" for f in doc["findings"])  # control
+
+
+def test_validate_flags_unresolvable_legacy_interpreter(project, capsys, monkeypatch):
+    from bmad_loop.install import install_into
+
+    install_bmad_config(project)
+    _write_policy(project.project)
+    assert install_into(project.project, clis=("claude",), skills=False) == 0
+    config = project.project / ".claude/settings.json"
+    data = json.loads(config.read_text())
+    stop = data["hooks"]["Stop"][0]["hooks"][0]
+    stop["command"] = 'python-missing-xyz "$CLAUDE_PROJECT_DIR"/.bmad-loop/bmad_loop_hook.py Stop'
+    config.write_text(json.dumps(data))
+    (project.project / ".bmad-loop/bmad_loop_hook.py").write_text("# legacy script\n")
+    capsys.readouterr()
+
+    _rc, doc = _validate_json(project.project, capsys)
+    flagged = [
+        f
+        for f in doc["findings"]
+        if f["check"] == "hooks.relay-present"
+        and f["severity"] == "problem"
+        and "python-missing-xyz" in f["message"]
+    ]
+    assert len(flagged) == 1
+    assert flagged[0]["detail"] == {
+        "path": "python-missing-xyz",
+        "interpreter": "python-missing-xyz",
+    }
+
+    # A resolvable interpreter is not flagged (absolute, so CI PATH is irrelevant).
+    stop["command"] = (
+        f'"{Path(sys.executable).as_posix()}" "$CLAUDE_PROJECT_DIR"/.bmad-loop/bmad_loop_hook.py Stop'
+    )
+    config.write_text(json.dumps(data))
+    _rc, doc = _validate_json(project.project, capsys)
+    assert not [
+        f
+        for f in doc["findings"]
+        if f["check"] == "hooks.relay-present" and "interpreter" in f.get("detail", {})
+    ]
+    assert any(
+        f["check"] == "hooks.relay-present" and f["severity"] == "ok" for f in doc["findings"]
+    )
+
+    # The uv form: only its first token is a PATH lookup, never the `python` after it.
+    stop["command"] = (
+        'uv run --no-project python "$CLAUDE_PROJECT_DIR"/.bmad-loop/bmad_loop_hook.py Stop'
+    )
+    config.write_text(json.dumps(data))
+    monkeypatch.setattr(
+        cli.shutil, "which", lambda name, *a, **k: "/usr/bin/uv" if name == "uv" else None
+    )
+    _rc, doc = _validate_json(project.project, capsys)
+    interpreter_findings = [
+        f
+        for f in doc["findings"]
+        if f["check"] == "hooks.relay-present" and "interpreter" in f.get("detail", {})
+    ]
+    assert not interpreter_findings
+    assert not [
+        f
+        for f in doc["findings"]
+        if f["check"] == "hooks.relay-present" and f.get("detail", {}).get("path") == "python"
+    ]
+
+
+def test_validate_refuses_relay_registered_only_on_session_start(project, capsys):
+    from bmad_loop.install import install_into
+
+    install_bmad_config(project)
+    _write_policy(project.project)
+    assert install_into(project.project, clis=("claude",), skills=False) == 0
+    config = project.project / ".claude/settings.json"
+    data = json.loads(config.read_text())
+    data["hooks"] = {"SessionStart": data["hooks"]["SessionStart"]}
+    config.write_text(json.dumps(data))
+    capsys.readouterr()
+
+    _rc, doc = _validate_json(project.project, capsys)
+    assert any(
+        f["check"] == "hooks.registered"
+        and f["severity"] == "problem"
+        and f["detail"]["profile"] == "claude"
+        for f in doc["findings"]
+    )
+
+
+def test_validate_refuses_stop_relay_under_unmapped_native_and_init_repairs(project, capsys):
+    """DW-409: a managed `relay Stop` under a native event claude's profile does
+    not map (`SubagentStop`) completes sessions early — validate flags it, and a
+    re-run init strips it so the same check reads ok."""
+    from bmad_loop.install import install_into
+
+    install_bmad_config(project)
+    _write_policy(project.project)
+    assert install_into(project.project, clis=("claude",), skills=False) == 0
+    config = project.project / ".claude/settings.json"
+    data = json.loads(config.read_text())
+    data["hooks"]["SubagentStop"] = data["hooks"]["Stop"]
+    config.write_text(json.dumps(data))
+    capsys.readouterr()
+
+    def registered_severities():
+        _rc, doc = _validate_json(project.project, capsys)
+        return [
+            f["severity"]
+            for f in doc["findings"]
+            if f["check"] == "hooks.registered" and f["detail"]["profile"] == "claude"
+        ]
+
+    assert registered_severities() == ["problem"]
+
+    assert install_into(project.project, clis=("claude",), skills=False) == 0
+    assert "SubagentStop" not in json.loads(config.read_text())["hooks"]
+    capsys.readouterr()
+    assert registered_severities() == ["ok"]
+
+
+def test_validate_passes_hooks_registered_without_the_notification_relay(project, capsys):
+    """DW-348 acceptance: an existing project whose `.claude/settings.json` lacks
+    the `Notification` relay (initialized before it existed) still passes
+    `hooks.registered` — the parked-signal relay is optional, Stop is not."""
+    from bmad_loop.install import install_into
+
+    install_bmad_config(project)
+    _write_policy(project.project)
+    assert install_into(project.project, clis=("claude",), skills=False) == 0
+    config = project.project / ".claude/settings.json"
+    data = json.loads(config.read_text())
+    del data["hooks"]["Notification"]
+    config.write_text(json.dumps(data))
+    capsys.readouterr()
+
+    _rc, doc = _validate_json(project.project, capsys)
+    registered = [
+        f
+        for f in doc["findings"]
+        if f["check"] == "hooks.registered" and f["detail"]["profile"] == "claude"
+    ]
+    assert [f["severity"] for f in registered] == ["ok"]
+
+
 def test_validate_ignores_unused_legacy_copy(project, capsys):
     from bmad_loop.install import install_into
 
@@ -10411,6 +11836,9 @@ def test_validate_reports_an_undecodable_profile_overlay_instead_of_crashing(pro
     assert finding["severity"] == "problem"
     assert "not valid UTF-8" in finding["message"]
     assert str(overlay) in finding["message"]  # the finding names the file at fault
+    # DW-367: no triage tree resolved, so no sweep-skill verdict at all — never a
+    # green `skills.sweep` assembled from an empty probe
+    assert not [f for f in doc["findings"] if f["check"].startswith("skills.sweep")]
 
 
 def test_validate_json_counts_and_ok_agree_with_findings(project, capsys):
@@ -10445,6 +11873,20 @@ def test_validate_json_warning_message_carries_no_severity_prefix(project, capsy
     for finding in warned:
         assert "warning:" not in finding["message"]
         assert not finding["message"].startswith(" ")
+
+
+def test_validate_policy_line_names_the_retro_adapter(project, capsys):
+    """DW-389: an `[adapter.retro]` override is named by `validate`'s policy finding,
+    in the message and the detail, beside the other roles.
+
+    Ablation: drop `retro=` from the policy-OK message and the message assert
+    reddens; drop `retro=_stage_adapter(...)` from `policy.loads` and both do."""
+    _write_policy(project.project, CLAUDE_ONLY_POLICY + '[adapter.retro]\nname = "codex"\n')
+    doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys, rc=1)
+    policy = next(f for f in doc["findings"] if f["check"] == "policy")
+    assert "retro=codex" in policy["message"]
+    assert policy["detail"]["adapters"]["retro"] == "codex"
+    assert policy["detail"]["adapters"]["dev"] == "claude"
 
 
 def test_validate_json_detail_round_trips_for_every_real_shape(capsys):
@@ -10784,6 +12226,31 @@ def test_validate_json_mux_detail_keeps_the_rows_the_text_flattens(mux_registry,
     assert rows["alpha"]["selected"] is True and rows["beta"]["selected"] is False
     assert rows["alpha"]["version"] == "alpha 1.2" and rows["beta"]["version"] is None
     assert rows["beta"]["matches_platform"] is False and rows["beta"]["available"] is False
+
+
+def test_platform_preflight_names_a_raising_backend_probe(mux_registry):
+    """A lone backend whose available() raises gets no inventory (the listing is
+    gated on >1 backend), so the fault has its own warning finding, ungated
+    (DW-464) — and a healthy backend gets none. A warning, so the verdict holds.
+    ABLATION: drop the mux.backend-probe loop in platform_preflight and the
+    assertion fails."""
+    import sys as _sys
+
+    mux_registry.register_multiplexer("alpha", lambda p: p == _sys.platform, _RaisingAvailableMux)
+    found = cli._platform_preflight(Path("C:/p"))
+    probes = [f for f in found if f.check == "mux.backend-probe"]
+    assert [(f.severity, f.detail) for f in probes] == [
+        (
+            "warning",
+            {"backend": "alpha", "error": "available() raised RuntimeError: probe exploded"},
+        )
+    ]
+    assert "alpha probe failed: available() raised RuntimeError" in probes[0].message
+
+    mux_registry._BACKENDS.clear()
+    mux_registry.get_multiplexer.cache_clear()
+    mux_registry.register_multiplexer("alpha", lambda p: p == _sys.platform, _MuxStub)
+    assert not [f for f in cli._platform_preflight(Path("C:/p")) if f.check == "mux.backend-probe"]
 
 
 def test_platform_preflight_selection_detail_keeps_the_raw_reason(mux_registry, monkeypatch):
@@ -11206,6 +12673,7 @@ def mux_registry(monkeypatch):
     m._BUILTINS_LOADED = True  # suppress the real tmux builtin
     m._CONFIGURED = None
     m.get_multiplexer.cache_clear()
+    monkeypatch.setattr(m, "_PROBE_FAULTS_WARNED", set())  # DW-464 warn-once state
     yield m
     m._BACKENDS[:] = saved_backends
     m._BUILTINS_LOADED = saved_loaded
@@ -11390,6 +12858,29 @@ def test_mux_warns_for_an_unavailable_backend_too(mux_registry, tmp_path, capsys
     assert cli.main(["mux", "--project", str(tmp_path)]) == 0
 
     assert "warning: alpha version probe failed: psmux -V failed" in capsys.readouterr().err
+
+
+class _RaisingAvailableMux(_MuxStub):
+    def available(self):
+        raise RuntimeError("probe exploded")
+
+
+def test_mux_names_a_raising_availability_probe(mux_registry, tmp_path, capsys):
+    """An AVAILABLE of `no` that a raising probe forced is a fold, not the host's
+    answer (DW-464): the row carries the fault and `mux` names it on stderr,
+    beside the version-probe diagnostic. ABLATION: drop the probe_error loop in
+    cmd_mux and the assertion fails."""
+    import sys as _sys
+
+    mux_registry.register_multiplexer("alpha", lambda p: p == _sys.platform, _RaisingAvailableMux)
+    mux_registry.register_multiplexer("beta", lambda p: p == _sys.platform, _MuxStub)
+    assert cli.main(["mux", "--project", str(tmp_path)]) == 0
+    err = capsys.readouterr().err
+    assert (
+        "warning: alpha backend probe failed: available() raised RuntimeError: probe exploded"
+        in err.splitlines()
+    )
+    assert "beta backend probe failed" not in err
 
 
 def test_mux_stays_silent_when_a_backend_simply_reports_no_version(mux_registry, tmp_path, capsys):
@@ -12272,9 +13763,9 @@ def test_confirm_reverify_runs_the_commands_in_the_code_tree(
     classify_cwds: list[Path] = []
     real_env_fault = verify.env_fault_reason
 
-    def classify_in(result, cwd):
+    def classify_in(result, cwd, **kwargs):
         classify_cwds.append(cwd)
-        return real_env_fault(result, cwd)
+        return real_env_fault(result, cwd, **kwargs)
 
     monkeypatch.setattr(verify, "env_fault_reason", classify_in)
 
@@ -12455,6 +13946,37 @@ def test_reverify_walks_every_command_when_they_all_pass(tmp_path, capsys):
 
     assert sentinel.is_file()
     assert "verify commands passed" in capsys.readouterr().out
+
+
+def test_reverify_runs_probes_first_and_names_the_environment(tmp_path, capsys):
+    """A failed `[environment]` probe answers before any `[verify]` command runs
+    (DW-523), and the reason names the probe and the environment rather than the
+    story. Ablation: drop the probe block from `_reverify` and the sentinel
+    command runs (and the reason becomes None — the commands pass)."""
+    sentinel = tmp_path / "probed-ran"
+    command = _sentinel_writer_cmd(tmp_path, sentinel, rc=0, stem="probed")
+    _write_policy(
+        tmp_path,
+        f"[verify]\ncommands = {json.dumps([command])}\n" '[environment]\nprobes = ["exit 6"]\n',
+    )
+
+    reason = cli._reverify(tmp_path, tmp_path)
+
+    assert reason is not None
+    assert reason.startswith("environment probe 'exit 6' failed (rc=6)")
+    assert "the run environment, not the story" in reason
+    assert not sentinel.exists()
+    assert "re-running" not in capsys.readouterr().out
+
+
+def test_reverify_declared_env_fault_rc_reports_not_could_not_run(tmp_path):
+    """A command exiting with `[verify] env_fault_rc` RAN and declared the fault;
+    "could not run" would send the operator hunting for a missing binary."""
+    _write_policy(tmp_path, '[verify]\ncommands = ["exit 75"]\nenv_fault_rc = 75\n')
+
+    reason = cli._reverify(tmp_path, tmp_path)
+
+    assert reason == "'exit 75' reported an environment fault (rc=75, [verify] env_fault_rc)"
 
 
 def test_confirm_drops_a_record_path_replaced_by_a_directory(project, capsys, monkeypatch):
@@ -12844,15 +14366,18 @@ def test_confirm_refuses_when_the_spec_vanished_before_the_audit_section(
     assert "1-1-a" in operatoractions.load(project.project)
 
 
-def test_confirm_reports_a_board_that_did_not_advance(project, capsys, monkeypatch):
-    """`sprintstatus.advance` returns the CURRENT status when its line regex
+def test_confirm_reports_a_board_write_the_writer_refused(project, capsys, monkeypatch):
+    """`sprintstatus.advance` raises `SprintStatusWriteRefused` when the line edit
     cannot rewrite the entry `story_status` resolved via YAML — a quoted story key
-    is enough, no mock required. That leaves the half-applied state the message
-    has to be honest about: spec signed off and done, board still parked.
+    is enough, no mock required (#842). That leaves the half-applied state the
+    message has to be honest about: spec signed off and done, board still parked.
+    The message names the row, its status, the reason token and the repair, and
+    the park entry stays so a re-run finishes the job.
 
-    Ablation: drop the `landed != "done"` branch and this fails — `✓ confirmed`
-    is printed and the entry is dropped over a board still at awaiting-operator,
-    with nothing left that can find the story."""
+    Ablation: drop the `except sprintstatus.SprintStatusWriteRefused` arm in
+    `_land_confirmation` and `main`'s generic `SprintStatusError` catch answers
+    instead — still exit 1, but with no word that the spec already landed or that
+    re-running `confirm` is the way back, which this row asserts."""
     from bmad_loop import devcontract, frontmatter, operatoractions, sprintstatus
 
     install_bmad_config(project)
@@ -12868,8 +14393,11 @@ def test_confirm_reports_a_board_that_did_not_advance(project, capsys, monkeypat
 
     assert cli.main(_confirm_argv(project, "1-1-a")) == 1
     err = capsys.readouterr().err
-    assert "did not advance" in err and "awaiting-operator" in err
-    assert "Fix the board by hand" in err and "re-run" in err
+    assert "board write was refused" in err and str(project.sprint_status) in err
+    assert "'awaiting-operator'" in err and "(key-not-plain)" in err
+    assert "rewrite the row as a plain one-line `1-1-a: <status>` entry" in err
+    assert "park entry has been left in place" in err
+    assert "re-run `bmad-loop confirm 1-1-a`" in err
     # the spec half landed and stays landed — that is what makes this recoverable
     assert frontmatter.status_of(frontmatter.read_frontmatter(sp)) == "done"
     assert devcontract.has_operator_confirmation(sp)
@@ -13056,9 +14584,9 @@ def test_a_resume_reverify_runs_the_commands_in_the_code_tree(
     classify_cwds: list[Path] = []
     real_env_fault = verify.env_fault_reason
 
-    def classify_in(result, cwd):
+    def classify_in(result, cwd, **kwargs):
         classify_cwds.append(cwd)
-        return real_env_fault(result, cwd)
+        return real_env_fault(result, cwd, **kwargs)
 
     monkeypatch.setattr(verify, "env_fault_reason", classify_in)
 
@@ -13201,6 +14729,208 @@ def test_validate_render_tracked_probe_degrades_without_a_fabricated_result(
     findings = _validate_findings(project, capsys)
     assert calls == 1
     assert "git.render-tracked" not in findings
+
+
+def test_validate_warns_on_a_ledger_neither_tracked_nor_ignored(project, monkeypatch, capsys):
+    """DW-361: the third ledger setting — on disk, never committed, never ignored —
+    is named at startup instead of surfacing as a commit at the first isolated merge.
+
+    Ablation: drop the `_validate_deferred_ledger_tracking` call from `cmd_validate`
+    and this fails on the id lookup."""
+    _make_validate_pass(project, monkeypatch, capsys)
+    write_ledger(project, {"DW-1": "open"}, commit=False)
+
+    # rc 1 only because the untracked ledger dirties the tree (`git.worktree-clean`);
+    # the new finding itself is a warning and never moves the exit code.
+    findings = _validate_findings(project, capsys, rc=1)
+    warning = findings["deferred.ledger-untracked"]
+    assert warning["severity"] == "warning"
+    rel = project.deferred_work.relative_to(project.repo_root).as_posix()
+    assert warning["detail"] == {"ledger": str(project.deferred_work), "path": rel}
+    assert "neither committed nor gitignored" in warning["message"]
+
+
+def test_validate_warns_on_an_untracked_ledger_git_status_hides(project, monkeypatch, capsys):
+    """The leg where the warning is the ONLY signal: with untracked files hidden from
+    `git status`, the ledger no longer dirties the tree, validate passes, a run would
+    start — and the first carry commits the file. rc 0 pins that nothing else speaks."""
+    _make_validate_pass(project, monkeypatch, capsys)
+    git(project.project, "config", "status.showUntrackedFiles", "no")
+    write_ledger(project, {"DW-1": "open"}, commit=False)
+
+    findings = _validate_findings(project, capsys)
+    assert findings["git.worktree-clean"]["severity"] == "ok"
+    assert findings["deferred.ledger-untracked"]["severity"] == "warning"
+
+
+def test_validate_is_silent_on_a_tracked_ledger(project, monkeypatch, capsys):
+    """Clearing leg: a committed ledger is a decision the project made."""
+    _make_validate_pass(project, monkeypatch, capsys)
+    write_ledger(project, {"DW-1": "open"})
+
+    findings = _validate_findings(project, capsys)
+    assert "deferred.ledger-untracked" not in findings
+
+
+def test_validate_is_silent_on_a_gitignored_ledger(project, monkeypatch, capsys):
+    """Clearing leg: an ignored ledger is the other decision — `git add` refuses it,
+    so no carry ever commits it. The rule is committed so the tree stays clean and
+    rc 0 pins that nothing else about the leg fails."""
+    _make_validate_pass(project, monkeypatch, capsys)
+    rel = project.deferred_work.relative_to(project.repo_root).as_posix()
+    gitignore = project.repo_root / ".gitignore"
+    gitignore.write_text(gitignore.read_text(encoding="utf-8") + f"/{rel}\n", encoding="utf-8")
+    git(project.project, "add", ".gitignore")
+    git(project.project, "commit", "-q", "-m", "ignore the ledger")
+    write_ledger(project, {"DW-1": "open"}, commit=False)
+
+    findings = _validate_findings(project, capsys)
+    assert "deferred.ledger-untracked" not in findings
+
+
+def test_validate_ledger_tracking_probe_skips_a_hung_git(project, monkeypatch, capsys):
+    """The ledger-tracking probe rides the same `git_answers` gate as
+    `git.render-tracked`: against a git that timed out it must not spend another
+    deadline, and it must not fabricate a finding either.
+
+    Ablation: drop `git_answers` from the call-site guard and `probes` is non-empty."""
+    _make_validate_pass(project, monkeypatch, capsys)
+    write_ledger(project, {"DW-1": "open"}, commit=False)
+
+    def hung(*_args, **_kwargs):
+        raise verify.GitTimeoutError(f"git status timed out after 120s in {project.project}")
+
+    probes = []
+
+    def counted_tracked(_repo, rel):
+        probes.append(rel)
+        return False
+
+    monkeypatch.setattr(verify, "worktree_clean", hung)
+    monkeypatch.setattr(verify, "path_tracked", counted_tracked)
+
+    findings = _validate_findings(project, capsys, rc=1)
+    assert probes == []
+    assert "deferred.ledger-untracked" not in findings
+
+
+def _ignore_ledger(project) -> str:
+    """Commit a `.gitignore` rule for the ledger so the tree stays clean."""
+    rel = project.deferred_work.relative_to(project.repo_root).as_posix()
+    gitignore = project.repo_root / ".gitignore"
+    gitignore.write_text(gitignore.read_text(encoding="utf-8") + f"/{rel}\n", encoding="utf-8")
+    git(project.project, "add", ".gitignore")
+    git(project.project, "commit", "-q", "-m", "ignore the ledger")
+    return rel
+
+
+def test_validate_warns_on_a_gitignored_ledger_under_worktree_isolation(
+    project, monkeypatch, capsys
+):
+    """DW-375: under worktree isolation a gitignored ledger reaches each unit only
+    as a seeded copy, and entries a session writes there are lost at teardown.
+    Exactly one warning, never `deferred.ledger-untracked`, and rc 0 — the finding
+    never moves the exit code.
+
+    Ablation: drop the `_validate_isolated_ledger_ignored` call from `cmd_validate`
+    and this fails on the id lookup."""
+    _make_validate_pass(project, monkeypatch, capsys, policy=ISOLATION_WORKTREE_POLICY)
+    rel = _ignore_ledger(project)
+    write_ledger(project, {"DW-1": "open"}, commit=False)
+
+    doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys, rc=0)
+    hits = [f for f in doc["findings"] if f["check"] == "deferred.ledger-ignored-isolated"]
+    assert len(hits) == 1
+    assert hits[0]["severity"] == "warning"
+    assert hits[0]["detail"] == {"ledger": str(project.deferred_work), "path": rel}
+    assert not any(f["check"] == "deferred.ledger-untracked" for f in doc["findings"])
+
+
+def test_validate_warns_on_a_gitignored_ledger_not_yet_created(project, monkeypatch, capsys):
+    """The hazard applies to the file the first harvest creates, so an absent
+    ledger under an ignore rule still warns."""
+    _make_validate_pass(project, monkeypatch, capsys, policy=ISOLATION_WORKTREE_POLICY)
+    _ignore_ledger(project)
+
+    assert not project.deferred_work.exists()
+    findings = _validate_findings(project, capsys)
+    assert findings["deferred.ledger-ignored-isolated"]["severity"] == "warning"
+
+
+def test_validate_is_silent_on_a_non_file_at_an_ignored_ledger_path(project, monkeypatch, capsys):
+    """A directory squatting the ignored ledger path is not a ledger the first
+    harvest will create, so the isolated-ledger advisory stays silent. Asserts only
+    on this id; the other findings are not this row's concern.
+
+    Ablation: drop the `S_ISREG` return in `_validate_isolated_ledger_ignored` and
+    this reports the warning."""
+    _make_validate_pass(project, monkeypatch, capsys, policy=ISOLATION_WORKTREE_POLICY)
+    _ignore_ledger(project)
+    project.deferred_work.mkdir(parents=True)
+
+    doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys)
+    assert not any(f["check"] == "deferred.ledger-ignored-isolated" for f in doc["findings"])
+
+
+def test_validate_is_silent_on_a_gitignored_ledger_without_isolation(project, monkeypatch, capsys):
+    """Clearing leg: in place, the orchestrator writes the main ledger directly."""
+    _make_validate_pass(project, monkeypatch, capsys, policy=NO_ISOLATION_POLICY)
+    _ignore_ledger(project)
+    write_ledger(project, {"DW-1": "open"}, commit=False)
+
+    findings = _validate_findings(project, capsys)
+    assert "deferred.ledger-ignored-isolated" not in findings
+
+
+def test_validate_is_silent_on_a_tracked_ledger_under_worktree_isolation(
+    project, monkeypatch, capsys
+):
+    """Clearing leg: a tracked ledger rides the unit merge, session writes too."""
+    _make_validate_pass(project, monkeypatch, capsys, policy=ISOLATION_WORKTREE_POLICY)
+    write_ledger(project, {"DW-1": "open"})
+
+    findings = _validate_findings(project, capsys)
+    assert "deferred.ledger-ignored-isolated" not in findings
+
+
+def _isolated_ledger_probe(tmp_path, ledger: Path) -> checks_mod.ValidationReport:
+    report = checks_mod.ValidationReport()
+    paths = types.SimpleNamespace(repo_root=tmp_path / "repo", deferred_work=ledger)
+    pol = types.SimpleNamespace(scm=types.SimpleNamespace(isolation="worktree"))
+    cli._validate_isolated_ledger_ignored(paths, pol, report)  # type: ignore[arg-type]
+    return report
+
+
+def test_isolated_ledger_advisory_is_silent_on_a_git_fault(tmp_path, monkeypatch):
+    """`git.probe` owns a git failure, so this advisory stays silent rather than
+    crash validate. The positive control proves the fault is what silenced it.
+    Ablation: delete the `except verify.GitError: return` and this raises."""
+    (tmp_path / "repo").mkdir()
+    ledger = tmp_path / "repo" / "impl" / "deferred-work.md"
+    monkeypatch.setattr(cli.verify, "path_tracked", lambda _repo, _rel: False)
+    monkeypatch.setattr(cli.verify, "path_ignored", lambda _repo, _path: True)
+    assert [f.check for f in _isolated_ledger_probe(tmp_path, ledger).findings] == [
+        "deferred.ledger-ignored-isolated"
+    ]
+
+    def _fault(_repo, _path):
+        raise verify.GitError("git check-ignore failed")
+
+    monkeypatch.setattr(cli.verify, "path_ignored", _fault)
+    assert _isolated_ledger_probe(tmp_path, ledger).findings == []
+
+
+def test_isolated_ledger_advisory_is_silent_on_an_out_of_repo_ledger(tmp_path, monkeypatch):
+    """A ledger outside the repo is shared by the worktree, not seeded, so there is
+    nothing to warn about and git is never asked. Ablation: drop `ValueError` from
+    the rel `except` and this raises."""
+    (tmp_path / "repo").mkdir()
+    probes: list[str] = []
+    monkeypatch.setattr(cli.verify, "path_tracked", lambda _repo, rel: probes.append(rel))
+    ledger = tmp_path / "outside" / "deferred-work.md"
+
+    assert _isolated_ledger_probe(tmp_path, ledger).findings == []
+    assert probes == []
 
 
 def test_validate_warns_on_a_stale_index_entry(project, capsys):
@@ -13549,6 +15279,95 @@ def test_validate_reports_each_renderer_problem_and_the_complete_surface_clears(
     assert not {check for check in cleared if check.startswith("skills.dev-renderer")}
 
 
+def _render_probe_validate_fixture(project, monkeypatch, capsys, marker, body):
+    """A validate-passing project whose dev primitive is a renderer stub with a
+    fake render_skill.py that records every execution to ``marker`` (outside
+    the project). `_make_validate_pass` stubs `which` to `/usr/bin/<tool>`; the
+    stub's launcher is this interpreter's absolute path, so let absolute names
+    resolve to themselves while every other gate keeps its pin."""
+    _make_validate_pass(
+        project,
+        monkeypatch,
+        capsys,
+        skills=lambda root: install_render_probe_fixture(root, marker, body),
+    )
+    monkeypatch.setattr(
+        cli.shutil,
+        "which",
+        lambda tool: tool if os.path.isabs(tool) else f"/usr/bin/{tool}",
+    )
+
+
+def _validate_argv(project, *extra):
+    return ["validate", "--project", str(project.project), "--json", *extra]
+
+
+def test_validate_render_probe_reports_ok_for_a_healthy_render(
+    project, capsys, monkeypatch, tmp_path
+):
+    from conftest import RENDER_PROBE_OK_BODY
+
+    marker = tmp_path / "ran.json"
+    _render_probe_validate_fixture(project, monkeypatch, capsys, marker, RENDER_PROBE_OK_BODY)
+
+    doc = machine_json(_validate_argv(project, "--render-probe"), capsys)
+
+    assert doc["ok"] is True
+    [probe] = [f for f in doc["findings"] if f["check"] == "skills.dev-render-probe"]
+    assert probe["severity"] == "ok"
+    assert probe["detail"]["tree"] == ".claude/skills"
+    assert marker.is_file()
+    assert not (project.project / "_bmad" / "render").exists()
+    # the render left the worktree exactly as committed
+    assert git(project.project, "status", "--porcelain", "--untracked-files=all") == ""
+
+
+def test_validate_render_probe_halt_fails_validate_and_the_flag_gates_execution(
+    project, capsys, monkeypatch, tmp_path
+):
+    from conftest import RENDER_PROBE_HALT_BODY
+
+    marker = tmp_path / "ran.json"
+    _render_probe_validate_fixture(project, monkeypatch, capsys, marker, RENDER_PROBE_HALT_BODY)
+
+    # Flag absent: no probe finding, and the renderer never ran.
+    plain = machine_json(_validate_argv(project), capsys)
+    assert plain["ok"] is True
+    assert "skills.dev-render-probe" not in {f["check"] for f in plain["findings"]}
+    assert not marker.exists()
+
+    doc = machine_json(_validate_argv(project, "--render-probe"), capsys, rc=1)
+
+    assert doc["ok"] is False
+    [probe] = [f for f in doc["findings"] if f["check"] == "skills.dev-render-probe"]
+    assert probe["severity"] == "problem"
+    halt = f"missing config value x under {project.project}"
+    assert probe["detail"]["halt"] == halt
+    assert halt in probe["message"]
+    assert marker.is_file()
+    # the probe finding is the only problem: every other gate stayed green
+    assert [f["check"] for f in doc["findings"] if f["severity"] == "problem"] == [
+        "skills.dev-render-probe"
+    ]
+
+
+def test_validate_render_probe_is_silent_when_policy_is_unloadable(
+    project, capsys, monkeypatch, tmp_path
+):
+    """No dev trees resolve under a broken policy: the probe must not print a green
+    "nothing to render" line over a probe that checked nothing."""
+    from conftest import RENDER_PROBE_OK_BODY
+
+    marker = tmp_path / "ran.json"
+    _render_probe_validate_fixture(project, monkeypatch, capsys, marker, RENDER_PROBE_OK_BODY)
+    _write_policy(project.project, "[adapter]\nname = ")  # unparseable
+
+    doc = machine_json(_validate_argv(project, "--render-probe"), capsys, rc=1)
+
+    assert "skills.dev-render-probe" not in {f["check"] for f in doc["findings"]}
+    assert not marker.exists()
+
+
 def test_a_forwarding_shim_install_fails_validate_and_aborts_the_run(project, capsys, monkeypatch):
     """The shim upstream's rename left behind is REFUSED, not driven.
 
@@ -13769,19 +15588,28 @@ def test_validate_does_not_gate_a_triage_only_skill_tree(project, capsys, monkey
     ]
 
 
-# ---- #414: worktree isolation is refused under a repo_root override ----------
+# ---- #414 / DW-379: worktree isolation is refused only for a DISJOINT repo_root ---
+#
+# Two disjoint shapes (the project NOT inside repo_root) are refused: `repo_root`
+# nested inside the project (`_override_repo_root`, `<project>/git-root`) and a
+# SIBLING checkout beside it (`_sibling_repo_root`). The nested monorepo shape
+# (`nested_repo_root_paths`, the project at `<repo>/app`) is supported: every
+# surface below proceeds, graded on a positive outcome.
 
 ISOLATION_WORKTREE_POLICY = (
     '[adapter]\nname = "claude"\nmodel = "opus"\n\n[scm]\nisolation = "worktree"\n'
 )
 NO_ISOLATION_POLICY = '[adapter]\nname = "claude"\nmodel = "opus"\n\n[scm]\nisolation = "none"\n'
-REFUSAL = 'isolation = "worktree" is not supported'
+REFUSAL = 'isolation = "worktree" needs the project directory to be inside repo_root'
+
+
+DISJOINT_SHAPES = ["inside", "sibling"]
 
 
 def _override_repo_root(paths, rel="git-root"):
-    """Point `repo_root` away from the project — #414's monorepo layout, minus the
-    monorepo. The target has no `_bmad/`, which is the shape the issue reports, but
-    it DOES exist: `cmd_run`/`cmd_sweep` probe `verify.worktree_clean(repo_root)`,
+    """Point `repo_root` INSIDE the project — one disjoint layout (the project is not
+    inside `repo_root`). The target has no `_bmad/`, which is the shape #414 reports,
+    but it DOES exist: `cmd_run`/`cmd_sweep` probe `verify.worktree_clean(repo_root)`,
     and against a missing dir that raises `GitError` instead of answering, which
     would make every "the isolation gate spoke first" assertion below unfalsifiable
     — the later gate would crash rather than print the message it is asserted not to
@@ -13789,6 +15617,37 @@ def _override_repo_root(paths, rel="git-root"):
     (paths.project / rel).mkdir(exist_ok=True)
     cfg = paths.project / "_bmad" / "bmm" / "config.yaml"
     cfg.write_text(cfg.read_text() + f"repo_root: '{{project-root}}/{rel}'\n", encoding="utf-8")
+
+
+def _sibling_repo_root(paths) -> Path:
+    """Point `repo_root` at a SIBLING checkout beside the project — the other disjoint
+    layout. A real (empty) git repository, so every later gate that probes it
+    answers rather than raising: the refusal must be what speaks, not a crash."""
+    sibling = paths.project.parent / f"{paths.project.name}-code"
+    sibling.mkdir()
+    git(sibling, "init", "-q")
+    cfg = paths.project / "_bmad" / "bmm" / "config.yaml"
+    cfg.write_text(cfg.read_text() + f"repo_root: '{sibling.as_posix()}'\n", encoding="utf-8")
+    return sibling
+
+
+def _disjoint_repo_root(paths, shape) -> Path:
+    """Configure one of the two disjoint layouts and return its code root."""
+    if shape == "sibling":
+        return _sibling_repo_root(paths)
+    _override_repo_root(paths)
+    return paths.project / "git-root"
+
+
+def _nested_validate_pass(project, monkeypatch, capsys, policy=ISOLATION_WORKTREE_POLICY):
+    """`_make_validate_pass` over the nested monorepo layout: the BMAD project at
+    `<repo>/app`, `repo_root` the checkout. The override config
+    `nested_repo_root_paths` committed is kept (the fixture's own config writer is a
+    no-op here), and everything the pass fixture lays down is committed with it."""
+    paths = nested_repo_root_paths(project)
+    _make_validate_pass(paths, monkeypatch, capsys, policy=policy, bmad_config=lambda _p: None)
+    assert paths.project == paths.repo_root / "app", "premise: nested roots"
+    return paths
 
 
 def _render_findings(doc) -> str:
@@ -13807,30 +15666,138 @@ def _render_findings(doc) -> str:
     return rendered
 
 
+@pytest.mark.parametrize("shape", DISJOINT_SHAPES)
 def test_validate_refuses_worktree_isolation_under_a_repo_root_override(
-    project, monkeypatch, capsys
+    project, monkeypatch, capsys, shape
 ):
-    """#414: provisioning seeds every non-git surface from `repo_root` while every
-    gate validate runs probes `project`, so a split pair makes validate approve a
-    surface the isolated run never receives. A `problem`, so the rc flips — and the
-    fixture is committed first, so the rc-1 is this gate and not a dirty tree."""
+    """#414: a unit worktree is a checkout of `repo_root`, so when the project is not
+    inside it the mount carries none of the project-local surfaces validate approves.
+    A `problem`, so the rc flips — and the fixture is committed first, so the rc-1 is
+    this gate and not a dirty tree. Both disjoint shapes refuse."""
     _make_validate_pass(project, monkeypatch, capsys, policy=ISOLATION_WORKTREE_POLICY)
-    _override_repo_root(project)
-    git(project.project, "commit", "-qam", "repo_root override")
+    code_root = _disjoint_repo_root(project, shape)
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-qm", "repo_root override")
 
     doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys, rc=1)
     finding = {f["check"]: f for f in doc["findings"]}["policy.isolation-repo-root"]
     assert finding["severity"] == "problem"
-    # Both remediations named, and only remediations that exist on this line: fix-1
-    # (plumbing `project` through provisioning) is a main-line option, so the message
-    # must not gesture at a flag or a version that would make the pair work.
-    assert "Remove the `repo_root` key" in finding["message"]
+    assert finding["message"].startswith(REFUSAL)
+    # All three remediations named, and only remediations that exist: nest the
+    # project, drop the override, or give up per-unit worktrees.
+    assert "Move the project inside repo_root" in finding["message"]
+    assert "remove the `repo_root` key" in finding["message"]
     assert '`isolation = "none"`' in finding["message"]
     assert finding["detail"] == {
-        "repo_root": str(project.project / "git-root"),
-        "project": str(project.project),
+        "repo_root": str(code_root.resolve()),
+        "project": str(project.project.resolve()),
     }
     _render_findings(doc)  # the detail shape draws in the TUI modal
+
+
+def test_validate_passes_worktree_isolation_under_a_nested_repo_root(project, monkeypatch, capsys):
+    """DW-379: the nested override beside `isolation = "worktree"` validates clean —
+    rc 0 and `ok`, with no `policy.isolation-repo-root` finding — because provisioning
+    lands every project-local surface at the project's offset inside the mount.
+
+    Ablation: widen `worktree_isolation_conflict` back to "any `repo_root` override"
+    and this reddens on the rc (the finding is a `problem`)."""
+    paths = _nested_validate_pass(project, monkeypatch, capsys)
+
+    doc = machine_json(["validate", "--project", str(paths.project), "--json"], capsys)
+    assert doc["ok"] is True
+    assert "policy.isolation-repo-root" not in {f["check"] for f in doc["findings"]}
+    _render_findings(doc)
+
+
+@pytest.mark.parametrize(
+    "policy_text,share,expected",
+    [
+        (ISOLATION_WORKTREE_POLICY, True, True),
+        (NO_ISOLATION_POLICY, True, False),
+        (ISOLATION_WORKTREE_POLICY, False, False),
+    ],
+    ids=["worktree-shared-dir", "none-shared-dir", "worktree-dirs-in-project"],
+)
+def test_validate_warns_about_an_artifact_dir_shared_with_the_main_checkout(
+    project, monkeypatch, capsys, policy_text, share, expected
+):
+    """DW-485: in the nested layout, `planning_artifacts` moved to `<repo>/shared/…` —
+    inside `repo_root`, outside the project — is one the unit worktree never gets its
+    own copy of, so validate warns naming it. Silent under `isolation = "none"` and
+    when every dir sits in the project. A warning, so rc stays 0 on every row.
+
+    Ablation: drop the `shared_artifact_dirs` loop from `cmd_validate` and the
+    worktree-shared-dir row reddens."""
+    paths = _nested_validate_pass(project, monkeypatch, capsys, policy=policy_text)
+    shared = paths.repo_root / "shared" / "planning-artifacts"
+    if share:
+        shared.mkdir(parents=True)
+        cfg = paths.project / "_bmad" / "bmm" / "config.yaml"
+        text = cfg.read_text(encoding="utf-8")
+        default = "'{project-root}/_bmad-output/planning-artifacts'"
+        assert default in text, "premise: the nested config's planning key"
+        cfg.write_text(text.replace(default, f"'{shared.as_posix()}'"), encoding="utf-8")
+        git(paths.repo_root, "commit", "-qam", "share the planning dir")
+        assert bmadconfig.load_paths(paths.project).planning_artifacts == shared.resolve()
+
+    doc = machine_json(["validate", "--project", str(paths.project), "--json"], capsys)
+
+    assert doc["ok"] is True
+    hits = [f for f in doc["findings"] if f["check"] == "policy.isolation-shared-artifact-dir"]
+    if not expected:
+        assert hits == []
+        return
+    assert len(hits) == 1
+    (hit,) = hits
+    assert hit["severity"] == "warning"
+    assert str(shared.resolve()) in hit["message"]
+    assert "shared with the main checkout, not per-worktree" in hit["message"]
+    assert hit["detail"] == {
+        "key": "planning_artifacts",
+        "path": str(shared.resolve()),
+        "repo_root": str(paths.repo_root),
+        "project": str(paths.project),
+    }
+    _render_findings(doc)
+
+
+def test_validate_probes_the_code_root_for_a_clean_tree(project, monkeypatch, capsys):
+    """`git.worktree-clean` probes `repo_root`, as `cmd_run`/`cmd_sweep` do: in the
+    nested layout a dirty TRACKED file outside `app/` — in the checkout the run's git
+    work happens in — fails the gate even though the project dir itself is clean, and
+    the finding names the root it probed.
+
+    Ablation: probe `project` in `cmd_validate`'s worktree-clean gate and this fails —
+    `worktree_clean` is pathspec-scoped to the dir it is handed, so `app/` reads clean."""
+    paths = _nested_validate_pass(project, monkeypatch, capsys)
+    outer = paths.repo_root / "src.txt"
+    assert git(paths.repo_root, "ls-files", "--error-unmatch", "src.txt"), "premise: tracked"
+    outer.write_text("dirty outside the project\n", encoding="utf-8")
+    assert cli.verify.worktree_clean(paths.project), "premise: the project itself is clean"
+
+    findings = _validate_findings(paths, capsys, rc=1)
+
+    clean = findings["git.worktree-clean"]
+    assert clean["severity"] == "problem"
+    assert str(paths.repo_root) in clean["message"]
+    assert clean["detail"] == {"root": str(paths.repo_root)}
+
+
+def test_validate_ignores_a_nested_projects_policy_edit(project, monkeypatch, capsys):
+    """The clean probe of `repo_root` still excludes the PROJECT's policy.toml, spelled
+    at its offset (`app/.bmad-loop/policy.toml`): a TUI settings edit must not read as
+    a dirty tree. Tracked here (force-added past the nested `.gitignore`), so the edit
+    is a real modification git would otherwise report.
+
+    Ablation: drop `project=` from `cmd_validate`'s `worktree_clean` call (the exclusion
+    falls back to the repo-root spelling, which names no file) and this reddens."""
+    paths = _nested_validate_pass(project, monkeypatch, capsys)
+    _track_and_edit_nested_policy(paths)
+
+    findings = _validate_findings(paths, capsys)
+
+    assert findings["git.worktree-clean"]["severity"] == "ok"
 
 
 @pytest.mark.parametrize(
@@ -13864,20 +15831,21 @@ def test_validate_isolation_gate_needs_both_halves(
     assert "policy.isolation-repo-root" not in _validate_findings(project, capsys)
 
 
-def _split_root_project(project, *, policy_text=ISOLATION_WORKTREE_POLICY):
+def _split_root_project(project, *, policy_text=ISOLATION_WORKTREE_POLICY, shape="inside"):
     install_bmad_config(project)
-    _override_repo_root(project)
+    code_root = _disjoint_repo_root(project, shape)
     _write_policy(project.project, policy_text)
     write_sprint(project, {"1-1-a": "ready-for-dev"})
     # `worktree_clean` scopes `git status` to `-- .` inside the dir it is handed, so
     # only dirt UNDER repo_root can make the next gate speak. Without this the
     # ordering assertion below passes no matter where the gate sits.
-    (project.project / "git-root" / "dirty.txt").write_text("uncommitted\n", encoding="utf-8")
+    (code_root / "dirty.txt").write_text("uncommitted\n", encoding="utf-8")
 
 
+@pytest.mark.parametrize("shape", DISJOINT_SHAPES)
 @pytest.mark.parametrize("command", ["run", "sweep"])
 def test_start_refuses_worktree_isolation_under_a_repo_root_override(
-    project, monkeypatch, capsys, command
+    project, monkeypatch, capsys, command, shape
 ):
     """The refusal validate reports is also the one the real command makes, and it is
     the FIRST one: `repo_root` is left genuinely dirty, so a gate ordered after
@@ -13885,7 +15853,7 @@ def test_start_refuses_worktree_isolation_under_a_repo_root_override(
     sends the operator to fix something that is not the problem. Both halves of that
     are load-bearing: the probe reads `repo_root`, not `project`, so dirtying the
     project would prove nothing."""
-    _split_root_project(project)
+    _split_root_project(project, shape=shape)
     monkeypatch.setattr(cli, "Engine", _StubEngine)
     monkeypatch.setattr(cli, "_make_adapters", lambda *a, **k: {r: None for r in cli.ROLES})
 
@@ -13895,15 +15863,94 @@ def test_start_refuses_worktree_isolation_under_a_repo_root_override(
     assert "not clean" not in err
 
 
-def test_resume_refuses_worktree_isolation_under_a_repo_root_override(project, monkeypatch, capsys):
+@pytest.mark.parametrize("command", ["run", "sweep"])
+def test_start_does_not_refuse_worktree_isolation_under_a_nested_repo_root(
+    project, monkeypatch, capsys, command
+):
+    """DW-379: `run` and `sweep` start under the nested override beside worktree
+    isolation — graded on the command reaching its engine (`run`: the stub engine
+    constructed; `sweep`: `_start_sweep` called) and returning 0.
+
+    Ablation: widen `worktree_isolation_conflict` back to "any `repo_root` override"
+    and this reddens on the rc and the engine that never started."""
+    paths = _nested_validate_pass(project, monkeypatch, capsys)
+    install_sweep_skill(paths.project)
+    git(paths.repo_root, "add", "-A")
+    git(paths.repo_root, "commit", "-q", "--allow-empty", "-m", "sweep skill")
+    engines: list = []
+    started: list = []
+
+    class _Recorder(_StubEngine):
+        def __init__(self, **kwargs):
+            engines.append(kwargs)
+
+    monkeypatch.setattr(cli, "Engine", _Recorder)
+    monkeypatch.setattr(cli, "_make_adapters", lambda *a, **k: {r: None for r in cli.ROLES})
+    monkeypatch.setattr(cli, "_start_sweep", lambda *a, **k: started.append(a) or 0)
+
+    rc = cli.main([command, "--project", str(paths.project)])
+    err = capsys.readouterr().err
+
+    assert rc == 0, err
+    assert REFUSAL not in err
+    assert engines if command == "run" else started, "the command never reached its engine"
+
+
+def _track_and_edit_nested_policy(paths) -> None:
+    """Force-track the nested project's policy.toml (past `app/.gitignore`), commit
+    it, then edit it the way the TUI settings screen does — a real modification git
+    would report unless the clean probe excludes it at its offset."""
+    policy_file = paths.project / ".bmad-loop" / "policy.toml"
+    git(paths.repo_root, "add", "-f", policy_file.relative_to(paths.repo_root).as_posix())
+    git(paths.repo_root, "commit", "-qm", "track the nested policy")
+    policy_file.write_text(policy_file.read_text() + "\n# edited\n", encoding="utf-8")
+
+
+@pytest.mark.parametrize("command", ["run", "sweep"])
+def test_start_ignores_a_nested_projects_policy_edit(project, monkeypatch, capsys, command):
+    """`run` and `sweep` probe `repo_root` for a clean tree with the PROJECT's
+    policy.toml excluded at its offset (`app/.bmad-loop/policy.toml`), so a settings
+    edit under nested roots does not refuse the start — mirroring
+    `test_validate_ignores_a_nested_projects_policy_edit`.
+
+    Ablation: drop `project=` from the command's `worktree_clean` call and this
+    reddens on "not clean"."""
+    paths = _nested_validate_pass(project, monkeypatch, capsys)
+    install_sweep_skill(paths.project)
+    git(paths.repo_root, "add", "-A")
+    git(paths.repo_root, "commit", "-q", "--allow-empty", "-m", "sweep skill")
+    _track_and_edit_nested_policy(paths)
+    engines: list = []
+    started: list = []
+
+    class _Recorder(_StubEngine):
+        def __init__(self, **kwargs):
+            engines.append(kwargs)
+
+    monkeypatch.setattr(cli, "Engine", _Recorder)
+    monkeypatch.setattr(cli, "_make_adapters", lambda *a, **k: {r: None for r in cli.ROLES})
+    monkeypatch.setattr(cli, "_start_sweep", lambda *a, **k: started.append(a) or 0)
+
+    rc = cli.main([command, "--project", str(paths.project)])
+    err = capsys.readouterr().err
+
+    assert rc == 0, err
+    assert "not clean" not in err
+    assert engines if command == "run" else started, "the command never reached its engine"
+
+
+@pytest.mark.parametrize("shape", DISJOINT_SHAPES)
+def test_resume_refuses_worktree_isolation_under_a_repo_root_override(
+    project, monkeypatch, capsys, shape
+):
     """Resume re-reads config.yaml and policy.toml off disk, so it is a second
-    entrypoint into the same provisioning: a run whose config grew the override
+    entrypoint into the same provisioning: a run whose config grew a disjoint override
     mid-flight must not finish its remaining stories through worktrees the preflight
     would now refuse. Refused before the `run-resume` entry, so the journal does not
     record a resume that never happened."""
     run_dir = _paused_run_for_resume(project, monkeypatch)
     _write_policy(project.project, RESUME_POLICY + '\n[scm]\nisolation = "worktree"\n')
-    _override_repo_root(project)
+    _disjoint_repo_root(project, shape)
     monkeypatch.setattr(cli, "Engine", lambda **kw: pytest.fail("engine constructed"))
 
     assert cli._resume_paused_run(project.project, run_dir) == 1
@@ -13911,7 +15958,41 @@ def test_resume_refuses_worktree_isolation_under_a_repo_root_override(project, m
     assert _resume_entries(run_dir) == []
 
 
-def test_auto_sweep_refuses_worktree_isolation_under_a_repo_root_override(project, monkeypatch):
+def test_resume_proceeds_under_worktree_isolation_beside_a_nested_repo_root(
+    project, monkeypatch, capsys
+):
+    """DW-379: the nested override is supported, so resume arms its engine — graded on
+    the `run-resume` entry and the constructed engine, not on an absent message.
+
+    Ablation: widen `worktree_isolation_conflict` back to "any `repo_root` override"
+    and this reddens: rc 1, no engine, no `run-resume` entry."""
+    import shutil
+
+    paths = nested_repo_root_paths(project)
+    # `_paused_run_for_resume` writes a fresh config (no override); make room for it,
+    # then restore the committed override byte-for-byte.
+    shutil.rmtree(paths.project / "_bmad")
+    run_dir = _paused_run_for_resume(paths, monkeypatch)
+    write_repo_root_override(paths, paths.repo_root)
+    _write_policy(paths.project, RESUME_POLICY + '\n[scm]\nisolation = "worktree"\n')
+    engines: list = []
+
+    class _Recorder(_StubEngine):
+        def __init__(self, **kwargs):
+            engines.append(kwargs)
+
+    monkeypatch.setattr(cli, "Engine", _Recorder)
+
+    assert cli._resume_paused_run(paths.project, run_dir) == 0, capsys.readouterr().err
+    assert REFUSAL not in capsys.readouterr().err
+    assert engines
+    assert len(_resume_entries(run_dir)) == 1
+
+
+@pytest.mark.parametrize("shape", DISJOINT_SHAPES)
+def test_auto_sweep_refuses_worktree_isolation_under_a_repo_root_override(
+    project, monkeypatch, shape
+):
     """The child sweep an engine auto-triggers is the one caller that reloads
     policy.toml while reusing the parent's already-loaded paths — so it is the only
     way a mid-run flip to `isolation = "worktree"` reaches provisioning under a split
@@ -13930,7 +16011,7 @@ def test_auto_sweep_refuses_worktree_isolation_under_a_repo_root_override(projec
     or the parent spends a trigger on a child that never existed (#501)."""
     from bmad_loop import bmadconfig
 
-    _split_root_project(project)
+    _split_root_project(project, shape=shape)
     launched = []
     monkeypatch.setattr(cli, "_start_sweep", _stub_start_sweep(launched))
 
@@ -13945,6 +16026,31 @@ def test_auto_sweep_refuses_worktree_isolation_under_a_repo_root_override(projec
     with pytest.raises(RuntimeError, match=REFUSAL):
         factory("epic-boundary", started=_never_started)
     assert launched == []
+
+
+def test_auto_sweep_launches_under_worktree_isolation_beside_a_nested_repo_root(
+    project, monkeypatch, capsys
+):
+    """DW-379: the auto-sweep factory's copy of the refusal stays silent for the
+    nested layout, so the child sweep launches — graded on `_start_sweep` being
+    reached, the positive outcome.
+
+    Ablation: widen `worktree_isolation_conflict` back to "any `repo_root` override"
+    and the factory raises the refusal instead."""
+    from bmad_loop import bmadconfig
+
+    paths = _nested_validate_pass(project, monkeypatch, capsys)
+    install_sweep_skill(paths.project)
+    git(paths.repo_root, "add", "-A")
+    git(paths.repo_root, "commit", "-q", "--allow-empty", "-m", "sweep skill")
+    launched = []
+    monkeypatch.setattr(cli, "_start_sweep", _stub_start_sweep(launched))
+
+    factory = cli._sweep_factory(
+        paths.project, bmadconfig.load_paths(paths.project), _config_pin(paths)
+    )
+    factory("epic-boundary", started=lambda: None)
+    assert len(launched) == 1
 
 
 # --- #461 point 4: the auto-sweep child's config re-read is integrity-pinned ---
@@ -14026,10 +16132,13 @@ def _pinned_sweep_factory(project, monkeypatch, *, policy_text=PIN_POLICY):
     `compose_sweep` is driven by
     `test_auto_sweep_launches_the_profile_bytes_the_gate_validated`."""
     from bmad_loop import bmadconfig
+    from bmad_loop.adapters.profile import get_profile
 
     install_bmad_config(project)
     _write_policy(project.project, policy_text)
     _pin_profile(project)
+    # the triage tree the child sweep dispatches `/bmad-loop-sweep` into
+    install_sweep_skill(project.project, get_profile("mycli", project.project).skill_tree)
     write_sprint(project, {"1-1-a": "ready-for-dev"})
     launched = []
     monkeypatch.setattr(cli, "_start_sweep", _stub_start_sweep(launched))
@@ -14130,14 +16239,26 @@ def test_auto_sweep_launches_the_profile_bytes_the_gate_validated(project, monke
     `compose_sweep`'s `on_started()` call fails this row alone, while dropping
     `on_started=` from the factory's `_start_sweep` call also reddens
     `test_auto_sweep_proceeds_after_a_benign_limits_edit` — which is the seam
-    below this one, and the reason both exist."""
+    below this one, and the reason both exist.
+
+    DW-410 rides the same swap: the policy's `extra_args` drops the profile's
+    bypass, so the child journals `bypass-dropped` into ITS run's journal, naming
+    the validated profile's `--yes` — not the swapped `--rogue`. ABLATION: drop
+    `profiles=` from `_start_sweep`'s `_warn_bypass_dropped` call (it re-reads the
+    swapped disk) or the call itself, and the journal assert fails."""
     from bmad_loop import bmadconfig, runs
     from bmad_loop.adapters import profile as profile_mod
 
     monkeypatch.setattr(mux_mod, "_usable", lambda mux: True)
     install_bmad_config(project)
-    _write_policy(project.project, PIN_POLICY)
+    _write_policy(
+        project.project,
+        PIN_POLICY.replace('name = "mycli"\n', 'name = "mycli"\nextra_args = ["--verbose"]\n'),
+    )
     _pin_profile(project)
+    install_sweep_skill(
+        project.project, profile_mod.get_profile("mycli", project.project).skill_tree
+    )
     write_sprint(project, {"1-1-a": "ready-for-dev"})
     pin = _config_pin(project)
 
@@ -14146,7 +16267,12 @@ def test_auto_sweep_launches_the_profile_bytes_the_gate_validated(project, monke
     def digest_then_swap(*a, **kw):
         digest = real_digest(*a, **kw)
         # The writer wakes the moment the comparison has its answer.
-        _pin_profile(project, PIN_PROFILE.replace('binary = "mycli"', 'binary = "rogue-cli"'))
+        _pin_profile(
+            project,
+            PIN_PROFILE.replace('binary = "mycli"', 'binary = "rogue-cli"').replace(
+                '["--yes"]', '["--rogue"]'
+            ),
+        )
         return digest
 
     monkeypatch.setattr(runsetup, "config_digest", digest_then_swap)
@@ -14177,11 +16303,108 @@ def test_auto_sweep_launches_the_profile_bytes_the_gate_validated(project, monke
     assert captured["only_ids"] is None and captured["min_severity"] is None
     assert signalled == ["started"]  # #501: the child composed, so the parent may latch
     run_id = captured["state"].run_id
-    assert runs.read_trusted_config_digest(project.project, run_id) == pin
+    assert runs.read_trusted_config_digest(project.project, run_id)[0] == pin
     # Both copies, and the same validated bytes in each: the in-tree secondary is
     # what survives a project rename (the state root is keyed by resolved path), so
     # a launch that stamped only out of tree loses the pin on the first move.
     assert captured["state"].trusted_config_digest == pin
+    entries = _bypass_journal(project.project / ".bmad-loop" / "runs" / run_id)
+    assert [(e["role"], e["profile"], e["missing"]) for e in entries] == [
+        (role, "mycli", ["--yes"]) for role in ("triage", "dev", "review")
+    ]
+
+
+@pytest.mark.parametrize("how", ["deleted", "partial"])
+def test_auto_sweep_refuses_a_broken_sweep_skill_before_started(project, monkeypatch, how):
+    """DW-367: the auto-sweep child dispatches `/bmad-loop-sweep` from the triage
+    tree, so a deleted or partial skill raises before `started` can fire — the parent
+    journals `sweep-auto-not-started` and keeps its trigger. Ablation: delete the
+    `missing_sweep_skill` raise in `_sweep_factory` and this reddens (the child launches)."""
+    from bmad_loop.adapters.profile import get_profile
+
+    factory, launched = _pinned_sweep_factory(project, monkeypatch)
+    tree = get_profile("mycli", project.project).skill_tree
+    _break_sweep_skill(project.project, tree, how)
+
+    with pytest.raises(RuntimeError, match=r"bmad-loop init --force-skills"):
+        factory("epic-boundary", started=_never_started)
+    assert launched == []
+
+
+def _commit_all(project, message: str) -> None:
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "--allow-empty", "-m", message)
+
+
+@pytest.mark.parametrize("how", ["deleted", "partial"])
+def test_sweep_refuses_a_broken_sweep_skill_before_any_run_dir(project, monkeypatch, capsys, how):
+    """DW-367 acceptance: a triage tree lacking a complete `bmad-loop-sweep` makes
+    `bmad-loop sweep` exit 1 naming the tree and `init --force-skills`, with no engine
+    started and no run directory created. Every other preflight passes (the fixture is
+    `validate`-clean) so the refusal is this gate's and no one else's.
+    Ablation: delete the `_require_sweep_skill` call in `cmd_sweep` and this reddens."""
+    _make_validate_pass(project, monkeypatch, capsys)
+    _break_sweep_skill(project.project, ".claude/skills", how)
+    _commit_all(project, "break the sweep skill")
+    started: list = []
+    monkeypatch.setattr(cli, "_start_sweep", lambda *a, **kw: started.append(kw) or 0)
+
+    assert cli.main(["sweep", "--no-prompt", "--project", str(project.project)]) == 1
+    err = capsys.readouterr().err
+    assert "FAIL: .claude/skills/bmad-loop-sweep" in err
+    assert "bmad-loop init --force-skills" in err
+    assert "run `bmad-loop validate` for details" in err
+    assert started == []
+    runs_root = project.project / runs.RUNS_DIR
+    assert not runs_root.exists() or list(runs_root.iterdir()) == []
+
+
+def test_sweep_passes_the_gate_on_a_complete_sweep_skill(project, monkeypatch, capsys):
+    """The positive leg of the row above, so its refusal is not green for a reason
+    unrelated to the skill."""
+    _make_validate_pass(project, monkeypatch, capsys)
+    started: list = []
+    monkeypatch.setattr(cli, "_start_sweep", lambda *a, **kw: started.append(kw) or 0)
+
+    assert cli.main(["sweep", "--no-prompt", "--project", str(project.project)]) == 0
+    assert len(started) == 1
+
+
+def test_validate_reports_the_sweep_skill_ok_then_incomplete(project, monkeypatch, capsys):
+    """DW-367 acceptance: `validate --json` reports ok `skills.sweep` on an init'd
+    project, and a failed `skills.sweep-incomplete` naming the missing file with rc 1
+    once a mode file is gone."""
+    _make_validate_pass(project, monkeypatch, capsys)
+    ok = _validate_findings(project, capsys)["skills.sweep"]
+    assert ok["severity"] == "ok"
+    assert ok["detail"]["trees"] == [".claude/skills"]
+
+    _break_sweep_skill(project.project, ".claude/skills", "partial")
+    _commit_all(project, "break the sweep skill")
+    findings = _validate_findings(project, capsys, rc=1)
+    assert "skills.sweep" not in findings
+    bad = findings["skills.sweep-incomplete"]
+    assert bad["severity"] == "problem"
+    assert bad["detail"]["missing_files"] == ["automation-mode.md"]
+    assert bad["detail"]["tree"] == ".claude/skills"
+
+
+def test_validate_probes_only_the_triage_tree_for_the_sweep_skill(project, monkeypatch, capsys):
+    """Distinct trees: dev on claude, triage on gemini. Only the triage profile's
+    tree is asked about `bmad-loop-sweep` — the dev tree losing it changes nothing,
+    the triage tree losing it fails naming that tree."""
+    policy = CLAUDE_ONLY_POLICY + '[adapter.triage]\nname = "gemini"\n'
+    _make_validate_pass(project, monkeypatch, capsys, policy=policy)
+    _break_sweep_skill(project.project, ".claude/skills", "deleted")
+    _commit_all(project, "drop the dev tree's sweep skill")
+    assert _validate_findings(project, capsys)["skills.sweep"]["detail"]["trees"] == [
+        ".agents/skills"
+    ]
+
+    _break_sweep_skill(project.project, ".agents/skills", "deleted")
+    _commit_all(project, "drop the triage tree's sweep skill")
+    bad = _validate_findings(project, capsys, rc=1)["skills.sweep-missing"]
+    assert bad["detail"] == {"tree": ".agents/skills", "skill": "bmad-loop-sweep"}
 
 
 def test_run_pins_the_profile_bytes_it_launches(project, monkeypatch):
@@ -14255,7 +16478,7 @@ def test_run_pins_the_profile_bytes_it_launches(project, monkeypatch):
     ), "the swap must actually have landed on disk, or this test proves nothing"
     assert captured["adapter"].profile.binary == "mycli"
     run_id = captured["state"].run_id
-    assert runs.read_trusted_config_digest(project.project, run_id) == pin
+    assert runs.read_trusted_config_digest(project.project, run_id)[0] == pin
     # As in the sweep twin: the launch stamps both copies, out-of-tree (trusted) and
     # in-tree (travels with the run dir when the project is renamed).
     assert captured["state"].trusted_config_digest == pin
@@ -14314,22 +16537,29 @@ def test_resume_pins_the_profile_bytes_it_launches(project, monkeypatch):
         profile_mod.get_profile("mycli", project.project).binary == "rogue-cli"
     ), "the swap must actually have landed on disk, or this test proves nothing"
     assert captured["adapter"].profile.binary == "mycli"
-    assert runs.read_trusted_config_digest(project.project, run_dir.name) == pin
+    assert runs.read_trusted_config_digest(project.project, run_dir.name)[0] == pin
 
 
-def test_dry_run_banner_names_the_isolation_refusal_first(project, capsys):
+@pytest.mark.parametrize("shape", ["inside", "sibling"])
+def test_dry_run_banner_names_the_isolation_refusal_first(project, capsys, shape):
     """The preview keeps rc 0 and still renders the schedule, but the banner has to
     name every refusal the dry-run's early return skips past — and in the order the
     real command makes them. (Not every refusal there is: the dirty-tree, queue and
     run-id gates are not part of this banner.) This
     project is short of base skills too, so the ordering is observable: the isolation
-    refusal aborts before `_require_base_skills`, so it heads the list."""
+    refusal aborts before `_require_base_skills`, so it heads the list. Both disjoint
+    layouts — `repo_root` inside the project, and a sibling — refuse."""
     import dataclasses
 
     write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
     _write_policy(project.project, ISOLATION_WORKTREE_POLICY)
     pol = policy_mod.load(project.project / ".bmad-loop" / "policy.toml")
-    paths = dataclasses.replace(project, repo_root=project.project / "git-root")
+    code_root = (
+        project.project / "git-root"
+        if shape == "inside"
+        else project.project.parent / f"{project.project.name}-code"
+    )
+    paths = dataclasses.replace(project, repo_root=code_root)
     args = argparse.Namespace(epic=None, story=None, max_stories=None)
 
     assert cli._dry_run(paths, pol, args) == 0
@@ -14338,6 +16568,31 @@ def test_dry_run_banner_names_the_isolation_refusal_first(project, capsys):
     assert REFUSAL in fails[0]
     assert len(fails) > 1, "the base-skill problems the banner already reported"
     assert "1-1-a" in out  # the schedule itself still rendered
+
+
+def test_dry_run_banner_does_not_refuse_a_nested_repo_root(project, capsys):
+    """DW-379: `repo_root` an ANCESTOR of the project is the supported nested layout,
+    so the banner names only the base-skill problems this project really has — the
+    positive half is that those FAIL lines still render, with the schedule, and the
+    first of them is not the isolation refusal.
+
+    Ablation: widen `worktree_isolation_conflict` back to "any `repo_root` override"
+    and the refusal heads the FAIL list again."""
+    import dataclasses
+
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    _write_policy(project.project, ISOLATION_WORKTREE_POLICY)
+    pol = policy_mod.load(project.project / ".bmad-loop" / "policy.toml")
+    paths = dataclasses.replace(project, repo_root=project.project.parent)
+    assert paths.project.parent == paths.repo_root, "premise: nested roots"
+    args = argparse.Namespace(epic=None, story=None, max_stories=None)
+
+    assert cli._dry_run(paths, pol, args) == 0
+    out, err = capsys.readouterr()
+    fails = [line for line in err.splitlines() if line.startswith("  FAIL:")]
+    assert fails, "the base-skill problems the banner still reports"
+    assert not any(REFUSAL in line for line in fails)
+    assert "1-1-a" in out
 
 
 # ------------------- a project root the OS refuses to canonicalize (#552) --------
@@ -15540,9 +17795,10 @@ def test_cleanup_names_what_the_migration_left_behind(project, capsys, monkeypat
     monkeypatch.setattr(
         runs,
         "legacy_registry_leftovers",
-        lambda _p, announced=(): {
-            runs.DEFAULT_REGISTRY_LABEL: ["bmad-loop-ctl", "bmad-loop-old-1"]
-        },
+        lambda _p, announced=(): (
+            {runs.DEFAULT_REGISTRY_LABEL: ["bmad-loop-ctl", "bmad-loop-old-1"]},
+            [],
+        ),
     )
     monkeypatch.setattr(launch, "prune_ctl_windows", lambda _p: ([], [], []))
 
@@ -15562,7 +17818,7 @@ def test_cleanup_dry_run_previews_what_the_migration_would_leave_behind(
     monkeypatch.setattr(
         runs,
         "legacy_registry_leftovers",
-        lambda _p, announced=(): {runs.DEFAULT_REGISTRY_LABEL: ["bmad-loop-old-1"]},
+        lambda _p, announced=(): ({runs.DEFAULT_REGISTRY_LABEL: ["bmad-loop-old-1"]}, []),
     )
     monkeypatch.setattr(launch, "prunable_ctl_windows", lambda _p: [])
 
@@ -15591,7 +17847,7 @@ def test_cleanup_dry_run_hands_the_remainder_the_plan_it_printed(project, capsys
 
     def _leftovers(_p, announced=()):
         seen.append(sorted(announced))
-        return {}
+        return {}, []
 
     monkeypatch.setattr(runs, "legacy_registry_leftovers", _leftovers)
     monkeypatch.setattr(launch, "prunable_ctl_windows", lambda _p: [])
@@ -15614,7 +17870,7 @@ def test_cleanup_json_carries_the_remainder_and_leaves_stderr_empty(project, cap
     monkeypatch.setattr(
         runs,
         "legacy_registry_leftovers",
-        lambda _p, announced=(): {runs.DEFAULT_REGISTRY_LABEL: ["bmad-loop-old-1"]},
+        lambda _p, announced=(): ({runs.DEFAULT_REGISTRY_LABEL: ["bmad-loop-old-1"]}, []),
     )
     monkeypatch.setattr(launch, "prune_ctl_windows", lambda _p: ([], [], []))
 
@@ -15647,10 +17903,13 @@ def test_cleanup_names_the_registry_each_leftover_is_actually_in(project, capsys
     monkeypatch.setattr(
         runs,
         "legacy_registry_leftovers",
-        lambda _p, announced=(): {
-            runs.DEFAULT_REGISTRY_LABEL: ["bmad-loop-ctl"],
-            theirs: ["bmad-loop-old-1"],
-        },
+        lambda _p, announced=(): (
+            {
+                runs.DEFAULT_REGISTRY_LABEL: ["bmad-loop-ctl"],
+                theirs: ["bmad-loop-old-1"],
+            },
+            [],
+        ),
     )
     monkeypatch.setattr(launch, "prune_ctl_windows", lambda _p: ([], [], []))
 
@@ -15678,10 +17937,13 @@ def test_cleanup_json_flattens_the_remainder_to_the_documented_list(project, cap
     monkeypatch.setattr(
         runs,
         "legacy_registry_leftovers",
-        lambda _p, announced=(): {
-            runs.DEFAULT_REGISTRY_LABEL: ["bmad-loop-ctl"],
-            r"D:\theirs": ["bmad-loop-old-1"],
-        },
+        lambda _p, announced=(): (
+            {
+                runs.DEFAULT_REGISTRY_LABEL: ["bmad-loop-ctl"],
+                r"D:\theirs": ["bmad-loop-old-1"],
+            },
+            [],
+        ),
     )
     monkeypatch.setattr(launch, "prune_ctl_windows", lambda _p: ([], [], []))
 
@@ -15696,11 +17958,39 @@ def test_cleanup_says_nothing_about_a_registry_with_no_remainder(project, capsys
     from bmad_loop.tui import launch
 
     monkeypatch.setattr(runs, "prune_sessions", lambda _p, dry_run=False: ([], [], set()))
-    monkeypatch.setattr(runs, "legacy_registry_leftovers", lambda _p, announced=(): {})
+    monkeypatch.setattr(runs, "legacy_registry_leftovers", lambda _p, announced=(): ({}, []))
     monkeypatch.setattr(launch, "prune_ctl_windows", lambda _p: ([], [], []))
 
     assert cli.main(["cleanup", "--project", str(project.project)]) == 0
-    assert "not migrated" not in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "not migrated" not in err and "not checked" not in err
+
+
+def test_cleanup_names_a_legacy_registry_that_could_not_be_asked(project, capsys, monkeypatch):
+    """DW-469: a registry whose listing raised used to print exactly what an empty
+    one prints — nothing. Text names it on stderr; --json carries it as
+    `sessions.legacy_unverified` with stderr empty. Ablate the `unverified` loop
+    in `_warn_legacy_leftovers` (or the document field) and this fails."""
+    from bmad_loop.tui import launch
+
+    monkeypatch.setattr(runs, "prune_sessions", lambda _p, dry_run=False: ([], [], set()))
+    monkeypatch.setattr(
+        runs,
+        "legacy_registry_leftovers",
+        lambda _p, announced=(): ({}, ["/reg/broken: could not be listed: no server"]),
+    )
+    monkeypatch.setattr(launch, "prune_ctl_windows", lambda _p: ([], [], []))
+
+    assert cli.main(["cleanup", "--project", str(project.project)]) == 0
+    err = capsys.readouterr().err
+    assert "not checked" in err and "/reg/broken" in err and "no server" in err
+
+    assert cli.main(["cleanup", "--json", "--project", str(project.project)]) == 0
+    captured = capsys.readouterr()
+    doc = json.loads(captured.out)
+    assert doc["sessions"]["legacy_unverified"] == ["/reg/broken: could not be listed: no server"]
+    assert doc["sessions"]["legacy_leftovers"] == []
+    assert captured.err == ""
 
 
 @pytest.mark.parametrize("read_target", ["ledger", "archive"])
@@ -15740,3 +18030,458 @@ def test_sweep_archive_routes_a_locked_ledger_os_read_fault(
         assert archive.read_bytes() == archive_before
     else:
         assert not archive.exists()
+
+
+def test_resume_backfills_legacy_root_identities_once(project, monkeypatch):
+    """DW-446: a paused run whose state.json predates the mint-time root identities
+    resumes, and the resume records the run dir's identity and each mounted task's
+    (persisted before the engine runs), journaling one `root-identity-recorded` per
+    record. A second resume journals none — the records are on disk, and an existing
+    record is never re-taken.
+
+    Ablation: drop the `runs.reconcile_root_identities` call from
+    `_prepare_resume_locked` and the persisted identities stay None (first block);
+    re-take a fresh `root_identity_record` for every root regardless of its record
+    (``if record is None:`` → ``if True:`` in `runs._reconcile_one_root`) and the
+    second resume journals two more rows."""
+    from bmad_loop import platform_util
+    from bmad_loop.journal import Journal, load_state, save_state
+    from bmad_loop.model import Phase, StoryTask
+
+    run_dir = _paused_run_for_resume(
+        project,
+        monkeypatch,
+        tasks={
+            "1-1-a": StoryTask(
+                "1-1-a",
+                1,
+                phase=Phase.DEV_VERIFY,
+                worktree_path=str(
+                    project.project / ".bmad-loop/runs/20990101-000000-beef/worktrees/1-1-a"
+                ),
+                branch="bmad-loop/1-1-a",
+            )
+        },
+    )
+    mount = run_dir / "worktrees" / "1-1-a"
+    mount.mkdir(parents=True)
+    raw = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
+    raw.pop("run_dir_identity")
+    raw["tasks"]["1-1-a"].pop("worktree_identity")  # the pre-DW-446 shape
+    (run_dir / "state.json").write_text(json.dumps(raw), encoding="utf-8")
+    seen: list[tuple] = []
+
+    class _IdentityEngine(_StubEngine):
+        def __init__(self, **kwargs):
+            state = kwargs["state"]
+            seen.append((state.run_dir_identity, state.tasks["1-1-a"].worktree_identity))
+
+    monkeypatch.setattr(cli, "Engine", _IdentityEngine)
+    argv = ["resume", "--project", str(project.project), run_dir.name]
+
+    def recorded_rows():
+        return [e for e in Journal(run_dir).entries() if e["kind"] == "root-identity-recorded"]
+
+    assert cli.main(argv) == 0
+    expected = (
+        platform_util.root_identity_record(run_dir),
+        platform_util.root_identity_record(mount),
+    )
+    assert expected[0] is not None and expected[1] is not None
+    assert seen == [expected]
+    saved = load_state(run_dir)
+    assert (saved.run_dir_identity, saved.tasks["1-1-a"].worktree_identity) == expected
+    rows = recorded_rows()
+    assert [(r["root"], r.get("story_key")) for r in rows] == [
+        ("run-dir", None),
+        ("worktree", "1-1-a"),
+    ]
+
+    state = load_state(run_dir)
+    state.paused_reason, state.paused_stage = "escalation", "escalation"
+    save_state(run_dir, state)
+    assert cli.main(argv) == 0
+    assert len(recorded_rows()) == 2  # a second resume journals none
+
+
+def _resume_with_records(project, monkeypatch, record_of):
+    """A paused mounted run whose persisted records are ``record_of(path)`` for the
+    run dir and the mount; returns ``(run_dir, mount, argv)`` with a stub engine."""
+    from bmad_loop.journal import load_state, save_state
+    from bmad_loop.model import Phase, StoryTask
+
+    run_dir = _paused_run_for_resume(
+        project,
+        monkeypatch,
+        tasks={
+            "1-1-a": StoryTask(
+                "1-1-a",
+                1,
+                phase=Phase.DEV_VERIFY,
+                worktree_path=str(
+                    project.project / ".bmad-loop/runs/20990101-000000-beef/worktrees/1-1-a"
+                ),
+                branch="bmad-loop/1-1-a",
+            )
+        },
+    )
+    mount = run_dir / "worktrees" / "1-1-a"
+    mount.mkdir(parents=True)
+    state = load_state(run_dir)
+    state.run_dir_identity = record_of(run_dir)
+    state.tasks["1-1-a"].worktree_identity = record_of(mount)
+    save_state(run_dir, state)
+    monkeypatch.setattr(cli, "Engine", _StubEngine)
+    return run_dir, mount, ["resume", "--project", str(project.project), run_dir.name]
+
+
+def test_resume_rebinds_a_renumbered_st_dev_once(project, monkeypatch):
+    """DW-446, human decision 2026-09-27 (b): `st_dev` is not stable across a reboot
+    (btrfs, NFS, overlay remounts). A paused run whose records carry the roots' real
+    inodes under another `st_dev` resumes, re-binds both records to today's
+    `st_dev`, persists them, journals one `root-identity-rebound` per root, and the
+    pinned writes then succeed (the verify stream lands, the mount identity is the
+    mount's own). A second resume journals nothing.
+
+    Ablation: drop the `runs.reconcile_root_identities` call from
+    `_prepare_resume_locked` and the persisted records stay renumbered and the
+    verify stream refuses."""
+    from bmad_loop import platform_util, runs
+    from bmad_loop.journal import Journal, load_state, save_state
+
+    def renumbered(path):
+        dev, ino = platform_util.root_identity_record(path)
+        return (dev + 7, ino)
+
+    run_dir, mount, argv = _resume_with_records(project, monkeypatch, renumbered)
+    old_run, old_mount = renumbered(run_dir), renumbered(mount)
+
+    def rebound_rows():
+        return [e for e in Journal(run_dir).entries() if e["kind"] == "root-identity-rebound"]
+
+    assert cli.main(argv) == 0
+
+    saved = load_state(run_dir)
+    assert saved.run_dir_identity == platform_util.root_identity_record(run_dir)
+    assert saved.tasks["1-1-a"].worktree_identity == platform_util.root_identity_record(mount)
+    assert [(r["root"], r.get("story_key"), r["old_dev"]) for r in rebound_rows()] == [
+        ("run-dir", None, old_run[0]),
+        ("worktree", "1-1-a", old_mount[0]),
+    ]
+    assert Journal(run_dir).write_verify_stream(
+        "v.stdout.log", "out", run_dir_identity=saved.run_dir_identity
+    )
+    identity = runs.mount_root_identity(
+        mount, mount=mount, recorded=saved.tasks["1-1-a"].worktree_identity
+    )
+    assert (identity.st_dev, identity.st_ino) == platform_util.root_identity_record(mount)
+
+    state = load_state(run_dir)
+    state.paused_reason, state.paused_stage = "escalation", "escalation"
+    save_state(run_dir, state)
+    assert cli.main(argv) == 0
+    assert len(rebound_rows()) == 2  # a second resume journals none
+
+
+def test_resume_never_rebinds_an_inode_mismatch(project, monkeypatch):
+    """The re-bind is inode-matched: a record whose inode differs from the root's
+    (the root was replaced while paused) is left as it is — the resume still
+    succeeds, nothing is journaled, and the pinned writes keep refusing.
+
+    Ablation: accept an inode mismatch in `runs._reconcile_one_root` (drop the
+    ``info.st_ino != ino`` check) and the persisted-record and no-journal-row
+    assertions redden. The pinned writes still refuse: that re-bind keeps the
+    record's old inode, so the pin never matches either way."""
+    from bmad_loop import platform_util, runs
+    from bmad_loop.journal import Journal, load_state
+
+    def stale(path):
+        dev, ino = platform_util.root_identity_record(path)
+        return (dev + 7, ino + 1)
+
+    run_dir, mount, argv = _resume_with_records(project, monkeypatch, stale)
+
+    assert cli.main(argv) == 0
+
+    saved = load_state(run_dir)
+    assert saved.run_dir_identity == stale(run_dir)
+    assert saved.tasks["1-1-a"].worktree_identity == stale(mount)
+    kinds = {e["kind"] for e in Journal(run_dir).entries()}
+    assert not kinds & {"root-identity-rebound", "root-identity-recorded"}
+    with pytest.raises(OSError):
+        Journal(run_dir).write_verify_stream(
+            "v.stdout.log", "out", run_dir_identity=saved.run_dir_identity
+        )
+    identity = runs.mount_root_identity(
+        mount, mount=mount, recorded=saved.tasks["1-1-a"].worktree_identity
+    )
+    assert identity.st_ino == 0  # never-matching
+
+
+def test_resume_accept_baseline_latches_for_one_resume_only(project, monkeypatch):
+    """DW-371: `resume --accept-baseline` persists `state.accept_baseline=True` before
+    the engine starts; a later plain resume (the path `resolve` and the TUI also take)
+    overwrites it with False, so a stale latch from a paused accept-resume cannot
+    adopt on the next one.
+
+    Ablation: drop the `state.accept_baseline = accept_baseline` write in
+    `_prepare_resume_locked` and the first assertion reddens; make it conditional on
+    the flag and the second one does."""
+    from bmad_loop.journal import load_state, save_state
+
+    run_dir = _paused_run_for_resume(project, monkeypatch)
+    seen: list[bool] = []
+
+    class _LatchEngine(_StubEngine):
+        def __init__(self, **kwargs):
+            seen.append(kwargs["state"].accept_baseline)
+
+    monkeypatch.setattr(cli, "Engine", _LatchEngine)
+    argv = ["resume", "--project", str(project.project), run_dir.name]
+
+    assert cli.main([*argv, "--accept-baseline"]) == 0
+    assert seen == [True]
+    assert load_state(run_dir).accept_baseline is True  # persisted before the engine ran
+
+    # the accept-resume paused mid-recovery: the latch is still on disk
+    state = load_state(run_dir)
+    state.paused_reason, state.paused_stage = "escalation", "escalation"
+    save_state(run_dir, state)
+
+    assert cli.main(argv) == 0
+    assert seen == [True, False]
+    assert load_state(run_dir).accept_baseline is False
+
+
+# ----------------------------------------------- resolve --reverify (DW-522)
+
+
+def _reverify_project(tmp_path):
+    """A deferred in-place run (`conftest._reverify_run`) and its project root."""
+    run_dir, spec = _reverify_run(tmp_path)
+    return run_dir, spec.parents[2]
+
+
+def _resolve_reverify(project, *extra):
+    return cli.main(["resolve", "--project", str(project), "r1", "--reverify", *extra])
+
+
+def test_resolve_reverify_rearms_and_resumes(tmp_path, monkeypatch, capsys):
+    from bmad_loop.journal import Journal, load_state
+    from bmad_loop.model import Phase
+
+    run_dir, project = _reverify_project(tmp_path)
+    resumed = []
+    monkeypatch.setattr(cli, "_resume_paused_run", lambda proj, rd: resumed.append(rd) or 0)
+
+    rc = _resolve_reverify(project, "--resume")
+
+    assert rc == 0 and resumed == [run_dir]
+    out = capsys.readouterr()
+    assert "No dev session and no resolve agent run" in out.err
+    assert "included in the story's squashed commit" in out.err
+    assert f"re-armed {_REVERIFY_KEY} for re-verification" in out.out
+    task = load_state(run_dir).tasks[_REVERIFY_KEY]
+    assert task.phase == Phase.DEV_VERIFY and task.reverify_from == "deferred"
+    assert [e["kind"] for e in Journal(run_dir).entries()].count("story-reverify-armed") == 1
+
+
+def test_resolve_reverify_no_resume_persists_the_latch(tmp_path, monkeypatch, capsys):
+    from bmad_loop.journal import load_state
+
+    run_dir, project = _reverify_project(tmp_path)
+    monkeypatch.setattr(
+        cli, "_resume_paused_run", lambda *_a: pytest.fail("--no-resume must not resume")
+    )
+
+    rc = _resolve_reverify(project, "--no-resume")
+
+    assert rc == 0
+    assert "resume when ready: bmad-loop resume r1" in capsys.readouterr().out
+    assert load_state(run_dir).tasks[_REVERIFY_KEY].reverify_from == "deferred"
+
+
+def test_resolve_reverify_cancel_writes_nothing(tmp_path, monkeypatch, capsys):
+    run_dir, project = _reverify_project(tmp_path)
+    before = _state_bytes(run_dir)
+    monkeypatch.setattr(cli, "_confirm", lambda _q: False)
+
+    rc = _resolve_reverify(project)
+
+    assert rc == 0
+    assert "cancelled" in capsys.readouterr().out
+    assert _state_bytes(run_dir) == before
+
+
+@pytest.mark.parametrize(
+    "other", [["--adopt-branch"], ["--restore-patch", "p.patch"]], ids=["adopt", "restore"]
+)
+def test_resolve_reverify_is_mutually_exclusive_with_adopt_and_restore(tmp_path, capsys, other):
+    _run_dir, project = _reverify_project(tmp_path)
+    with pytest.raises(SystemExit) as exc:
+        _resolve_reverify(project, *other)
+    assert exc.value.code == 2
+    assert "not allowed with argument" in capsys.readouterr().err
+
+
+def test_resolve_reverify_refusals_leave_state_untouched(tmp_path, monkeypatch, capsys):
+    """A story the replay cannot claim is refused BEFORE the statement and the
+    prompt, with state.json unchanged. Ablation, performed: delete the
+    `runs.reverify_refusal` early exit in `_resolve_reverify` and the prompt is
+    reached (the locked re-arm would still refuse, but only after asking)."""
+    from bmad_loop.journal import load_state, save_state
+    from bmad_loop.model import Phase, StoryTask
+
+    run_dir, project = _reverify_project(tmp_path)
+    state = load_state(run_dir)
+    # a later story was picked: an in-place replay would squash its work in too
+    state.tasks["1-1-b"] = StoryTask(story_key="1-1-b", epic=1, phase=Phase.PENDING)
+    save_state(run_dir, state)
+    before = _state_bytes(run_dir)
+    monkeypatch.setattr(cli, "_confirm", lambda _q: pytest.fail("prompted for a refused replay"))
+
+    rc = _resolve_reverify(project)
+
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "a later story was picked" in err and "re-verifying" not in err
+    assert _state_bytes(run_dir) == before
+
+
+def test_resolve_on_a_deferred_task_without_reverify_hints_the_flag(tmp_path, monkeypatch, capsys):
+    """A bare `resolve` on a deferred story names `--reverify` instead of the generic
+    "no escalated story" refusal, and writes nothing. Ablation, performed: delete the
+    DEFERRED hint branch in `cmd_resolve` and the generic refusal prints instead."""
+    run_dir, project = _reverify_project(tmp_path)
+    before = _state_bytes(run_dir)
+    monkeypatch.setattr(cli, "_confirm", lambda _q: pytest.fail("prompted"))
+
+    rc = cli.main(["resolve", "--project", str(project), "r1"])
+
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert f"story {_REVERIFY_KEY} is deferred, not escalated" in err
+    assert "bmad-loop resolve r1 --reverify" in err
+    assert _state_bytes(run_dir) == before
+
+
+@pytest.mark.parametrize("force", [True, False], ids=["force", "no-force"])
+def test_resolve_reverify_force_unknown_proceeds(tmp_path, monkeypatch, capsys, force):
+    from bmad_loop.journal import load_state
+
+    run_dir, project = _reverify_project(tmp_path)
+    before = _state_bytes(run_dir)
+    monkeypatch.setattr(runs, "engine_liveness", lambda _rd: "unknown")
+    monkeypatch.setattr(cli, "_resume_paused_run", lambda *_a: 0)
+
+    rc = _resolve_reverify(project, "--resume", *(["--force"] if force else []))
+
+    if force:
+        assert rc == 0
+        assert load_state(run_dir).tasks[_REVERIFY_KEY].reverify_from == "deferred"
+    else:
+        assert rc == 1
+        assert "unverifiable pid" in capsys.readouterr().err
+        assert _state_bytes(run_dir) == before
+
+
+def test_resolve_reverify_never_launches_the_resolve_agent(tmp_path, monkeypatch):
+    """--reverify runs no interactive session even without --no-interactive: the
+    agent, the adapters and the escalation re-arm are never reached."""
+    from bmad_loop import resolve
+
+    _run_dir, project = _reverify_project(tmp_path)
+    monkeypatch.setattr(resolve, "run_session", lambda *a, **k: pytest.fail("ran the agent"))
+    monkeypatch.setattr(cli, "_make_adapters", lambda *a, **k: pytest.fail("built adapters"))
+    monkeypatch.setattr(runs, "rearm_escalation", lambda *a, **k: pytest.fail("re-armed"))
+    monkeypatch.setattr(cli, "_resume_paused_run", lambda *_a: 0)
+
+    assert _resolve_reverify(project, "--resume") == 0
+
+
+def _off_escalation_pause(run_dir) -> None:
+    """Re-pause the run at a non-escalation stage on another story — the shape a
+    worktree run is in when an isolated defer let it move on."""
+    from bmad_loop.journal import load_state, save_state
+
+    state = load_state(run_dir)
+    state.paused_stage = "story-gate"
+    state.paused_story_key = "1-1-b"
+    save_state(run_dir, state)
+
+
+def _mount_reverify_task(run_dir, project) -> Path:
+    """Move `_reverify_run`'s attempt into a kept worktree unit: a registered
+    worktree on the unit branch, holding a committed change above the baseline and
+    the spec, recorded on the task as `isolation = "worktree"` records it."""
+    from bmad_loop.journal import load_state, save_state
+
+    state = load_state(run_dir)
+    task = state.tasks[_REVERIFY_KEY]
+    branch = f"bmad-loop/r1/{_REVERIFY_KEY}"
+    wt = project / ".bmad-loop" / "worktrees" / "r1" / _REVERIFY_KEY
+    git(project, "worktree", "add", "-q", "-b", branch, str(wt), task.baseline_commit)
+    (wt / "unit.py").write_text("print('unit attempt')\n", encoding="utf-8")
+    git(wt, "add", "unit.py")
+    git(wt, "commit", "-q", "-m", "unit attempt")
+    spec = wt / (task.spec_file or "")
+    spec.parent.mkdir(parents=True, exist_ok=True)
+    spec.write_bytes((project / (task.spec_file or "")).read_bytes())
+    task.worktree_path = str(wt)
+    task.branch = branch
+    save_state(run_dir, state)
+    return wt
+
+
+def test_resolve_reverify_story_accepts_any_pause_for_a_mounted_task(tmp_path, monkeypatch, capsys):
+    """DW-522: an isolated defer does not pause the run, so a deferred worktree unit
+    is re-verified under whatever pause the run reached — when `--story` names it.
+    Unnamed, resolve still requires the escalation pause.
+
+    Ablation: make `_resolve_pause_admits` ignore `reverify_named` and the named
+    resolve is refused at the entry gate."""
+    from bmad_loop.journal import load_state
+    from bmad_loop.model import Phase
+
+    run_dir, project = _reverify_project(tmp_path)
+    wt = _mount_reverify_task(run_dir, project)
+    _off_escalation_pause(run_dir)
+    monkeypatch.setattr(
+        cli, "_resume_paused_run", lambda *_a: pytest.fail("--no-resume must not resume")
+    )
+
+    before = _state_bytes(run_dir)
+    assert _resolve_reverify(project, "--no-resume") == 1
+    assert "not paused at an escalation (stage: story-gate)" in capsys.readouterr().err
+    assert _state_bytes(run_dir) == before
+
+    rc = _resolve_reverify(project, "--story", _REVERIFY_KEY, "--no-resume")
+
+    out = capsys.readouterr()
+    assert rc == 0, out.err
+    assert f"in its kept worktree: the attempt is branch bmad-loop/r1/{_REVERIFY_KEY}" in out.err
+    assert "the unit merges into the target branch on a pass" in out.err
+    saved = load_state(run_dir)
+    assert saved.paused_stage == "story-gate"  # the pause is the resume's to clear
+    task = saved.tasks[_REVERIFY_KEY]
+    assert task.phase == Phase.DEV_VERIFY and task.reverify_from == "deferred"
+    assert task.worktree_path == str(wt)
+
+
+def test_resolve_reverify_in_place_still_requires_the_escalation_pause(tmp_path, capsys):
+    """DW-522: naming an IN-PLACE story does not lift the pause rule — its replay
+    claims the whole code tree, which is only the story's attempt when the run
+    stopped on it. The CLI admits the named story; `reverify_refusal` refuses it.
+
+    Ablation: drop the pause-stage check in `runs.reverify_refusal` and the
+    re-arm goes through."""
+    run_dir, project = _reverify_project(tmp_path)
+    _off_escalation_pause(run_dir)
+    before = _state_bytes(run_dir)
+
+    rc = _resolve_reverify(project, "--story", _REVERIFY_KEY, "--no-resume")
+
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "an in-place replay re-verifies only the story the run stopped on" in err
+    assert _state_bytes(run_dir) == before

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import builtins
 import importlib
+import json
 import os
 import subprocess
 import sys
@@ -93,7 +94,8 @@ def test_pending_missed_decisions_reads_and_caches(project, monkeypatch):
     _write_triage_decision(run_dir)
 
     pending = data.pending_missed_decisions(project.project)
-    assert [d.id for d in pending] == ["DW-1"]
+    assert pending.fault is None
+    assert [d.id for d in pending.items] == ["DW-1"]
     # cached: same object back while ledger/store/run-set are unchanged
     assert data.pending_missed_decisions(project.project) is pending
 
@@ -118,7 +120,7 @@ def test_pending_missed_decisions_uses_loaded_project_root(project, monkeypatch)
 
     pending = data.pending_missed_decisions(original_spelling)
 
-    assert [decision.id for decision in pending] == ["DW-1"]
+    assert [decision.id for decision in pending.items] == ["DW-1"]
     assert data.pending_missed_decisions(original_spelling) is pending
     assert paths.project in data._missed_cache
     assert original_spelling not in data._missed_cache
@@ -141,7 +143,7 @@ def test_pending_missed_decisions_survives_an_undecodable_triage(project):
     bad = make_run(project.project, "20260102-000000-bbbb")
     (bad / "triage.json").write_bytes(b'{"workflow": "deferred-sweep-triage", "x": "\xff"}')
 
-    assert [d.id for d in data.pending_missed_decisions(project.project)] == ["DW-1"]
+    assert [d.id for d in data.pending_missed_decisions(project.project).items] == ["DW-1"]
 
 
 def test_pending_missed_decisions_survives_a_nested_null_triage(project):
@@ -180,11 +182,18 @@ def test_pending_missed_decisions_survives_a_nested_null_triage(project):
         encoding="utf-8",
     )
 
-    assert [d.id for d in data.pending_missed_decisions(project.project)] == ["DW-1"]
+    assert [d.id for d in data.pending_missed_decisions(project.project).items] == ["DW-1"]
 
 
-def test_pending_missed_decisions_empty_for_uninitialized(tmp_path):
-    assert data.pending_missed_decisions(tmp_path) == []
+def test_pending_missed_decisions_faults_for_uninitialized(tmp_path):
+    """DW-473: a project whose BMAD config cannot be loaded has no answer to give,
+    so the reader says so instead of answering "none pending".
+
+    Ablation: return `MissedDecisions([])` on the `_project_paths is None` arm and
+    this reddens on the fault assertion."""
+    missed = data.pending_missed_decisions(tmp_path)
+    assert missed.items == []
+    assert missed.fault is not None and "BMAD config not found" in missed.fault
 
 
 # ------------------------------------------------------------ no textual dep
@@ -242,6 +251,35 @@ def test_watcher_state_keeps_last_good_parse(tmp_path):
     )
     save_state(run_dir, state)
     assert watcher.state().current_epic == 2
+
+
+def test_sweep_outcomes_reads_both_fields_off_state_json(tmp_path):
+    """DW-366: the TUI reads the auto-sweep ledger off the same parsed state.json
+    `status`/`diagnose` use, in file order, refusals kept apart from deliveries.
+
+    Ablation: drop the `not in state.sweeps_refused` filter — the `triggered`
+    assert fails on epic-2, the latched-then-failed trigger. Return
+    `SweepOutcomes()` instead and both populated-run asserts fail."""
+    from bmad_loop.model import SWEEP_REFUSED_DIRTY, SWEEP_REFUSED_FAILED
+
+    # epic-2 is the engine's real `failed` shape: latched into sweeps_triggered
+    # when the child started, then recorded refused when it failed.
+    run_dir = make_run(
+        tmp_path,
+        "20260611-100000-aaaa",
+        sweeps_triggered=["epic-1", "epic-2"],
+        sweeps_refused={"epic-2": SWEEP_REFUSED_FAILED, "run-end": SWEEP_REFUSED_DIRTY},
+    )
+    outcomes = data.sweep_outcomes(data.RunWatcher(run_dir).state())
+    assert outcomes.triggered == ("epic-1",)  # a failed child was not delivered
+    assert outcomes.refused == (("epic-2", "failed"), ("run-end", "dirty"))
+
+    # A state.json written before #501 carries neither key: empty, not a crash.
+    legacy = make_run(tmp_path, "20260611-100000-bbbb")
+    raw = json.loads((legacy / "state.json").read_text(encoding="utf-8"))
+    del raw["sweeps_triggered"], raw["sweeps_refused"]
+    (legacy / "state.json").write_text(json.dumps(raw), encoding="utf-8")
+    assert data.sweep_outcomes(data.RunWatcher(legacy).state()) == data.SweepOutcomes()
 
 
 def test_watcher_state_none_before_first_write(tmp_path):
@@ -876,8 +914,9 @@ def test_active_task_id_ignores_verifier_streams(tmp_path):
     os.utime(logs / "1-1-a-dev-1.log", ns=(1, 1))  # older than anything written below
 
     journal = Journal(tmp_path)
-    journal.write_verify_stream("verify-1-1-a-dev-1-1-0.stdout.log", "out")
-    journal.write_verify_stream("verify-1-1-a-dev-1-1-0.stderr.log", "err")
+    record = platform_util.root_identity_record(tmp_path)
+    journal.write_verify_stream("verify-1-1-a-dev-1-1-0.stdout.log", "out", run_dir_identity=record)
+    journal.write_verify_stream("verify-1-1-a-dev-1-1-0.stderr.log", "err", run_dir_identity=record)
 
     # a dev session that has ended -> no open session -> the fallback fires
     ended = [
@@ -1067,23 +1106,25 @@ def test_pending_decision_missing_fields():
 # ------------------------------------------------------------ sprint overview
 
 
-def test_project_paths_degrades_and_recovers_from_root_resolve_refusal(project, monkeypatch):
+def test_project_paths_degrades_and_recovers_from_root_resolve_refusal(project_tree, monkeypatch):
     """A dead provider yields unavailable readers without poisoning recovery.
 
     INVERSE ablation: restore bare ``project.resolve()`` in ``_project_paths``
     and this test raises the stubbed WinError 64 on its first observation rather
     than returning empty panes and recovering after the provider is healthy.
     """
-    install_bmad_config(project)
-    write_sprint(project, {"1-1-a": "ready-for-dev"})
-    root = project.project
+    install_bmad_config(project_tree)
+    write_sprint(project_tree, {"1-1-a": "ready-for-dev"})
+    root = project_tree.project
 
     with monkeypatch.context() as refusal:
         refuse_to_resolve(refusal, root)
         assert data._project_paths(root) is None
         assert data.sprint_overview(root) is None
         assert data.deferred_entries(root) is None
-        assert data.pending_missed_decisions(root) == []
+        missed = data.pending_missed_decisions(root)
+        assert missed.items == [] and missed.fault is not None
+        assert "cannot canonicalize" in missed.fault
         assert root not in data._paths_cache
 
     paths = data._project_paths(root)
@@ -1093,15 +1134,15 @@ def test_project_paths_degrades_and_recovers_from_root_resolve_refusal(project, 
     assert data.sprint_overview(root) is not None
 
 
-def test_project_paths_uses_one_canonical_cache_key(project):
+def test_project_paths_uses_one_canonical_cache_key(project_tree):
     """Healthy aliases share one ProjectPaths snapshot under the canonical root.
 
     INVERSE ablation: key ``_paths_cache`` with the pre-canonical spelling while
     loading from the stable root and this test finds the ``..`` spelling as a
     second cache key instead of reusing the canonical entry.
     """
-    install_bmad_config(project)
-    root = project.project.resolve()
+    install_bmad_config(project_tree)
+    root = project_tree.project.resolve()
     alternate_spelling = root / ".." / root.name
 
     paths = data._project_paths(alternate_spelling)
@@ -1120,32 +1161,32 @@ def _override_implementation_artifacts(project, rel: str) -> None:
     )
 
 
-def test_project_paths_sees_a_toml_layer_edit_in_a_mixed_install(project):
+def test_project_paths_sees_a_toml_layer_edit_in_a_mixed_install(project_tree):
     """#769: the TOML layers outrank the legacy YAML the v6.12 installer still writes
     beside them, so an override-layer edit must invalidate the cached snapshot.
 
     Ablation: stat-gate on config.yaml alone and the second call serves the stale
     artifact dir from cache.
     """
-    install_bmad_config(project)
-    install_bmad_central_config(project)
-    root = project.project.resolve()
+    install_bmad_config(project_tree)
+    install_bmad_central_config(project_tree)
+    root = project_tree.project.resolve()
     before = data._project_paths(root)
     assert before is not None
     assert data._project_paths(root) is before
 
-    _override_implementation_artifacts(project, "moved-impl")
+    _override_implementation_artifacts(project_tree, "moved-impl")
 
     after = data._project_paths(root)
     assert after is not None
     assert after.implementation_artifacts == root / "moved-impl"
 
 
-def test_project_paths_caches_and_invalidates_a_toml_only_install(project):
+def test_project_paths_caches_and_invalidates_a_toml_only_install(project_tree):
     """With no config.yaml there is still a source to stat-gate on: the snapshot is
     cached (it used to be reloaded on every call) and a layer edit invalidates it."""
-    install_bmad_central_config(project)
-    root = project.project.resolve()
+    install_bmad_central_config(project_tree)
+    root = project_tree.project.resolve()
     assert not (root / bmadconfig.LEGACY_CONFIG_REL).exists()
 
     first = data._project_paths(root)
@@ -1153,7 +1194,7 @@ def test_project_paths_caches_and_invalidates_a_toml_only_install(project):
     assert data._paths_cache[root][1] is first
     assert data._project_paths(root) is first
 
-    _override_implementation_artifacts(project, "moved-impl")
+    _override_implementation_artifacts(project_tree, "moved-impl")
 
     second = data._project_paths(root)
     assert second is not None
@@ -1162,10 +1203,10 @@ def test_project_paths_caches_and_invalidates_a_toml_only_install(project):
     assert data._paths_cache[root][1] is second
 
 
-def test_sprint_overview(project):
-    install_bmad_config(project)
+def test_sprint_overview(project_tree):
+    install_bmad_config(project_tree)
     write_sprint(
-        project,
+        project_tree,
         {
             "epic-1": "in-progress",
             "1-1-a": "ready-for-dev",
@@ -1175,7 +1216,7 @@ def test_sprint_overview(project):
             "2-1-c": "backlog",
         },
     )
-    ss = data.sprint_overview(project.project)
+    ss = data.sprint_overview(project_tree.project)
     assert ss.epics == {1: "in-progress", 2: "backlog"}
     assert [(s.key, s.status) for s in ss.stories] == [
         ("1-1-a", "ready-for-dev"),
@@ -1185,21 +1226,21 @@ def test_sprint_overview(project):
     assert ss.retros == {1: "optional"}
 
     # cached result (same object) until the file changes, then re-parsed
-    assert data.sprint_overview(project.project) is ss
-    write_sprint(project, {"1-1-a": "done"})
-    assert [s.status for s in data.sprint_overview(project.project).stories] == ["done"]
+    assert data.sprint_overview(project_tree.project) is ss
+    write_sprint(project_tree, {"1-1-a": "done"})
+    assert [s.status for s in data.sprint_overview(project_tree.project).stories] == ["done"]
 
 
-def test_sprint_overview_unavailable(tmp_path, project):
+def test_sprint_overview_unavailable(tmp_path, project_tree):
     assert data.sprint_overview(tmp_path) is None  # no _bmad config at all
-    install_bmad_config(project)  # config but no sprint file
-    assert data.sprint_overview(project.project) is None
+    install_bmad_config(project_tree)  # config but no sprint file
+    assert data.sprint_overview(project_tree.project) is None
 
     # LLM-maintained file: malformed content must come back None, not raise
-    project.sprint_status.write_text("{ not: valid: yaml: [")
-    assert data.sprint_overview(project.project) is None
-    project.sprint_status.write_text("- just\n- a\n- list\n")
-    assert data.sprint_overview(project.project) is None
+    project_tree.sprint_status.write_text("{ not: valid: yaml: [")
+    assert data.sprint_overview(project_tree.project) is None
+    project_tree.sprint_status.write_text("- just\n- a\n- list\n")
+    assert data.sprint_overview(project_tree.project) is None
 
 
 # ------------------------------------------------- stories mode: pause + board
@@ -1240,9 +1281,9 @@ def test_stories_overview_none_when_unavailable(tmp_path):
 # ------------------------------------------------------------- deferred work
 
 
-def test_deferred_entries(project):
-    install_bmad_config(project)
-    project.deferred_work.write_text(
+def test_deferred_entries(project_tree):
+    install_bmad_config(project_tree)
+    project_tree.deferred_work.write_text(
         "# Deferred Work\n\n"
         "### DW-1: High severity item\n\n"
         "origin: test, 2026-06-01\nlocation: src.txt:1\n"
@@ -1260,7 +1301,7 @@ def test_deferred_entries(project):
         "origin: test, 2026-06-01\nlocation: src.txt:5\nreason: test.\n",
         encoding="utf-8",
     )
-    items = data.deferred_entries(project.project)
+    items = data.deferred_entries(project_tree.project)
     assert [(i.id, i.severity, i.done) for i in items] == [
         ("DW-1", "high", False),
         ("DW-2", "critical", False),
@@ -1272,18 +1313,18 @@ def test_deferred_entries(project):
     assert "origin: test" in items[0].body
 
     # cached result (same object) until the file changes, then re-parsed
-    assert data.deferred_entries(project.project) is items
-    project.deferred_work.write_text("# Deferred Work\n\nfreeform, no entries\n")
-    assert data.deferred_entries(project.project) == []
+    assert data.deferred_entries(project_tree.project) is items
+    project_tree.deferred_work.write_text("# Deferred Work\n\nfreeform, no entries\n")
+    assert data.deferred_entries(project_tree.project) == []
 
 
-def test_deferred_entries_unavailable(tmp_path, project):
+def test_deferred_entries_unavailable(tmp_path, project_tree):
     assert data.deferred_entries(tmp_path) is None  # no _bmad config at all
-    install_bmad_config(project)  # config but no ledger file
-    assert data.deferred_entries(project.project) is None
+    install_bmad_config(project_tree)  # config but no ledger file
+    assert data.deferred_entries(project_tree.project) is None
 
 
-def test_deferred_entries_undecodable_ledger_is_unavailable(project):
+def test_deferred_entries_undecodable_ledger_is_unavailable(project_tree):
     """The pane already had an "unavailable" degrade (`items = None`), but reached it
     only for `OSError` — and `UnicodeDecodeError` is a `ValueError` (DW-146), so
     undecodable bytes escaped the whole refresh instead of rendering the pane
@@ -1291,10 +1332,10 @@ def test_deferred_entries_undecodable_ledger_is_unavailable(project):
     it could not read.
     Ablation: revert the except tuple to `OSError` alone and this reddens with
     `UnicodeDecodeError` escaping rather than `None`."""
-    install_bmad_config(project)
-    project.deferred_work.write_bytes(b"# Deferred Work\n\n### DW-1: bad \xff byte\n")
+    install_bmad_config(project_tree)
+    project_tree.deferred_work.write_bytes(b"# Deferred Work\n\n### DW-1: bad \xff byte\n")
 
-    assert data.deferred_entries(project.project) is None
+    assert data.deferred_entries(project_tree.project) is None
 
 
 def test_severity_extraction():
@@ -1312,24 +1353,24 @@ def test_severity_extraction():
         assert deferredwork.field_severity(f"### DW-9: t\n\n{body}status: open\n") == expected, body
 
 
-def test_deferred_entries_does_not_read_severity_from_a_fenced_example(project):
-    install_bmad_config(project)
-    project.deferred_work.write_text(
+def test_deferred_entries_does_not_read_severity_from_a_fenced_example(project_tree):
+    install_bmad_config(project_tree)
+    project_tree.deferred_work.write_text(
         "# Deferred Work\n\n"
         "### DW-1: quoted severity\n\n"
         "```markdown\nseverity: critical\n```\nstatus: open\n",
         encoding="utf-8",
     )
 
-    items = data.deferred_entries(project.project)
+    items = data.deferred_entries(project_tree.project)
 
     assert items is not None
     assert items[0].severity is None
 
 
-def test_deferred_entries_legacy_ledger(project):
-    install_bmad_config(project)
-    project.deferred_work.write_text(
+def test_deferred_entries_legacy_ledger(project_tree):
+    install_bmad_config(project_tree)
+    project_tree.deferred_work.write_text(
         "# Deferred Work\n\n"
         "## Deferred from: code review of story 1.2 (2026-04-06)\n\n"
         "- ~~**Old fixed thing** — was broken, then repaired~~ → fixed in 1.3\n"
@@ -1337,7 +1378,7 @@ def test_deferred_entries_legacy_ledger(project):
         "- **Open bold-titled thing here** — details that run on and on\n",
         encoding="utf-8",
     )
-    items = data.deferred_entries(project.project)
+    items = data.deferred_entries(project_tree.project)
     assert [(i.id, i.done, i.severity, i.legacy) for i in items] == [
         ("L1", True, None, True),
         ("W9", False, "high", True),
@@ -1348,12 +1389,12 @@ def test_deferred_entries_legacy_ledger(project):
     assert items[2].title == "Open bold-titled thing here"
     assert all(i.option_key and i.option_key.startswith("legacy:") for i in items)
     # option keys never collide with DW ids and stay stable across refreshes
-    assert data.deferred_entries(project.project) is items
+    assert data.deferred_entries(project_tree.project) is items
 
 
-def test_deferred_entries_mixed_ledger_in_file_order(project):
-    install_bmad_config(project)
-    project.deferred_work.write_text(
+def test_deferred_entries_mixed_ledger_in_file_order(project_tree):
+    install_bmad_config(project_tree)
+    project_tree.deferred_work.write_text(
         "# Deferred Work\n\n"
         "## Deferred from: epic 1 review (2026-04-06)\n\n"
         "- legacy item first in the file\n\n"
@@ -1361,7 +1402,7 @@ def test_deferred_entries_mixed_ledger_in_file_order(project):
         "origin: test, 2026-06-01\nseverity: high\nreason: t.\nstatus: open\n",
         encoding="utf-8",
     )
-    items = data.deferred_entries(project.project)
+    items = data.deferred_entries(project_tree.project)
     assert [(i.id, i.legacy) for i in items] == [("L1", True), ("DW-1", False)]
     assert items[1].option_key is None  # canonical rows key on the DW id
     assert items[1].severity == "high"
@@ -1470,15 +1511,15 @@ def test_story_key_from_task_id_grammar_including_the_generation_suffix():
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX symlinks")
-def test_project_paths_invalidates_when_a_dangling_link_appears_at_an_absent_layer(project):
+def test_project_paths_invalidates_when_a_dangling_link_appears_at_an_absent_layer(project_tree):
     """`_stat_sig` follows links and folds every OSError into None, so a dangling
     link created at a layer path that was absent signs exactly like the absence and
     the cache served stale paths. `load_paths` refuses that link, so must the TUI.
 
     Ablation: sign config sources with `_stat_sig` and the stale paths come back."""
-    install_bmad_config(project)
-    install_bmad_central_config(project)
-    root = project.project.resolve()
+    install_bmad_config(project_tree)
+    install_bmad_central_config(project_tree)
+    root = project_tree.project.resolve()
     layer = root / bmadconfig.CENTRAL_LAYERS_REL[3]
     layer.unlink()  # an optional layer the operator never wrote
     assert data._project_paths(root) is not None
@@ -1486,3 +1527,374 @@ def test_project_paths_invalidates_when_a_dangling_link_appears_at_an_absent_lay
     layer.symlink_to("missing.toml")
 
     assert data._project_paths(root) is None
+
+
+# ------------------------------------------- folded read faults (DW-472..475)
+
+
+def _refuse_stat(monkeypatch, target: Path) -> None:
+    """`target.stat()` raises EACCES; every other path stats normally."""
+    real = Path.stat
+
+    def fake(self, *args, **kwargs):
+        if self == target:
+            raise PermissionError(13, "stubbed: permission denied", str(self))
+        return real(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", fake)
+
+
+def test_classified_sig_tells_absence_from_a_stat_fault(tmp_path, monkeypatch):
+    present = tmp_path / "f"
+    present.write_text("x")
+    assert data._classified_sig(present)[0] is not None
+    assert data._classified_sig(present)[1] is None
+    assert data._classified_sig(tmp_path / "missing") == (None, None)
+    assert data._classified_sig(present / "under-a-file") == (None, None)  # ENOTDIR
+    _refuse_stat(monkeypatch, present)
+    sig, fault = data._classified_sig(present)
+    assert sig is None and fault is not None and "PermissionError" in fault
+
+
+def test_watcher_flags_a_persisting_state_parse_fault(tmp_path):
+    """DW-472: the last good state survives a bad state.json, but once the SAME
+    signature has failed twice the watcher says the shown state is stale — and the
+    next good parse clears it. One failed look is forgiven (a torn read the next
+    write heals).
+
+    Ablation: drop `self.state_fault = why` in `_note_state_fault` and the second
+    look's assertion reddens."""
+    run_dir = make_run(tmp_path, "20260611-100000-aaaa", current_epic=1)
+    watcher = data.RunWatcher(run_dir)
+    assert watcher.state().current_epic == 1 and watcher.state_fault is None
+
+    (run_dir / "state.json").write_text("{ broken for good")
+    assert watcher.state().current_epic == 1
+    assert watcher.state_fault is None  # first failed look: maybe torn, not flagged
+    assert watcher.state().current_epic == 1  # still the last good...
+    assert watcher.state_fault is not None  # ...but now marked stale
+    assert "state.json unreadable" in watcher.state_fault
+    assert "JSONDecodeError" in watcher.state_fault
+
+    save_state(
+        run_dir,
+        RunState(run_id=run_dir.name, project=str(tmp_path), started_at="t", current_epic=2),
+    )
+    assert watcher.state().current_epic == 2
+    assert watcher.state_fault is None
+
+
+def test_watcher_forgives_a_torn_state_read_the_next_write_heals(tmp_path):
+    """A failure at one signature followed by a good write at a new one never flags:
+    the two-look rule compares signatures, not failure counts."""
+    run_dir = make_run(tmp_path, "20260611-100000-aaaa", current_epic=1)
+    watcher = data.RunWatcher(run_dir)
+    watcher.state()
+    (run_dir / "state.json").write_text("{ torn")
+    watcher.state()
+    save_state(
+        run_dir,
+        RunState(run_id=run_dir.name, project=str(tmp_path), started_at="t", current_epic=3),
+    )
+    assert watcher.state().current_epic == 3
+    assert watcher.state_fault is None
+
+
+def test_watcher_flags_state_json_gone_after_a_good_read(tmp_path):
+    run_dir = make_run(tmp_path, "20260611-100000-aaaa", current_epic=1)
+    watcher = data.RunWatcher(run_dir)
+    watcher.state()
+    (run_dir / "state.json").unlink()
+    watcher.state()
+    assert watcher.state().current_epic == 1
+    assert watcher.state_fault == "state.json is gone"
+
+
+def test_watcher_clears_a_stat_fault_when_state_json_recovers_unchanged(tmp_path, monkeypatch):
+    """A flagged stat fault clears once the last good read's file stats back at the
+    SAME signature: a finished or paused run never rewrites state.json, so no fresh
+    parse would ever arrive to clear it.
+
+    Ablation: drop the clears in `state()`'s `sig == self._state_sig` branch and
+    the recovered look's assertion reddens."""
+    run_dir = make_run(tmp_path, "20260611-100000-aaaa", current_epic=1)
+    watcher = data.RunWatcher(run_dir)
+    watcher.state()
+    with monkeypatch.context() as m:
+        _refuse_stat(m, run_dir / "state.json")
+        watcher.state()
+        watcher.state()
+        assert watcher.state_fault is not None and "PermissionError" in watcher.state_fault
+    for _ in range(3):
+        assert watcher.state().current_epic == 1
+        assert watcher.state_fault is None
+    # The recovery also retired the suspect: one fresh failed look is forgiven again.
+    with monkeypatch.context() as m:
+        _refuse_stat(m, run_dir / "state.json")
+        watcher.state()
+        assert watcher.state_fault is None
+
+
+def test_watcher_state_never_written_is_not_stale(tmp_path):
+    watcher = data.RunWatcher(tmp_path / "nope")
+    for _ in range(3):
+        assert watcher.state() is None
+    assert watcher.state_fault is None
+
+
+def test_watcher_state_fault_names_a_never_parsed_state(tmp_path):
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "state.json").write_text("not json")
+    watcher = data.RunWatcher(run_dir)
+    watcher.state()
+    assert watcher.state() is None
+    assert watcher.state_fault is not None and "state.json unreadable" in watcher.state_fault
+
+
+def test_watcher_attention_flags_an_unreadable_file(tmp_path):
+    """DW-475: a read fault keeps the last text but is named in
+    `attention_fault`, cleared by the next good read; absence is no fault.
+
+    Ablation: drop the `attention_fault` assignment in the read arm and the
+    directory-case assertion reddens."""
+    run_dir = make_run(tmp_path, "20260611-100000-aaaa")
+    watcher = data.RunWatcher(run_dir)
+    assert watcher.attention() == "" and watcher.attention_fault is None
+
+    (run_dir / "ATTENTION").mkdir()  # stats fine, cannot be read as a file
+    assert watcher.attention() == ""
+    assert watcher.attention_fault is not None
+    assert "ATTENTION unreadable" in watcher.attention_fault
+
+    (run_dir / "ATTENTION").rmdir()
+    (run_dir / "ATTENTION").write_text("[ts] gate: epic boundary\n", encoding="utf-8")
+    assert watcher.attention() == "[ts] gate: epic boundary\n"
+    assert watcher.attention_fault is None
+
+
+def test_watcher_attention_undecodable_bytes_are_a_fault_not_a_crash(tmp_path):
+    run_dir = make_run(tmp_path, "20260611-100000-aaaa")
+    (run_dir / "ATTENTION").write_bytes(b"\xff\xfe not utf-8\n")
+    watcher = data.RunWatcher(run_dir)
+    assert watcher.attention() == ""
+    assert watcher.attention_fault is not None
+    assert "UnicodeDecodeError" in watcher.attention_fault
+
+
+def test_watcher_attention_stat_fault_keeps_text_and_flags(tmp_path, monkeypatch):
+    run_dir = make_run(tmp_path, "20260611-100000-aaaa")
+    (run_dir / "ATTENTION").write_text("[ts] one\n", encoding="utf-8")
+    watcher = data.RunWatcher(run_dir)
+    assert watcher.attention() == "[ts] one\n"
+    _refuse_stat(monkeypatch, run_dir / "ATTENTION")
+    assert watcher.attention() == "[ts] one\n"
+    assert watcher.attention_fault is not None and "cannot be stat'd" in watcher.attention_fault
+
+
+def test_journal_tail_stat_fault_keeps_the_offset(tmp_path, monkeypatch):
+    """DW-475: a stat FAULT is not absence — the offset survives it, so recovery
+    reads only what is new, and the fault is named until then.
+
+    Ablation: reset `_offset` on the fault arm and the post-recovery read returns
+    all three entries (re-delivering two), reddening the last assertion."""
+    journal = Journal(tmp_path)
+    journal.append("run-start")
+    journal.append("story-start", story="1-1-a")
+    tail = data.JournalTail(tmp_path)
+    assert len(tail.read_new()) == 2
+
+    with monkeypatch.context() as m:
+        _refuse_stat(m, tmp_path / "journal.jsonl")
+        assert tail.read_new() == []
+        assert tail.fault is not None and "journal.jsonl cannot be stat'd" in tail.fault
+
+    journal.append("story-done", story="1-1-a")
+    assert [e["kind"] for e in tail.read_new()] == ["story-done"]
+    assert tail.fault is None
+
+
+def test_journal_tail_open_fault_keeps_the_offset(tmp_path, monkeypatch):
+    journal = Journal(tmp_path)
+    journal.append("run-start")
+    tail = data.JournalTail(tmp_path)
+    assert len(tail.read_new()) == 1
+    journal.append("story-start", story="1-1-a")
+
+    real_open = Path.open
+
+    def refuse(self, *args, **kwargs):
+        if self == tmp_path / "journal.jsonl":
+            raise PermissionError(13, "stubbed: permission denied", str(self))
+        return real_open(self, *args, **kwargs)
+
+    with monkeypatch.context() as m:
+        m.setattr(Path, "open", refuse)
+        assert tail.read_new() == []
+        assert tail.fault is not None and "journal.jsonl unreadable" in tail.fault
+
+    assert [e["kind"] for e in tail.read_new()] == ["story-start"]
+    assert tail.fault is None
+
+
+def test_journal_tail_absence_still_resets_without_a_fault(tmp_path):
+    journal = Journal(tmp_path)
+    journal.append("run-start")
+    journal.append("story-start")
+    tail = data.JournalTail(tmp_path)
+    assert len(tail.read_new()) == 2
+    (tmp_path / "journal.jsonl").unlink()
+    assert tail.read_new() == []
+    assert tail.fault is None
+    Journal(tmp_path).append("run-resume")
+    assert [e["kind"] for e in tail.read_new()] == ["run-resume"]
+
+
+def test_log_view_prefix_scan_fault_is_flagged(tmp_path, monkeypatch):
+    """DW-475: a cold-open prefix scan that cannot read leaves `altscreen_seen`
+    False — which then means "not looked", so the fault is recorded for the pane.
+
+    Ablation: drop the `altscreen_scan_fault` assignment and this reddens."""
+    path = tmp_path / "task.log"
+    path.write_bytes(b"\x1b[?1049h" + b"filler\r\n" * 2000 + b"THE-END\r\n")
+    real_open = Path.open
+    calls = {"n": 0}
+
+    def fail_first(self, *args, **kwargs):
+        if self == path:
+            calls["n"] += 1
+            if calls["n"] == 1:  # the prefix scan opens first
+                raise PermissionError(13, "stubbed: permission denied", str(self))
+        return real_open(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", fail_first)
+    view = data.LogView(path, max_bytes=1024)
+    assert view.read_new() is True
+    assert view.altscreen_seen is False
+    assert view.altscreen_scan_fault is not None
+    assert "PermissionError" in view.altscreen_scan_fault
+
+
+def test_log_view_clean_scan_records_no_fault(tmp_path):
+    path = tmp_path / "task.log"
+    path.write_bytes(b"filler\r\n" * 2000)
+    view = data.LogView(path, max_bytes=1024)
+    assert view.read_new() is True
+    assert view.altscreen_scan_fault is None
+
+
+def test_active_agent_malformed_entry_is_unreadable_not_absent():
+    """DW-474: a malformed entry answers `UnreadableAgent` with the fault, never
+    `None` (which means no session is open).
+
+    Ablation: return None from the narrowed except arm and this reddens."""
+    agent = data.active_agent([_stamped_start(), None], None)  # type: ignore[list-item]
+    assert isinstance(agent, data.UnreadableAgent)
+    assert "AttributeError" in agent.error
+
+
+def test_active_agent_does_not_swallow_an_unexpected_exception(monkeypatch):
+    """DW-474: only the malformed-data faults are caught; a bug propagates.
+
+    Ablation: widen the except back to `Exception` and this reddens."""
+
+    def bug(*_args, **_kwargs):
+        raise RuntimeError("programming error")
+
+    monkeypatch.setattr(data, "_idle_since", bug)
+    with pytest.raises(RuntimeError, match="programming error"):
+        data.active_agent([_stamped_start()], None)
+
+
+def test_pending_missed_decisions_read_fault_is_named_and_not_cached(project, monkeypatch):
+    """DW-473: a raising read answers a fault, not an empty list, and is not
+    cached — the next call, with nothing on disk changed, reads for real.
+
+    Ablation: cache the fault result (or return it without `fault`) and one of the
+    two assertions reddens."""
+    from conftest import write_ledger
+
+    from bmad_loop import decisions
+
+    install_bmad_config(project)
+    write_ledger(project, {"DW-1": "open"})
+    _write_triage_decision(make_run(project.project, "20260101-000000-aaaa"))
+
+    with monkeypatch.context() as m:
+
+        def boom(_project):
+            raise PermissionError(13, "stubbed: permission denied")
+
+        m.setattr(decisions, "pending_missed_decisions", boom)
+        missed = data.pending_missed_decisions(project.project)
+        assert missed.items == []
+        assert missed.fault is not None and "PermissionError" in missed.fault
+
+    missed = data.pending_missed_decisions(project.project)
+    assert missed.fault is None
+    assert [d.id for d in missed.items] == ["DW-1"]
+
+
+def test_pending_missed_decisions_unreadable_ledger_is_a_fault(project_tree):
+    """DW-473: `decisions.pending_missed_decisions` reads an undecodable ledger as
+    "no open ids" and answers []; the TUI reader probes the ledger the way
+    `cmd_decisions` does and names the fault instead.
+
+    Ablation: drop the `read_for_observation` probe and `fault` is None."""
+    from conftest import UNDECODABLE_LEDGER
+
+    install_bmad_config(project_tree)
+    project_tree.deferred_work.write_bytes(UNDECODABLE_LEDGER)
+    _write_triage_decision(make_run(project_tree.project, "20260101-000000-aaaa"))
+    missed = data.pending_missed_decisions(project_tree.project)
+    assert missed.items == []
+    assert missed.fault is not None and "deferred-work ledger unreadable" in missed.fault
+    assert "UnicodeDecodeError" in missed.fault
+
+
+def _deny_stat_under(monkeypatch, root: Path) -> None:
+    """Every `stat()` of `root` or below raises EACCES — an unreadable dir, as
+    3.14's `is_dir`/`is_file` would fold it into False."""
+    real = Path.stat
+
+    def stat(self, *args, **kwargs):
+        if self == root or root in self.parents:
+            raise PermissionError(13, "Permission denied", str(self))
+        return real(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", stat)
+
+
+def test_pending_missed_decisions_incomplete_run_listing_is_a_fault(project, monkeypatch):
+    """DW-468: a run dir the listing cannot read holds triage this reader never
+    saw, so the readable run's DW-1 is not the whole answer — the reader names the
+    fault instead, and does not cache it: once the run reads again, so does DW-1.
+
+    Ablation: drop the `listing_fault` return in `pending_missed_decisions` and
+    this reddens — `fault` is None over a partial listing."""
+    from conftest import write_ledger
+
+    install_bmad_config(project)
+    write_ledger(project, {"DW-1": "open"})
+    _write_triage_decision(make_run(project.project, "20260101-000000-aaaa"))
+    bad = make_run(project.project, "20260102-000000-bbbb")
+
+    with monkeypatch.context() as m:
+        _deny_stat_under(m, bad)
+        missed = data.pending_missed_decisions(project.project)
+        assert missed.items == []
+        assert missed.fault is not None and "run listing incomplete" in missed.fault
+        assert "20260102-000000-bbbb" in missed.fault
+
+    missed = data.pending_missed_decisions(project.project)
+    assert missed.fault is None
+    assert [d.id for d in missed.items] == ["DW-1"]
+
+
+def test_pending_missed_decisions_none_pending_is_an_answer(project):
+    from conftest import write_ledger
+
+    install_bmad_config(project)
+    write_ledger(project, {"DW-1": "done 2026-06-01"})
+    missed = data.pending_missed_decisions(project.project)
+    assert missed == data.MissedDecisions([])

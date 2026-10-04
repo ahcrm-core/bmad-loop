@@ -78,10 +78,12 @@ if TYPE_CHECKING:
         ) -> dict[str, CodingCLIAdapter]: ...
 
 
-# The three adapter roles a run wires. Defined here (the composition layer that
+# The adapter roles a run wires. Defined here (the composition layer that
 # actually builds them) and re-exported as ``cli.ROLES``, which `cmd_validate`
-# and the test suite resolve.
-ROLES = ("dev", "review", "triage")
+# and the test suite resolve. ``retro`` drives the headless epic-boundary
+# retrospective (`gates.retrospective = "auto"`, DW-389); like ``triage`` it is a
+# plain adapter that reads the session's own result.json.
+ROLES = ("dev", "review", "triage", "retro")
 SWEEP_OPTIONS_VERSION = 2
 _MAX_SWEEP_OPTIONS_BYTES = 64 * 1024
 
@@ -120,7 +122,7 @@ def resolve_profiles(policy: Policy, project: Path) -> dict[str, CLIProfile]:
     and the composition. Profiles were the only surface read twice.
 
     Deduplicated by profile name, so the common single-CLI policy touches disk
-    once rather than three times. ``ProfileError`` propagates.
+    once rather than once per role. ``ProfileError`` propagates.
     """
     from .adapters.profile import get_profile
 
@@ -151,6 +153,13 @@ def config_digest(
     the exec-reachable surface:
 
     * ``verify.commands`` — order-preserved; they run in sequence.
+    * ``environment.probes`` — order-preserved like ``verify.commands`` and run
+      the same way (``shell=True``, DW-523), so they are the same host-exec
+      surface. Hashed only when non-empty, for the ``session_id_flag`` reason
+      below: an unset list runs nothing, and leaving the key out keeps the payload
+      byte-identical to a digest stamped before the field existed.
+      ``verify.env_fault_rc`` and ``environment.probe_timeout_s`` are not: they
+      classify or bound a command's run, and neither can name a program.
     * ``sorted(plugins.enabled)`` — set semantics, so order is not meaningful.
     * per :data:`ROLES`, every field that decides **which program runs and with
       what flags and environment**. That rule, not a hand-picked list, is what
@@ -158,9 +167,11 @@ def config_digest(
       ``interactive_env`` and every token there traces back to one of
       ``binary`` / ``launch_args`` / ``bypass_args`` / ``model_flag`` /
       ``prompt_template`` / ``env`` on the *resolved* profile, or to
-      ``extra_args`` on the resolved adapter. The opencode-http builder reads a
-      strict SUBSET of those — ``_serve_argv`` takes ``binary`` and the adapter's
-      ``extra_args`` and nothing else, and ``_session_env`` layers
+      ``extra_args`` on the resolved adapter — plus ``session_id_flag``, which
+      ``build_command`` appends (with a minted id) to the launched argv only.
+      The opencode-http builder reads a strict SUBSET of those — ``_serve_argv``
+      takes ``binary``, ``launch_args`` and the adapter's ``extra_args`` and
+      nothing else, and ``_session_env`` layers
       ``profile.env`` plus one *generated* variable, which the ``skill_tree``
       bullet below accounts for. See the union paragraph on why the subset does
       not narrow what is hashed.
@@ -195,12 +206,14 @@ def config_digest(
     the argument for ``adapter``, since ``hookless`` selected the builder only
     until the registry took that job over: *a hard-coded argv token is not the
     same thing as a safe one.* Flipping ``hooks.dialect`` to ``"none"``
-    does not add a token — it swaps the whole builder, dropping ``launch_args``,
-    the prompt and the ``bypass_args`` fallback and putting the literal ``"serve"``
-    at argv[1], which ``_spawn_server`` then runs with ``cwd`` at the workspace
-    root. To a CLI that is a subcommand and a bad one dies in the health poll. To
-    an *interpreter* — a profile whose ``binary`` is ``python``/``sh``/``node``
-    with the real program in ``launch_args``, which nothing forbids — argv[1] is a
+    does not add a token — it swaps the whole builder, dropping the prompt and
+    the ``bypass_args`` fallback and putting the literal ``"serve"`` right after
+    ``binary`` + ``launch_args``, which ``_spawn_server`` then runs with ``cwd`` at
+    the workspace root. To a CLI that is a subcommand and a bad one dies in the
+    health poll. To an *interpreter* ``binary`` (``python``/``sh``/``node``) with
+    an empty or options-only ``launch_args`` (e.g. ``python3 -u``) — which nothing
+    forbids; validate only warns (``adapter.launch-args-unservable``) —
+    ``"serve"`` lands in the script slot as a
     **script path resolved against the agent-writable tree**, and the exec happens
     before the health poll it fails (three times: ``SPAWN_ATTEMPTS``). ``binary``
     being pinned does not save it: the attacker inherits whichever binary the
@@ -214,8 +227,9 @@ def config_digest(
     ``adapter.extra_args`` REPLACES ``bypass_args`` rather than extending it, so
     for a role that sets it the hashed ``bypass_args`` is dead, and rewriting the
     dead field alone moves this digest without moving one token of the launched
-    argv. Under ``hookless``, ``bypass_args`` / ``launch_args`` / ``model_flag``
-    are dead the same way. Hashing the effective projection instead means
+    argv. Under ``hookless``, ``bypass_args`` / ``model_flag`` are dead the same
+    way (``launch_args`` is not: the opencode builder places it before
+    ``serve``). Hashing the effective projection instead means
     restating two builders' precedence rules inside the control that polices
     them, where drift is silent and lands in the UNDER-covering direction — the
     failure this function has already made four times by reasoning from one
@@ -267,7 +281,7 @@ def config_digest(
       ``seed_files``) all reject absolute and parent refs.
 
       NOT excluded on "the parent execs it too" — that defence is false for the
-      ``triage`` role. Base ``Engine`` wires only dev+review; ``sweep.py`` holds
+      ``triage`` role. Base ``Engine`` wires only dev+review+retro; ``sweep.py`` holds
       the only ``adapters["triage"]`` assignment and the only two ``role="triage"``
       dispatches, so a ``[adapter.triage]`` profile override's target is exec'd by
       a sweep and by nothing else. ``sweep.auto = "run-end"`` and worktree
@@ -397,20 +411,32 @@ def config_digest(
             "adapter": prof.adapter,
             # The transport. It no longer selects the builder (`adapter` does),
             # but it still rewrites what the opencode builder emits WHOLESALE
-            # rather than adding a token: hookless drops launch_args/prompt/
-            # bypass_args and substitutes `serve --port … --print-logs`, whose
-            # literal "serve" an interpreter binary reads as a cwd-relative
-            # script path.
+            # rather than adding a token: hookless drops prompt/bypass_args and
+            # appends `serve --port … --print-logs` after binary + launch_args,
+            # whose literal "serve" an interpreter binary with an empty or
+            # options-only launch_args (e.g. `python3 -u`) reads as a
+            # cwd-relative script path.
             "hookless": prof.hookless,
             # None (inherit profile.bypass_args) is NOT the same state as () (an
             # explicit override to no flags at all); json.dumps keeps them apart.
             "extra_args": None if cfg.extra_args is None else list(cfg.extra_args),
         }
+        # An argv FLAG `build_command` appends to the launched command with a
+        # minted session id (DW-505); not in interactive_argv, still launched.
+        # Hashed only when set: an unset flag adds no token, so leaving the key
+        # out keeps the payload byte-identical to a digest stamped before the
+        # field existed — a paused run resumed across the upgrade must not report
+        # a host-exec change its argv never had.
+        if prof.session_id_flag:
+            launch[role]["session_id_flag"] = prof.session_id_flag
     payload = {
         "verify_commands": list(policy.verify.commands),
         "plugins_enabled": sorted(policy.plugins.enabled),
         "profiles": launch,
     }
+    # Same byte-identity rule as `session_id_flag` above: no probes, no key.
+    if policy.environment.probes:
+        payload["environment_probes"] = list(policy.environment.probes)
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
 
 
@@ -692,6 +718,20 @@ def platform_preflight(project: Path) -> list[Finding]:
                 },
             )
         )
+    # Not gated on the backend count like the listing above: an "(unavailable)"
+    # that a raising probe forced is a fold, not the host's answer, and a lone
+    # backend is the one an operator most needs told about (DW-464). A warning —
+    # selection already degraded past it, as for a failed external.
+    for i in infos:
+        if i.probe_error:
+            found.append(
+                Finding(
+                    "mux.backend-probe",
+                    "warning",
+                    f"mux backend {i.name} probe failed: {i.probe_error}",
+                    {"backend": i.name, "error": i.probe_error},
+                )
+            )
     chosen = next((i for i in infos if i.selected), None)
     if chosen:
         # Emitted for EVERY reason, not just the forced ones (#332): the reason that
@@ -785,6 +825,7 @@ def build_run_state(
     stories_on: bool,
     spec_folder: str,
     trusted_config_digest: str,
+    run_dir_identity: tuple[int, int] | None,
 ) -> RunState:
     """Assemble the launch-time :class:`RunState` for a fresh run.
 
@@ -801,11 +842,16 @@ def build_run_state(
     ``repo_root`` records the git root code work happens in (``paths.repo_root``),
     which equals ``project`` unless the BMAD config sets a `repo_root:` override.
     ``runs.rearm_escalation`` runs out of process and reads it back to advance the
-    attempt baseline in the tree the proof-of-work gate actually measures."""
+    attempt baseline in the tree the proof-of-work gate actually measures.
+
+    ``run_dir_identity`` is the run dir's mint-time identity
+    (:func:`_claim_identity` of the composer's claim, DW-446) — what the verify
+    stream's pin compares the run dir it opens against."""
     return RunState(
         run_id=run_id,
         project=str(project),
         repo_root=str(repo_root),
+        run_dir_identity=run_dir_identity,
         started_at=time.strftime("%Y-%m-%dT%H:%M:%S"),
         policy_snapshot=policy.to_dict(),
         epic_filter=epic_filter,
@@ -981,6 +1027,20 @@ def validate_sweep_options_binding(
     """Bind current sweep options to the exact bytes published at launch."""
     if version == SWEEP_OPTIONS_VERSION and options.digest != expected_digest:
         raise SweepOptionsError("sweep.json no longer matches the options bound at launch")
+
+
+def _claim_identity(claim: os.stat_result) -> tuple[int, int] | None:
+    """The run dir's mint-time identity record (DW-446) from the composer's claim —
+    the ``lstat`` of the directory this process just created, before any session
+    can reach it — or None for a zero inode, which carries no identity, so every
+    pin compared against it refuses. On the dir-fd verify-stream arm and for the
+    mount writers that is no change (a zero inode never matched), but the win32
+    verify-stream arm, which before DW-446 wrote through a zero-inode run dir, now
+    REFUSES it (accepted 2026-09-27): each lost log tail is journaled as the
+    verify record's ``capture_error`` and verification proceeds without it."""
+    if claim.st_ino == 0:
+        return None
+    return (claim.st_dev, claim.st_ino)
 
 
 def _claim_run_dir(run_dir: Path) -> os.stat_result:
@@ -1196,6 +1256,7 @@ def compose_run(
             stories_on=stories_on,
             spec_folder=spec_folder,
             trusted_config_digest=trusted_config_digest,
+            run_dir_identity=_claim_identity(composer_claim),
         )
         # State becoming resumable and the pid making this process live are one
         # publication.  An explicit-id resume waits for the pid rather than entering
@@ -1221,6 +1282,7 @@ def compose_run(
             policy=policy,
             adapter=adapters["dev"],
             review_adapter=adapters["review"],
+            retro_adapter=adapters["retro"],
             run_dir=run_dir,
             journal=journal,
             state=state,
@@ -1354,6 +1416,7 @@ def compose_sweep(
             run_id=run_id,
             project=str(project),
             repo_root=str(paths.repo_root),
+            run_dir_identity=_claim_identity(composer_claim),
             started_at=time.strftime("%Y-%m-%dT%H:%M:%S"),
             policy_snapshot=policy.to_dict(),
             run_type="sweep",
@@ -1495,6 +1558,7 @@ def compose_resume(
             policy=policy,
             adapter=adapters["dev"],
             review_adapter=adapters["review"],
+            retro_adapter=adapters["retro"],
             run_dir=run_dir,
             journal=journal,
             state=state,

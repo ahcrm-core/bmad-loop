@@ -12,11 +12,13 @@ import signal
 import stat
 import subprocess
 import sys
+import time
 import warnings
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
+import perf_report
 import pytest
 import yaml
 
@@ -40,6 +42,17 @@ if sys.platform == "win32" and not sys.flags.utf8_mode:
         "(e.g. `set PYTHONUTF8=1 && uv run pytest`). The suite assumes UTF-8 to "
         "match the files under test; CI's windows job sets this automatically."
     )
+
+
+# Opt-in runtime metrics (`--test-metrics-dir=PATH`, tests/perf_report.py). Both
+# hooks only register the options and, when the directory option is given, the
+# recorder; without it nothing else of that module runs.
+def pytest_addoption(parser: pytest.Parser) -> None:
+    perf_report.add_options(parser)
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    perf_report.configure(config)
 
 
 def _codec_rejects_bad_byte() -> bool:
@@ -348,6 +361,25 @@ def opencode_runs() -> bool:
 
 
 @pytest.fixture
+def emulate_windows_newlines(monkeypatch):
+    """Return an activator that makes `Path.write_text` translate newlines like Windows.
+
+    With ``newline=None`` a text write maps ``\n`` to ``\r\n`` there. The translation
+    is compiled into `io.TextIOWrapper`, so patching `os.linesep` cannot reproduce it;
+    without this, a "no CRLF" assertion passes on Linux whether or not the fix is in.
+    Call the activator after test setup so the fixture's own writes stay untranslated.
+    """
+    real = Path.write_text
+
+    def write_text(self, data, encoding=None, errors=None, newline=None):
+        if newline is None:
+            data, newline = data.replace("\n", "\r\n"), ""
+        return real(self, data, encoding=encoding, errors=errors, newline=newline)
+
+    return lambda: monkeypatch.setattr(Path, "write_text", write_text)
+
+
+@pytest.fixture
 def force_tmux_backend(monkeypatch):
     """Pin the tmux transport backend by name, regardless of host platform.
 
@@ -427,6 +459,55 @@ def write_script_launcher(directory: Path, name: str, body: str) -> Path:
     return launcher
 
 
+def read_pid(pid_file: Path) -> int | None:
+    """The pid a test child recorded in ``pid_file``, or None before it has."""
+    try:
+        text = pid_file.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return None
+    return int(text) if text.isdigit() else None
+
+
+def pid_gone(pid: int) -> bool:
+    """Dead or a zombie awaiting its (new) parent's reap — either way no longer
+    running anything."""
+    if sys.platform.startswith("linux"):
+        try:
+            stat_line = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+        except (FileNotFoundError, ProcessLookupError):
+            return True
+        return stat_line.rsplit(")", 1)[1].split()[0] in ("Z", "X")
+    from bmad_loop.process_host import get_process_host
+
+    return not get_process_host().is_alive(pid)
+
+
+def wait_pid_gone(pid: int, timeout: float = 5.0) -> bool:
+    """Poll :func:`pid_gone` until it holds or ``timeout`` passes."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if pid_gone(pid):
+            return True
+        time.sleep(0.05)
+    return pid_gone(pid)
+
+
+@pytest.fixture
+def reap_leftovers() -> Iterator[list[int]]:
+    """Pids a failing row may have leaked; force-killed at teardown so a red row
+    never leaves a long sleeper behind. Append a pid as soon as it is known,
+    before the first assertion that could fail."""
+    from bmad_loop.process_host import get_process_host
+
+    pids: list[int] = []
+    yield pids
+    host = get_process_host()
+    for pid in pids:
+        if not pid_gone(pid):
+            with contextlib.suppress(Exception):
+                host.force_kill(pid)
+
+
 class _WindowsLauncher:
     """``Path(sys.argv[0]).absolute()`` as a Windows install presents it, on any
     test host: ``str`` is the Windows path the relay registration quotes, while
@@ -495,6 +576,19 @@ def _file_exists_cmd(path) -> str:
     if sys.platform == "win32":
         return f'if exist "{path}\\NUL" (exit 1) else if exist "{path}" (exit 0) else (exit 1)'
     return f'test -f "{path}"'
+
+
+def assert_multiline_notice_keeps_its_lines(run_dir: Path, title: str, notice: str) -> None:
+    """A `gates.notify(..., multiline=True)` notice in ATTENTION: its header record
+    (the one carrying ``title``) holds the notice's first line unfolded (no
+    ` ⏎ `), and the next ATTENTION line is the notice's second line. Ablation:
+    drop the site's `multiline=True` and the notice folds onto the header line."""
+    lines = (run_dir / "ATTENTION").read_text(encoding="utf-8").splitlines()
+    (header,) = [i for i, ln in enumerate(lines) if title in ln]
+    first, second = notice.splitlines()[:2]
+    assert " ⏎ " not in lines[header]
+    assert lines[header].endswith(first)
+    assert lines[header + 1] == second
 
 
 def scripted_verify_runner(expected_root: Path, next_results):
@@ -796,8 +890,58 @@ def _isolate_ambient_git_ignores(tmp_path_factory: pytest.TempPathFactory):
     mp.undo()
 
 
+class StateRootAllocator:
+    """Hands out distinct, freshly created state roots under one per-worker base.
+
+    Linear by construction: `allocate` does one `mkdir` (two on the first child of a
+    bucket) and never lists a directory. `tmp_path_factory.mktemp` does not have that
+    property — pytest's numbered-dir allocation scans the parent for the highest
+    existing suffix on every call, so one numbered state root per test made the
+    autouse fixture quadratic in the tests a worker had already run, and every
+    ordinary `tmp_path` allocation scanned those roots too because they shared its
+    parent. The counter is plain per-instance state: each xdist worker is its own
+    process with its own session fixture, so no two allocators share a base.
+
+    Children are bucketed `BUCKET_SIZE` to a directory so no directory ever holds
+    more than that many entries. `mkdir` without `exist_ok` is the distinctness
+    proof: an existing path is an error, never a silently shared root. Names stay
+    short (`state0/b3/s17`) so no root is longer than the `state-rootN` it replaced
+    — Windows path budgets are measured from here."""
+
+    BUCKET_SIZE = 256
+
+    def __init__(self, base: Path) -> None:
+        self.base = base
+        self._allocated = 0
+
+    def allocate(self) -> Path:
+        index = self._allocated
+        self._allocated += 1
+        bucket, slot = divmod(index, self.BUCKET_SIZE)
+        bucket_dir = self.base / f"b{bucket}"
+        if slot == 0:
+            bucket_dir.mkdir()
+        root = bucket_dir / f"s{slot}"
+        root.mkdir()
+        return root
+
+
+def point_state_root(mp: pytest.MonkeyPatch, allocator: StateRootAllocator) -> Path:
+    """Aim `BMAD_LOOP_STATE_DIR` at a fresh root, through ``mp`` so ``mp.undo()``
+    restores the operator's own value (or its absence). The only variable touched."""
+    root = allocator.allocate()
+    mp.setenv(envvars.STATE_DIR, str(root))
+    return root
+
+
+@pytest.fixture(scope="session")
+def _state_root_allocator(tmp_path_factory: pytest.TempPathFactory) -> StateRootAllocator:
+    """One numbered base per worker session; every per-test root is a child of it."""
+    return StateRootAllocator(tmp_path_factory.mktemp("state"))
+
+
 @pytest.fixture(autouse=True)
-def _isolate_state_root(tmp_path_factory: pytest.TempPathFactory, monkeypatch):
+def _isolate_state_root(_state_root_allocator: StateRootAllocator, monkeypatch):
     """Point the user-scoped state root at a per-test temp dir, for every test.
 
     `runs.state_root()` resolves to `~/.local/state/bmad-loop` (POSIX) or
@@ -820,7 +964,7 @@ def _isolate_state_root(tmp_path_factory: pytest.TempPathFactory, monkeypatch):
     Tests that grade the cascade itself `delenv` this variable and monkeypatch
     the ones they need, and share this fixture's monkeypatch instance, so the
     override comes off cleanly for exactly that test."""
-    monkeypatch.setenv(envvars.STATE_DIR, str(tmp_path_factory.mktemp("state-root")))
+    point_state_root(monkeypatch, _state_root_allocator)
 
 
 @pytest.fixture(autouse=True)
@@ -865,6 +1009,24 @@ def _isolate_mux_registry(monkeypatch):
     monkeypatch.setattr(psmux_backend, "_DISPLACED_ROOT", None)
 
 
+def seed_project_files(root: Path) -> ProjectPaths:
+    """Write the sandbox's file tree under ``root`` (which must not exist yet).
+
+    The ONE definition of what a sandbox holds before Git: `_project_template` commits
+    exactly this, and `project_tree` hands it out with no repository at all, so the
+    two fixtures cannot drift into describing different projects."""
+    paths = ProjectPaths(
+        project=root,
+        implementation_artifacts=root / "_bmad-output" / "implementation-artifacts",
+        planning_artifacts=root / "_bmad-output" / "planning-artifacts",
+    )
+    paths.implementation_artifacts.mkdir(parents=True)
+    paths.planning_artifacts.mkdir(parents=True)
+    (root / "src.txt").write_text("original\n")
+    (root / ".gitignore").write_text(".bmad-loop/runs/\n")  # as `bmad-loop init` would
+    return paths
+
+
 @pytest.fixture(scope="session")
 def _project_template(
     tmp_path_factory: pytest.TempPathFactory, _isolate_ambient_git_ignores: None
@@ -873,13 +1035,7 @@ def _project_template(
     a test — a mutation would poison every later test in the worker; tests get
     disposable copies via `project`. (Do not chmod it read-only either: copytree
     preserves modes, so the copies would inherit it and break every write.)"""
-    root = tmp_path_factory.mktemp("project-template") / "sandbox"
-    impl = root / "_bmad-output" / "implementation-artifacts"
-    plan = root / "_bmad-output" / "planning-artifacts"
-    impl.mkdir(parents=True)
-    plan.mkdir(parents=True)
-    (root / "src.txt").write_text("original\n")
-    (root / ".gitignore").write_text(".bmad-loop/runs/\n")  # as `bmad-loop init` would
+    root = seed_project_files(tmp_path_factory.mktemp("project-template") / "sandbox").project
     git(root, "init", "-q", "-b", "main")
     # `git init` seeds 14 dead `*.sample` hooks nothing here reads, and every test
     # replicated all 14 through `project`'s copytree. Drop the files only — NOT via
@@ -907,13 +1063,10 @@ def _project_template(
     return root
 
 
-@pytest.fixture
-def project(tmp_path: Path, _project_template: Path) -> ProjectPaths:
-    """Git repo with BMAD-shaped artifact dirs and an initial commit — a copytree
-    clone of the per-worker template, so no git subprocesses per test (git spawn
-    plus fsync made this fixture ~3s per test on Windows CI)."""
-    root = tmp_path / "sandbox"
-    shutil.copytree(_project_template, root)
+def copy_project(template: Path, root: Path) -> ProjectPaths:
+    """A private copytree of the template repo at ``root``: its own `.git` directory,
+    index, refs and hooks, nothing linked back to the template or any other copy."""
+    shutil.copytree(template, root)
     return ProjectPaths(
         project=root,
         implementation_artifacts=root / "_bmad-output" / "implementation-artifacts",
@@ -921,12 +1074,43 @@ def project(tmp_path: Path, _project_template: Path) -> ProjectPaths:
     )
 
 
+@pytest.fixture
+def project(tmp_path: Path, _project_template: Path) -> ProjectPaths:
+    """Git repo with BMAD-shaped artifact dirs and an initial commit — a copytree
+    clone of the per-worker template, so no git subprocesses per test (git spawn
+    plus fsync made this fixture ~3s per test on Windows CI)."""
+    return copy_project(_project_template, tmp_path / "sandbox")
+
+
+@pytest.fixture
+def project_tree(tmp_path: Path) -> ProjectPaths:
+    """The `project` file tree at the same `tmp_path / "sandbox"` spot, with NO Git.
+
+    For tests whose assertion and exercised code path never consult a repository:
+    it skips the `.git` copy entirely. Opt in explicitly and only with a reason —
+    nothing here guesses from a test's name, and nothing creates a repository lazily
+    if the code under test turns out to want one. Code that does reach Git finds no
+    repository here and may DEGRADE rather than fail, so a green run on this fixture
+    is not by itself evidence that Git was incidental — read the exercised path.
+    Anything that commits, diffs, stashes, installs hooks or reads `HEAD` stays on
+    `project`.
+
+    Admitted so far, each on two grounds — the product path is Git-free by reading
+    (every TUI Git contact goes through `verify._run_git`, only on launch, decision
+    publish, story-checkpoint subject and re-arm; nothing reads `.git` directly) AND
+    the test measured zero subprocess spawns on `project`: `test_sprintstatus.py`
+    parsing, `test_tui_data.py` config/ledger/sprint readers, and `test_tui_app.py`
+    render, input, layout and lifecycle rows that never reach one of those actions."""
+    return seed_project_files(tmp_path / "sandbox")
+
+
 # --------------------------------------- divergent roots (`repo_root` override)
 #
-# `isolation = "none"` plus a `repo_root:` key in _bmad/bmm/config.yaml is the ONE
-# supported shape where `paths.project` and `paths.repo_root` name different
-# directories (`bmadconfig.worktree_isolation_conflict` refuses the other, and
-# `ProjectPaths.rebased` sets both roots, so worktree isolation never diverges).
+# A `repo_root:` key in _bmad/bmm/config.yaml is the shape where `paths.project` and
+# `paths.repo_root` name different directories. Under `isolation = "none"` any such
+# key is supported; under `isolation = "worktree"` only a `repo_root` that CONTAINS
+# the project is (`bmadconfig.worktree_isolation_conflict` refuses a disjoint one),
+# and `ProjectPaths.rebased` keeps the project's offset inside the mount (DW-379).
 # The `project` fixture above sets no override, so `repo_root == project` there and
 # nothing built on it can tell the two apart. These helpers centralize the shared
 # marker probes, config writer, and nested builder so new coverage does not have to
@@ -996,11 +1180,11 @@ _ARTIFACT_PATH_KEYS = (
 def write_repo_root_override(paths: ProjectPaths, code_root: Path) -> None:
     """Rewrite `_bmad/bmm/config.yaml` with a `repo_root:` pointing at `code_root`.
 
-    The one supported divergent-roots config: `isolation = "none"` plus a
-    `repo_root:` key (`bmadconfig.worktree_isolation_conflict` refuses the other
-    combination, and `ProjectPaths.rebased` sets both roots, so worktree isolation
-    never diverges). Overwrites rather than appends, so it is exact whether or not
-    `install_bmad_config` ran first.
+    The divergent-roots config: a `repo_root:` key, supported beside
+    `isolation = "none"` for any `code_root` and beside `isolation = "worktree"` only
+    when `code_root` contains the project (`bmadconfig.worktree_isolation_conflict`
+    refuses a disjoint one, DW-379). Overwrites rather than appends, so it is exact
+    whether or not `install_bmad_config` ran first.
 
     `code_root` need not be a git checkout, and several rows deliberately pass a
     plain directory or a missing one.
@@ -1312,6 +1496,72 @@ RENDERER_STUB_SKILL_MD = (
 RENDERER_WORKFLOW_MD = "Read [[bmad-snapshot:step-04-review.md]] fully.\n"
 RENDERER_SCRIPT_IMPORTING_SIBLING = "from config_utils import load_central_config\n"
 
+# `validate --render-probe` fixtures: a stub whose fenced render command launches
+# this interpreter, and fake renderers that record each execution to a marker file.
+# The prose line also names render_skill.py, so a parser that took the first line
+# anywhere (rather than the first FENCED line) would pick the wrong command.
+_RENDER_PROBE_PREAMBLE = """\
+import json, os, pathlib, sys
+args = sys.argv[1:]
+root = pathlib.Path(args[args.index("--project-root") + 1])
+skill = pathlib.Path(args[args.index("--skill") + 1])
+pathlib.Path({marker!r}).write_text(json.dumps({{
+    "root": str(root),
+    "skill": str(skill),
+    "cwd": os.getcwd(),
+    "argv": args,
+    "stale_render": (root / "_bmad" / "render").exists(),
+    "skill_md": (skill / "SKILL.md").is_file(),
+}}), encoding="utf-8")
+"""
+RENDER_PROBE_OK_BODY = """\
+out = root / "_bmad" / "render" / skill.name / "workflow.md"
+out.parent.mkdir(parents=True, exist_ok=True)
+out.write_text("rendered\\n", encoding="utf-8")
+print(f"read and follow {out}")
+"""
+RENDER_PROBE_HALT_BODY = """\
+print(f"HALT: missing config value x under {root}")
+sys.exit(1)
+"""
+RENDER_PROBE_TRACEBACK_BODY = 'raise RuntimeError("renderer exploded")\n'
+
+
+def render_probe_stub_skill_md(launcher: str | None = None) -> str:
+    """A renderer-stub SKILL.md shaped like upstream's, launching ``launcher``
+    (default: this interpreter) on the project's render_skill.py."""
+    import shlex
+
+    if launcher is None:
+        launcher = shlex.quote(Path(sys.executable).as_posix())
+    return (
+        "---\nname: bmad-build-auto\n---\n\n"
+        "Run the `render_skill.py` command below exactly once:\n\n"
+        "```bash\n"
+        f'{launcher} "{{project-root}}/_bmad/scripts/render_skill.py" '
+        '--project-root "{project-root}" --skill "{skill-root}"\n'
+        "```\n"
+    )
+
+
+def install_render_probe_fixture(
+    root: Path, marker: Path, body: str, tree: str = ".claude/skills"
+) -> Path:
+    """A renderer-stub dev primitive with a complete presence surface whose
+    render_skill.py is a fake that writes ``marker`` whenever it executes.
+    Returns the primitive's skill dir."""
+    from bmad_loop.install import CENTRAL_CONFIG_REL, DEV_PRIMITIVE_NEW, RENDERER_SCRIPT_REL
+
+    skills = install_build_auto_skill(root, tree, renderer_stub=True)
+    primitive = skills / DEV_PRIMITIVE_NEW
+    (primitive / "SKILL.md").write_text(render_probe_stub_skill_md(), encoding="utf-8")
+    script = Path(root) / RENDERER_SCRIPT_REL
+    script.parent.mkdir(parents=True, exist_ok=True)
+    script.write_text(_RENDER_PROBE_PREAMBLE.format(marker=str(marker)) + body, encoding="utf-8")
+    config = Path(root) / CENTRAL_CONFIG_REL
+    config.write_text("[core]\nname = 'fixture'\n", encoding="utf-8")
+    return primitive
+
 
 def install_dev_base_skills(root: Path, tree: str = ".claude/skills", *, folder_id: bool) -> Path:
     """Lay down stubs of the upstream skills the orchestrator drives on every dev run
@@ -1415,11 +1665,33 @@ def install_base_skills(paths: ProjectPaths, trees=(".claude/skills", ".agents/s
 
     BASE_SKILLS names BOTH primitive eras, so this lays down both and the tree
     resolves to `bmad-build-auto`. For a single-era scaffold use
-    :func:`install_dev_base_skills` (legacy) or :func:`install_build_auto_skill`."""
+    :func:`install_dev_base_skills` (legacy) or :func:`install_build_auto_skill`.
+    Each tree also gets a real copy of the bundled `bmad-loop-sweep`
+    (:func:`install_sweep_skill`), as `bmad-loop init` would lay it down."""
     from bmad_loop.install import BASE_SKILLS
 
     for tree in trees:
         _write_skill_stubs(paths.project / tree, BASE_SKILLS)
+        install_sweep_skill(paths.project, tree)
+
+
+def install_sweep_skill(root: Path, tree: str = ".claude/skills") -> Path:
+    """Copy the wheel's bundled `bmad-loop-sweep` into ``root/tree``, the way
+    `bmad-loop init` lays it down, so the triage-tree preflight
+    (`install.missing_sweep_skill`) passes for the right reason: the file set it
+    requires is read from the same bundle, so a stub list here would drift the
+    moment a mode file is added. Idempotent. Returns the skill directory."""
+    from importlib import resources
+
+    from bmad_loop.install import SWEEP_SKILL, bundled_skill_files
+
+    src = resources.files("bmad_loop.data").joinpath("skills").joinpath(SWEEP_SKILL)
+    dst = Path(root) / tree / SWEEP_SKILL
+    for rel in bundled_skill_files(SWEEP_SKILL):
+        target = dst.joinpath(*rel.split("/"))
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(src.joinpath(*rel.split("/")).read_bytes())
+    return dst
 
 
 def attach_profile(adapter, name: str = "claude", project: Path | None = None):
@@ -1928,11 +2200,13 @@ def ignore_before_commit(project: ProjectPaths, *patterns: str) -> None:
 
 
 def crash_at_merge_back(engine, *, after: str = "merge") -> None:
-    """Kill the host inside the isolated DONE arm, in one of its two windows.
+    """Kill the host inside the isolated DONE arm, in one of its three windows.
 
     `WorktreeFlow.integrate_unit`'s DONE arm runs merge -> carry -> latch, and each
     gap has its own recovery contract:
 
+    - ``"commit"``: after the DONE save, before `merge_local` (DW-385). The unit
+      commit exists on its mounted branch; no `unit-merge-started` row was written.
     - ``"merge"``: after `merge_local`, before `_carry_isolated_ledger_writes`. The
       branch landed and the worktree is gone; no ledger write happened.
     - ``"carry"``: after the whole carry, before `isolated_ledger_carried` is set
@@ -1946,10 +2220,18 @@ def crash_at_merge_back(engine, *, after: str = "merge") -> None:
     Replaces a method on the engine INSTANCE rather than monkeypatching the class.
     `WorktreeFlow` is handed `carry_isolated_ledger_writes=lambda task:
     self._carry_isolated_ledger_writes(task)`, a late-binding lambda, so instance
-    assignment is what the callback sees.
+    assignment is what the callback sees. ``"commit"`` replaces `merge_local` on
+    the engine's `WorktreeFlow` instance, which `integrate_unit` calls via `self`.
     """
-    if after not in ("merge", "carry"):
+    if after not in ("commit", "merge", "carry"):
         raise ValueError(f"unknown crash window: {after!r}")
+    if after == "commit":
+
+        def crash_before_merge(*_args, **_kwargs) -> None:
+            raise RuntimeError("host died after the DONE save, before the merge")
+
+        engine._worktree_flow.merge_local = crash_before_merge
+        return
     if after == "merge":
 
         def crash_before_carry(_task) -> None:
@@ -2246,6 +2528,11 @@ def escalated_run(
         restore_patch=restore_patch,
         sentinel_kind=sentinel_kind,
         worktree_path=worktree_path,
+        # the mount's mint-time identity (DW-446) when the caller built the mount
+        # first; None otherwise, which re-arm/resume backfill
+        worktree_identity=(
+            platform_util.root_identity_record(Path(worktree_path)) if worktree_path else None
+        ),
     )
     if with_session:
         task.sessions.append(
@@ -2264,4 +2551,90 @@ def escalated_run(
     )
     run_dir = project / ".bmad-loop" / "runs" / run_id
     save_state(run_dir, state)
+    # the run dir's mint-time identity (DW-446), as the composers record it
+    state.run_dir_identity = platform_util.root_identity_record(run_dir)
+    save_state(run_dir, state)
     return EscalatedRun(run_dir=run_dir, state=state, task=task)
+
+
+# DW-522: an in-place run paused on a story whose attempt committed above its
+# baseline — shared by the `rearm_for_reverify` (tests/test_runs.py) and
+# `resolve --reverify` (tests/test_cli.py) tests.
+_REVERIFY_KEY = "1-1-a"
+_REVERIFY_SPEC_REL = "_bmad-output/implementation-artifacts/1-1-a.md"
+_REVERIFY_SPEC_BYTES = (
+    b"---\r\ntitle: t\r\nstatus: in-review\r\n---\r\n\r\n## Intent\r\n\r\nbody\r\n"
+)
+
+
+def _reverify_run(tmp_path, *, phase="deferred", spec="live", env_fault_site=None):
+    """An in-place run paused on a story whose attempt committed above its baseline:
+    the reported shape (isolation none, rollback off). `phase` is the story's terminal
+    phase; `spec` is "live" (in the artifacts dir) or "stashed" (moved under the run
+    dir the way `Engine._stash_deferred_artifacts` moves it)."""
+    from bmad_loop.model import PAUSE_ESCALATION, Phase, SessionRecord
+
+    project = tmp_path / "proj"
+    config = project / "_bmad" / "bmm" / "config.yaml"
+    config.parent.mkdir(parents=True)
+    config.write_text(
+        "implementation_artifacts: '{project-root}/_bmad-output/implementation-artifacts'\n"
+        "planning_artifacts: '{project-root}/_bmad-output/planning-artifacts'\n",
+        encoding="utf-8",
+    )
+    (project / ".gitignore").write_text(".bmad-loop/\n", encoding="utf-8")
+    git(project, "init", "-q", "-b", "main")
+    git(project, "config", "user.email", "test@test")
+    git(project, "config", "user.name", "test")
+    git(project, "add", "-A")
+    git(project, "commit", "-q", "-m", "initial")
+    baseline = git(project, "rev-parse", "HEAD")
+    (project / "app.py").write_text("print('attempt')\n", encoding="utf-8")
+    git(project, "add", "app.py")
+    git(project, "commit", "-q", "-m", "attempt")
+
+    run_dir = project / ".bmad-loop" / "runs" / "r1"
+    spec_path = project / _REVERIFY_SPEC_REL
+    spec_path.parent.mkdir(parents=True)
+    if spec == "live":
+        spec_path.write_bytes(_REVERIFY_SPEC_BYTES)
+    else:
+        stash = runs.deferred_stash_path(run_dir, _REVERIFY_KEY, spec_path.name)
+        stash.parent.mkdir(parents=True)
+        stash.write_bytes(_REVERIFY_SPEC_BYTES)
+
+    task = StoryTask(
+        story_key=_REVERIFY_KEY,
+        epic=1,
+        phase=Phase.DEFERRED if phase == "deferred" else Phase.ESCALATED,
+        attempt=2,
+        review_cycle=1,
+        followup_reviews_spent=1,
+        baseline_commit=baseline,
+        baseline_untracked=[],
+        spec_file=_REVERIFY_SPEC_REL,
+        defer_reason="verify failed: e2e" if phase == "deferred" else None,
+        env_fault_site=env_fault_site,
+        salvage_refile_pending=True,
+        resolved_redrive=False,
+        board_advance_intended="review",
+    )
+    task.sessions.append(
+        SessionRecord(
+            task_id="1-1-a-dev-2", role="dev", status="completed", result_json={"status": "done"}
+        )
+    )
+    state = RunState(
+        run_id="r1",
+        project=str(project),
+        started_at="2026-10-01T10:00:00",
+        repo_root=str(project.resolve()),
+        paused_reason="manual recovery",
+        paused_stage=PAUSE_ESCALATION,
+        paused_story_key=_REVERIFY_KEY,
+        tasks={_REVERIFY_KEY: task},
+    )
+    save_state(run_dir, state)
+    state.run_dir_identity = platform_util.root_identity_record(run_dir)
+    save_state(run_dir, state)
+    return run_dir, spec_path

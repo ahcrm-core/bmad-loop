@@ -11,6 +11,7 @@ The g binding opens the policy.toml settings editor.
 
 from __future__ import annotations
 
+import os
 import shlex
 import subprocess
 import time
@@ -18,6 +19,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any, TypeVar
 
+from rich.markup import escape
 from rich.text import Text
 from textual import work
 from textual.app import App, SuspendNotSupported
@@ -38,6 +40,7 @@ from .. import (
 from ..adapters.multiplexer import MultiplexerError, mux_usable
 from ..journal import load_state, state_lock
 from ..model import (
+    PAUSE_ENVIRONMENT,
     PAUSE_EPIC_BOUNDARY,
     PAUSE_ESCALATION,
     PAUSE_PLAN_CHECKPOINT,
@@ -194,7 +197,8 @@ class BmadLoopApp(App[None]):
 
     def _guarded(self, go: Callable[[], None]) -> None:
         """Pre-launch guard mirroring the CLI: the git support floor refused first,
-        then the #414 isolation/repo_root conflict, then a clean worktree required,
+        then the #414 isolation/repo_root conflict (a project outside `repo_root`
+        under worktree isolation), then a clean code root (`repo_root`) required,
         plus a confirm when another engine is already live."""
         # First, in `cmd_run`'s own order, and for the reason that order exists: this
         # is a fact about the HOST, so every other answer here would be advice about
@@ -232,17 +236,33 @@ class BmadLoopApp(App[None]):
         # into their own typed error, so the two named here are the whole surface;
         # a raw `UnicodeDecodeError` would be a ValueError and escape.
         try:
-            conflict = bmadconfig.worktree_isolation_conflict(
-                bmadconfig.load_paths(self.project),
-                policy.load(self.project / POLICY_FILE).scm.isolation,
+            loaded = bmadconfig.load_paths(self.project)
+        except (bmadconfig.BmadConfigError, OSError):
+            loaded = None
+        try:
+            conflict = (
+                None
+                if loaded is None
+                else bmadconfig.worktree_isolation_conflict(
+                    loaded, policy.load(self.project / POLICY_FILE).scm.isolation
+                )
             )
-        except (bmadconfig.BmadConfigError, policy.PolicyError, OSError):
+        except (policy.PolicyError, OSError):
             conflict = None
         if conflict is not None:
             self.notify(conflict, severity="error")
             return
+        # The clean-tree gate probes the CODE root, as `cmd_run`/`cmd_sweep` do
+        # (`verify.worktree_clean(paths.repo_root, ...)`), so a `repo_root:` override
+        # whose checkout is dirty outside the project is refused here as it is there
+        # (DW-379). An unreadable config falls through to probing the project, for the
+        # fall-through reason above: the detached CLI re-reads the same file and fails
+        # loudly on it.
+        clean_root = loaded.repo_root if loaded is not None else self.project
         try:
-            if not verify.worktree_clean(self.project):
+            if not verify.worktree_clean(
+                clean_root, project=loaded.project if loaded is not None else None
+            ):
                 self.notify(
                     "git worktree is not clean — commit or stash first",
                     severity="error",
@@ -251,14 +271,17 @@ class BmadLoopApp(App[None]):
         except verify.GitError as e:
             self.notify(f"git check failed: {e}", severity="error")
             return
-        live = [
-            r.run_id for r in data.discover_runs(self.project) if _engine_possibly_live(r.run_dir)
-        ]
-        if live:
+        infos, listing_fault = data.discover_runs(self.project)
+        live = [r.run_id for r in infos if _engine_possibly_live(r.run_dir)]
+        if live or listing_fault is not None:
+            # DW-468: a run the listing could not read may be live too, so an
+            # incomplete listing asks rather than reading as "none live".
+            # Escaped: the modal body is markup, and a path in the fault is not.
+            unread = f"run listing incomplete: {escape(listing_fault)}\n" if listing_fault else ""
             self.push_screen(
                 ConfirmModal(
                     "another run may be live",
-                    f"live or unknown: {', '.join(live)}\n"
+                    f"live or unknown: {', '.join(live) or 'none readable'}\n{unread}"
                     "launching another engine on the same project may conflict.",
                     confirm_label="launch anyway",
                 ),
@@ -373,11 +396,19 @@ class BmadLoopApp(App[None]):
         modal at a time. Each answer is recorded so the next sweep acts on it
         (build -> bundle, close -> closed, keep-open -> recorded) without asking
         again. No tmux/engine needed — this only edits the ledger and store."""
-        pending = data.pending_missed_decisions(self.project)
-        if not pending:
+        missed = data.pending_missed_decisions(self.project)
+        if missed.fault is not None:
+            # DW-473: nothing could be read, which is not "nothing is pending".
+            self.notify(
+                f"could not read past sweeps' decisions: {missed.fault}",
+                severity="error",
+                markup=False,
+            )
+            return
+        if not missed.items:
             self.notify("no unanswered decisions from past sweeps")
             return
-        self._walk_decisions(list(pending), 0, 0)
+        self._walk_decisions(list(missed.items), 0, 0)
 
     def _walk_decisions(self, pending: list, idx: int, answered: int) -> None:
         if idx >= len(pending):
@@ -592,11 +623,21 @@ class BmadLoopApp(App[None]):
         except (OSError, KeyError, ValueError):
             self.notify(f"state for run {run_id} is unreadable", severity="error")
             return
+        if state.paused_stage == PAUSE_ENVIRONMENT:
+            # DW-523: nothing ran and nothing was charged — resume lifts it.
+            self.notify(
+                "an environment pause needs no resolve: fix the environment, then "
+                f"resume (`bmad-loop resume {run_id}`)",
+                severity="warning",
+            )
+            return
         if state.paused_stage != "escalation":
             self.notify(
                 "resolve is only available for a run paused at an escalation",
                 severity="warning",
             )
+            return
+        if self._deferred_pause_notified(run_id, state):
             return
         if _engine_possibly_live(run_dir):
             self.notify(f"run {run_id} may still be live — stop it first", severity="warning")
@@ -612,6 +653,24 @@ class BmadLoopApp(App[None]):
             ),
             lambda ok: self._launch_resolve(run_id) if ok else None,
         )
+
+    def _deferred_pause_notified(self, run_id: str, state: RunState) -> bool:
+        """Point a pause on a DEFERRED story at the CLI (DW-522) and say so.
+
+        A deferred story pauses at the escalation stage (manual recovery), but
+        there is no escalation to resolve: the resolve agent and the re-arm would
+        both re-drive it from scratch. Its kept work is re-verified by
+        `bmad-loop resolve --reverify`, which the TUI does not drive."""
+        story_key = state.paused_story_key
+        task = state.tasks.get(story_key) if story_key else None
+        if task is None or task.phase != Phase.DEFERRED:
+            return False
+        self.notify(
+            f"{story_key} was deferred, not escalated: run `bmad-loop resolve {run_id} "
+            f"--reverify` (re-verify kept work) or `bmad-loop resume {run_id}` (move on)",
+            severity="warning",
+        )
+        return True
 
     def _launch_resolve(self, run_id: str) -> None:
         """Open the interactive resolve agent for run_id in a ctl window and
@@ -656,7 +715,12 @@ class BmadLoopApp(App[None]):
             self._review_story_checkpoint(run_id, run_dir, state)
         elif stage == PAUSE_ESCALATION:
             self._review_escalation(run_id, run_dir, state)
-        elif stage in (PAUSE_SPEC_APPROVAL, PAUSE_EPIC_BOUNDARY, PAUSE_STORY_GATE):
+        elif stage in (
+            PAUSE_SPEC_APPROVAL,
+            PAUSE_EPIC_BOUNDARY,
+            PAUSE_STORY_GATE,
+            PAUSE_ENVIRONMENT,
+        ):
             self._review_gate(run_id, run_dir, state)
         else:
             self.notify(f"no review viewer for pause stage {stage!r}", severity="warning")
@@ -698,14 +762,21 @@ class BmadLoopApp(App[None]):
                 if spec_path is None:
                     self.notify("no spec file to reset for replan", severity="error")
                     return
-                self._do_replan(run_id, spec_path, self._paused_spec_root(state))
+                self._do_replan(
+                    run_id,
+                    spec_path,
+                    self._paused_spec_root(state),
+                    root_identity=self._paused_spec_root_identity(state),
+                )
 
         self.push_screen(modal, done)
 
     def _review_gate(self, run_id: str, run_dir: Path, state: RunState) -> None:
         label = widgets.pause_label(state.paused_stage or "")[0] or "gate"
         spec_path, spec_text, readable = (
-            (None, "", True) if state.paused_stage == PAUSE_STORY_GATE else self._paused_spec(state)
+            (None, "", True)
+            if state.paused_stage in (PAUSE_STORY_GATE, PAUSE_ENVIRONMENT)
+            else self._paused_spec(state)
         )
 
         def done(verb: str | None) -> None:
@@ -720,7 +791,9 @@ class BmadLoopApp(App[None]):
             # this arm even when the task carries a spec_file (DW-243: a sweep
             # bundle re-armed after a dev escalation keeps its spec_file, and its
             # intent-regeneration refusal pauses at this stage) — the repair steer
-            # is in the reason, which the spec viewer would hide.
+            # is in the reason, which the spec viewer would hide. An environment
+            # pause (DW-523) is the same shape: the failed probe and its remedy
+            # are the reason, and the only action is resume.
             subtitle = (
                 self._story_subtitle(state)
                 if state.paused_story_key
@@ -796,6 +869,8 @@ class BmadLoopApp(App[None]):
         self.push_screen(modal, done)
 
     def _review_escalation(self, run_id: str, run_dir: Path, state: RunState) -> None:
+        if self._deferred_pause_notified(run_id, state):
+            return
         story_key = state.paused_story_key or "?"
         task = state.tasks.get(story_key)
         expected_generation = task.generation if task is not None else None
@@ -894,7 +969,14 @@ class BmadLoopApp(App[None]):
             f"resume of {run_id} launched (control session {launch.ctl_session(self.project)})"
         )
 
-    def _do_replan(self, run_id: str, spec_path: Path, confine_root: Path) -> None:
+    def _do_replan(
+        self,
+        run_id: str,
+        spec_path: Path,
+        confine_root: Path,
+        *,
+        root_identity: os.stat_result | None = None,
+    ) -> None:
         """Request-replan: reset the planned spec to draft + strip its Auto Run
         Result, then resume — the next dispatch re-enters step-02 planning. Uses
         the same devcontract primitives the engine's repair path uses.
@@ -905,7 +987,12 @@ class BmadLoopApp(App[None]):
         that `_paused_spec` anchored the path on. `runs.task_spec_root`'s docstring
         carries the rationale — a `confine_root` that disagrees with the anchor is not
         REFUSED, it silently drops both writes to the plain no-follow arm and loses the
-        confined arm's O_NOFOLLOW walk (#593) with no signal at all."""
+        confined arm's O_NOFOLLOW walk (#593) with no signal at all.
+
+        `root_identity` pins `confine_root` when it is the run's worktree mount
+        (`_paused_spec_root_identity`, DW-423): a mount swapped for a link refuses the
+        reset with `UnconfinedWriteError` — the error notice below, no resume — rather
+        than landing the replan outside the repository."""
         # Guard a possibly-live engine BEFORE mutating the spec — a draft-reset +
         # strip under a still-running session would race its writes (the rearm path
         # already checks liveness first; match it so replan can't corrupt a live
@@ -927,7 +1014,9 @@ class BmadLoopApp(App[None]):
             self.notify(f"replan: no spec at {spec_path} — not resuming", severity="error")
             return
         try:
-            reset = devcontract.reset_spec_for_replan(spec_path, confine_root=confine_root)
+            reset = devcontract.reset_spec_for_replan(
+                spec_path, confine_root=confine_root, root_identity=root_identity
+            )
         except (OSError, UnicodeDecodeError, verify.FrontmatterWriteError) as e:
             # FrontmatterWriteError is not an OSError: a spec whose `status:` is a
             # block scalar or a flow mapping reads fine and fails the WRITE. It
@@ -1328,6 +1417,23 @@ class BmadLoopApp(App[None]):
             return runs.live_spec_root(task, state, self.project)
         return runs.rebase_recorded_project_path(Path(state.project), state, self.project)
 
+    def _paused_spec_root_identity(self, state: RunState) -> os.stat_result | None:
+        """The pin for `_paused_spec_root` (DW-423) — kept beside it so the root and its
+        identity stay one claim. `runs.live_spec_root_identity` answers it: the mount's
+        identity when the root is the worktree mount, `None` for the project (and for
+        the no-task arm, which is the project). Taken at the replan gesture, just
+        before the writes it pins. The mount identity is compared against the
+        mount's persisted mint-time record (`StoryTask.worktree_identity`, DW-446).
+        This replan pin is the observer path: it never writes or re-binds a record,
+        so a legacy paused run whose state predates it refuses the replan until a
+        `resume` or a re-arm has recorded it. A TUI-launched re-arm (`_do_rearm`)
+        goes through the locked `runs.rearm_escalation` and reconciles — backfill
+        and `st_dev` re-bind, `runs.reconcile_root_identities` — like any re-arm."""
+        task = self._paused_task(state)
+        if task:
+            return runs.live_spec_root_identity(task, state, self.project)
+        return None
+
     def _story_subtitle(self, state: RunState) -> Text:
         key = state.paused_story_key or "?"
         title = self._story_context(state, key)[0]
@@ -1573,14 +1679,17 @@ class BmadLoopApp(App[None]):
 
     @work(thread=True, group="lifecycle")
     def _delete_run_worker(self, run_id: str, run_dir: Path) -> None:
+        guard_notes: list[str] = []
         try:
-            runs.delete_run(self.project, run_dir)
+            runs.delete_run(self.project, run_dir, warn=guard_notes.append)
         except (OSError, runs.StateRootError, runs.LiveEngineError, runs.LiveSessionError) as e:
             # The modal's liveness sample is advisory. Surface authoritative
             # lifecycle refusals and lock/removal failures here rather than letting
             # them kill the worker thread or forgetting a run that still exists.
+            self._notify_guard_notes(guard_notes)
             self.call_from_thread(self.notify, f"delete failed: {e}", severity="error")
             return
+        self._notify_guard_notes(guard_notes)
         self.call_from_thread(self._dashboard.forget_run, run_id)
         self.call_from_thread(self.notify, f"run {run_id} deleted")
 
@@ -1612,15 +1721,28 @@ class BmadLoopApp(App[None]):
 
     @work(thread=True, group="lifecycle")
     def _archive_run_worker(self, run_id: str, run_dir: Path) -> None:
+        guard_notes: list[str] = []
         try:
-            dest = runs.archive_run(self.project, run_dir)
+            dest = runs.archive_run(self.project, run_dir, warn=guard_notes.append)
         except (OSError, runs.StateRootError, runs.LiveEngineError, runs.LiveSessionError) as e:
             # Same worker boundary as delete: report the authoritative transaction,
             # not the earlier modal sample.
+            self._notify_guard_notes(guard_notes)
             self.call_from_thread(self.notify, f"archive failed: {e}", severity="error")
             return
+        self._notify_guard_notes(guard_notes)
         self.call_from_thread(self._dashboard.forget_run, run_id)
         self.call_from_thread(self.notify, f"run {run_id} archived to {dest}")
+
+    def _notify_guard_notes(self, notes: list[str]) -> None:
+        # The #419 session guard's "could not ask the multiplexer" degrade
+        # (DW-466). Its default channel is stderr, which Textual captures for the
+        # app's whole run (see run_tui), so the workers hand delete_run /
+        # archive_run a sink and toast what it collected — after the call, never
+        # from inside it, which holds the run's state lock. Shown whether or not
+        # the removal then succeeded: the guard's verdict was unasked either way.
+        for note in notes:
+            self.call_from_thread(self.notify, note, severity="warning")
 
     def action_cleanup_sessions(self) -> None:
         if self._mux_missing():
@@ -1690,7 +1812,16 @@ class BmadLoopApp(App[None]):
         # One toast per registry, naming it: there is more than one legacy
         # registry (psmux's default, and any root this process displaced), and
         # the operator's next action is to open the one holding these.
-        for registry, names in runs.legacy_registry_leftovers(self.project).items():
+        leftovers, unverified = runs.legacy_registry_leftovers(self.project)
+        # DW-469: a registry that could not be asked is not one holding nothing.
+        for line in unverified:
+            self.call_from_thread(
+                self.notify,
+                f"legacy registry not checked for sessions left behind: {line}",
+                severity="warning",
+                markup=False,
+            )
+        for registry, names in leftovers.items():
             self.call_from_thread(
                 self.notify,
                 f"{len(names)} session(s) left in {registry} (not migrated): "

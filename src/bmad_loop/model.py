@@ -20,6 +20,8 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
+from .mountpaths import project_offset, rebased_project
+
 
 class Phase(StrEnum):
     PENDING = "pending"
@@ -63,6 +65,41 @@ PAUSE_STORY_GATE = "story-gate"
 # commit (skip-if-last). Both re-arm through the same resume path.
 PAUSE_PLAN_CHECKPOINT = "plan-checkpoint"
 PAUSE_STORY_CHECKPOINT = "story-checkpoint"
+# An `[environment] probe` failed right before a session dispatch (DW-523): the
+# environment, not the story, blocks the run, so nothing was charged or rolled
+# back and resume re-probes before dispatching. Reserved for the dispatch gate.
+PAUSE_ENVIRONMENT = "environment"
+
+# Where an environment fault was detected (DW-523), as recorded in
+# `StoryTask.env_fault_site`. A CLOSED vocabulary: `verify:<role>` — a verify
+# pass reported the env fault itself (a failed preflight probe, a declared
+# `[verify] env_fault_rc`, rc 126/127); `probe:decision:<role>` — a failure the
+# deciders would have charged (retry / defer) was re-probed and a probe failed;
+# `probe:claim:<role>` — a session claimed an environment fault and a probe
+# confirmed it; `probe:dispatch:<role>` — a probe failed before a session launch.
+ENV_FAULT_SITE_DISPATCH_PREFIX = "probe:dispatch:"
+ENV_FAULT_SITES = frozenset(
+    {
+        "verify:dev",
+        "verify:fix",
+        "verify:review",
+        "probe:decision:dev",
+        "probe:decision:fix",
+        "probe:decision:review",
+        "probe:decision:workflow",
+        "probe:claim:dev",
+        "probe:claim:fix",
+        "probe:claim:review",
+        "probe:claim:workflow",
+        f"{ENV_FAULT_SITE_DISPATCH_PREFIX}dev",
+        f"{ENV_FAULT_SITE_DISPATCH_PREFIX}review",
+    }
+)
+
+# The bound on a session's "Environment fault:" claim (DW-523): synthesized under
+# it by `devcontract` and re-applied by `escalation.env_fault_claim`, because a
+# third-party adapter's result document is not bound by the first-party writer.
+ENV_FAULT_CLAIM_LIMIT = 500
 
 # Reasons recorded in RunState.sweeps_refused (trigger -> reason). A CLOSED
 # vocabulary of short slugs, deliberately not a formatted exception: `bmad-loop
@@ -144,6 +181,12 @@ class SessionRecord:
     # the session's parsed result payload, persisted so a durably-saved
     # completed session is actionable on resume, not just forensics
     result_json: dict[str, Any] | None = None
+    # the plugin workflow (``<plugin>.<workflow>``) an injected workflow session
+    # ran; "" for the primary dev/fix/review sessions. A workflow declares its
+    # own role, so a `role="dev"` record is not necessarily the story's dev or
+    # fix session — lookups of the attempt's own result skip labeled records
+    # (DW-522). "" also for every record written before the field existed.
+    label: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -156,6 +199,7 @@ class SessionRecord:
             "transcript_path": self.transcript_path,
             "usage": self.usage.to_dict() if self.usage else None,
             "result_json": self.result_json,
+            "label": self.label,
         }
 
     @classmethod
@@ -171,6 +215,7 @@ class SessionRecord:
             transcript_path=d.get("transcript_path"),
             usage=TokenUsage.from_dict(usage) if usage else None,
             result_json=d.get("result_json"),
+            label=str(d.get("label", "") or ""),
         )
 
 
@@ -238,6 +283,25 @@ def _baseline_artifacts_from(raw: object) -> dict[str, list[int] | None] | None:
     return out
 
 
+def _identity_record_from(raw: object) -> tuple[int, int] | None:
+    """Rehydrate a mint-time root identity record (DW-446) from state.json: a
+    two-int ``[st_dev, st_ino]`` list. A pre-upgrade absent key, ``null``, or any
+    other shape reads as "no record" — on which every pin refuses rather than
+    degrading to an unpinned open — and never raises out of ``from_dict``."""
+    if not isinstance(raw, list):
+        return None
+    items: list[object] = list(raw)
+    # `bool` is an `int`; a `[true, 42]` is a mangled record, not an identity
+    ints = [v for v in items if isinstance(v, int) and not isinstance(v, bool)]
+    if len(items) == 2 and len(ints) == 2:
+        return (ints[0], ints[1])
+    return None
+
+
+def _identity_record_to(record: tuple[int, int] | None) -> list[int] | None:
+    return None if record is None else [record[0], record[1]]
+
+
 @dataclass
 class StoryTask:
     story_key: str
@@ -293,6 +357,41 @@ class StoryTask:
     # doubt. A later successful idempotent replay may release that doubt, but
     # must never release one inherited from another sweep phase.
     migration_ledger_doubt_owned: bool = False
+    # DW-405/407: whether the migrate task's latest escalation left from
+    # COMMITTING. ESCALATED erases the prior phase, and TRIAGE_VERIFY
+    # escalations carry the same marker and records, so this durable fact, read
+    # together with phase ESCALATED, grants a cycle-one resume the idempotent
+    # commit-tail retry. Re-stamped on every migrate escalation (a re-arm to
+    # PENDING may leave it set until then); pre-upgrade tasks default to no retry.
+    migration_commit_escalated: bool = False
+    # DW-429: whether the migrate task's latest escalation refused a READABLE
+    # rival ledger (a live value the restore would have overwritten). ESCALATED
+    # erases the prior phase and a rival is byte-indistinguishable from a
+    # session's partial rewrite, so this durable fact tells the generic
+    # ESCALATED restart to put the observed rival back after its reset instead
+    # of hard-resetting it away. Re-stamped on every migrate escalation, cleared
+    # when that restart leaves ESCALATED; pre-upgrade tasks default to no keep.
+    migration_ledger_rival: bool = False
+    # DW-436: whether the migrate task's validation-retry leg rejected a
+    # rewrite in the current attempt. That leg leaves TRIAGE_VERIFY with the
+    # marker but no rewrite record, the same shape as a corrupt record set, so
+    # this durable fact tells a marked TRIAGE_VERIFY resume to restore the
+    # baseline snapshot and redispatch instead of escalating. Set before the
+    # retry leg's reset, cleared on each redispatch and when a restart leaves
+    # for PENDING, re-stamped False on every migrate escalation; pre-upgrade
+    # tasks default to no latch (today's fail-closed escalation).
+    migration_rewrite_rejected: bool = False
+    # DW-317: stable identity of one migration completion, minted fresh in the
+    # same save that records DONE (a re-migration mints a new one). Hooks see it
+    # as ``ctx.delivery_id`` / ``BMAD_LOOP_DELIVERY_ID`` to deduplicate the
+    # at-least-once ``post_migrate`` delivery. None = pre-upgrade/no completion.
+    migration_delivery_id: str | None = None
+    # True from that DONE save until the ``sweep-migrated`` row is journaled and
+    # ``post_migrate`` has returned; a cycle-one resume replays while it is set.
+    migration_delivery_pending: bool = False
+    # The ``sweep-migrated`` row's counts (converted / entries_now / open_now),
+    # persisted with the identity so a replay needs no migrate-* record reads.
+    migration_delivery_counts: dict[str, int] | None = None
     baseline_commit: str | None = None
     # untracked, non-ignored paths present at baseline capture (repo-relative
     # posix). On rollback only paths NOT in this set are removed, so files the
@@ -334,6 +433,20 @@ class StoryTask:
     # the commit boundary. Same ledger, same isolation problem: a gitignored path
     # never merges out of the unit worktree, so the flip has to be re-applied.
     story_closes_intended: list[str] = field(default_factory=list)
+    # The seeded deferred-work ledger's text as provisioning laid it into this
+    # unit's worktree (DW-375), or None when no ledger seed was nominated (a
+    # tracked or out-of-tree ledger, or one the main checkout does not carry).
+    # Success-path teardown diffs the worktree ledger against it and journals
+    # whatever the engine-recorded writes above do not explain; persisted, like
+    # `pre_harvest_ledger`, so a resume replaying the merge still has it.
+    ledger_seed_text: str | None = None
+    # Every tracked hook config provisioning rewrote AND pinned skip-worktree in
+    # this unit's worktree (DW-368): worktree-relative path -> {"dialect", "text"},
+    # the text being exactly what was written. The pin hides a story's own edit to
+    # that file from `git add -A`, so success teardown compares the file on disk
+    # with this record (relay hooks ignored) and pauses instead of discarding an
+    # edit. A fresh provision overwrites it; persisted so a resume re-checks it.
+    pinned_config_rewrites: dict[str, dict[str, str]] = field(default_factory=dict)
     # The sprint-status stage `_post_dev_state_sync` REQUESTED for this story, or
     # None when it never ran (sweep bundles, stories mode, the legacy path). Same
     # isolation problem as the ledger payloads above, one file over: under
@@ -409,6 +522,16 @@ class StoryTask:
     # gone).
     operator_actions: list[str] = field(default_factory=list)
     defer_reason: str | None = None
+    # where the environment fault behind this task's escalation was detected
+    # (DW-523), one of `ENV_FAULT_SITES`; None = the escalation (if any) is not an
+    # environment fault. Set by `Engine._escalate_env` (directly, or through
+    # `Engine._escalate_outcome` for a verify env fault) and, for a
+    # `probe:dispatch:<role>` site on a NON-escalated task paused at
+    # `PAUSE_ENVIRONMENT`, by `Engine._pause_environment`; cleared by
+    # `runs.rearm_escalation` and `runs.adopt_escalated_branch` — a re-armed
+    # story starts with no fault on record — and by a resume whose re-probe
+    # passes (`Engine._take_env_dispatch_pause`). Survives the resume round-trip.
+    env_fault_site: str | None = None
     # the recovery ref this attempt's work was parked on by the last auto-rollback
     # — an `attempt-preserve/*` branch (commits above baseline) or, when the tree
     # was also dirty, the `refs/attempt-preserve-dirty/*` snapshot, which is
@@ -493,6 +616,27 @@ class StoryTask:
     # diff, and clears it once the corrected work commits. None = ordinary
     # from-scratch re-drive. Survives the resume serialization round-trip.
     restore_patch: str | None = None
+    # Latched by runs.adopt_escalated_branch (`bmad-loop resolve --adopt-branch`,
+    # DW-386): the operator vouched for an ESCALATED task's kept worktree branch, so
+    # the task was moved straight to COMMITTING. On resume, _finish_inflight's
+    # COMMITTING arm reads it to flip the spec to its terminal status and mirror the
+    # board before the ordinary finalize/merge. Cleared by _finalize_commit_phase on
+    # success, by runs.rearm_escalation, and by every re-escalation (Engine._escalate
+    # and WorktreeFlow.escalate_unit), so an ESCALATED task never carries it.
+    # Survives the resume serialization round-trip; deliberately absent from
+    # `documents.py`'s `--json` projection (schema 1).
+    adopt_pending: bool = False
+    # Latched by runs.rearm_for_reverify (`bmad-loop resolve --reverify`, DW-522): the
+    # operator fixed the environment and asked for the kept attempt product (HEAD plus
+    # the dirty tree) to be re-verified, so the task was moved straight to DEV_VERIFY
+    # without a dev session. The value names the phase the story was re-armed FROM —
+    # "deferred" or "escalated" — which `escalation.decide_reverify` reads to choose
+    # between DEFER and PAUSE on a failing replay. Any non-empty value means a replay
+    # is pending: an unknown value is kept raw rather than dropped, so a state.json
+    # from a newer version fails closed (replay, never a silent dev re-drive). ""
+    # = no reverify pending. Survives the resume serialization round-trip;
+    # deliberately absent from `documents.py`'s `--json` projection (schema 1).
+    reverify_from: str = ""
     # sweep bundles only: the deferred-work ids this task closes and the
     # rendered intent file handed to dev sessions
     dw_ids: list[str] = field(default_factory=list)
@@ -501,6 +645,19 @@ class StoryTask:
     # mounted worktree dir and branch, recorded so a paused/crashed run can
     # reconstruct or discard the in-flight worktree on resume.
     worktree_path: str = ""
+    # The mount's mint-time identity, ``(st_dev, st_ino)`` (DW-446): recorded by
+    # `worktree_flow.run_isolated` beside `worktree_path` before any session runs,
+    # and cleared wherever `worktree_path` is. The mount writers'
+    # `runs.mount_root_identity` compares the mount they open against it, so a
+    # mount — or an ancestor (`worktrees/`, `runs/<id>/`) — swapped for a link to
+    # a tree holding a real `<unit>` refuses. None — a pre-upgrade state.json, an
+    # unpinnable mount — refuses every pinned mount write until
+    # `runs.reconcile_root_identities` backfills it on resume/re-arm. That locked
+    # load never overwrites a non-None record, save one exception: a mount that
+    # still lstats as a real directory with the same `st_ino` and a renumbered
+    # `st_dev` (a reboot/remount) has its `st_dev` re-bound. Deliberately absent
+    # from `documents.py`'s `--json` projection (schema 1).
+    worktree_identity: tuple[int, int] | None = None
     branch: str = ""
     sessions: list[SessionRecord] = field(default_factory=list)
     tokens: TokenUsage = field(default_factory=TokenUsage)
@@ -537,7 +694,9 @@ class StoryTask:
             return
         raise KeyError(task_id)
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self, mount_project: Path | None = None) -> dict[str, Any]:
+        """``mount_project`` anchors the relative spec spellings: see
+        :meth:`_serialized_worktree_path`. ``RunState.to_dict`` passes each task's."""
         return {
             "story_key": self.story_key,
             "epic": self.epic,
@@ -551,6 +710,16 @@ class StoryTask:
             "salvage_refile_pending": self.salvage_refile_pending,
             "migration_recovery_format": self.migration_recovery_format,
             "migration_ledger_doubt_owned": self.migration_ledger_doubt_owned,
+            "migration_commit_escalated": self.migration_commit_escalated,
+            "migration_ledger_rival": self.migration_ledger_rival,
+            "migration_rewrite_rejected": self.migration_rewrite_rejected,
+            "migration_delivery_id": self.migration_delivery_id,
+            "migration_delivery_pending": self.migration_delivery_pending,
+            "migration_delivery_counts": (
+                dict(self.migration_delivery_counts)
+                if self.migration_delivery_counts is not None
+                else None
+            ),
             "baseline_commit": self.baseline_commit,
             "baseline_untracked": self.baseline_untracked,
             "baseline_artifacts": self.baseline_artifacts,
@@ -563,6 +732,8 @@ class StoryTask:
             "harvested_deferrals": self.harvested_deferrals,
             "bundle_closes_intended": self.bundle_closes_intended,
             "story_closes_intended": self.story_closes_intended,
+            "ledger_seed_text": self.ledger_seed_text,
+            "pinned_config_rewrites": deepcopy(self.pinned_config_rewrites),
             "board_advance_intended": self.board_advance_intended,
             "accepted_dev_session_index": self.accepted_dev_session_index,
             "harvest_carry_commit_pending": self.harvest_carry_commit_pending,
@@ -575,8 +746,10 @@ class StoryTask:
             "artifact_payload": deepcopy(self.artifact_payload),
             "artifact_publication_complete": self.artifact_publication_complete,
             "integration_attempt": deepcopy(self.integration_attempt),
-            "spec_file": self._serialized_worktree_path(self.spec_file),
-            "dispatched_spec_file": self._serialized_worktree_path(self.dispatched_spec_file),
+            "spec_file": self._serialized_worktree_path(self.spec_file, mount_project),
+            "dispatched_spec_file": self._serialized_worktree_path(
+                self.dispatched_spec_file, mount_project
+            ),
             "dispatched_spec_snapshot": (
                 base64.b64encode(self.dispatched_spec_snapshot).decode("ascii")
                 if self.dispatched_spec_snapshot is not None
@@ -585,6 +758,7 @@ class StoryTask:
             "commit_sha": self.commit_sha,
             "operator_actions": self.operator_actions,
             "defer_reason": self.defer_reason,
+            "env_fault_site": self.env_fault_site,
             "preserve_ref": self.preserve_ref,
             "preserve_partial": self.preserve_partial,
             "preserve_from_attempt": self.preserve_from_attempt,
@@ -594,32 +768,44 @@ class StoryTask:
             "plan_review_owed": self.plan_review_owed,
             "sentinel_kind": self.sentinel_kind,
             "restore_patch": self.restore_patch,
+            "adopt_pending": self.adopt_pending,
+            "reverify_from": self.reverify_from,
             "dw_ids": self.dw_ids,
             "bundle_file": self.bundle_file,
             "worktree_path": self.worktree_path,
+            "worktree_identity": _identity_record_to(self.worktree_identity),
             "branch": self.branch,
             "sessions": [s.to_dict() for s in self.sessions],
             "tokens": self.tokens.to_dict(),
             "token_budget_warned": self.token_budget_warned,
         }
 
-    def _serialized_worktree_path(self, path: str | None) -> str | None:
-        """Persist a worktree-local spec path relative to its mounted root.
+    def _serialized_worktree_path(
+        self, path: str | None, mount_project: Path | None = None
+    ) -> str | None:
+        """Persist a worktree-local spec path relative to its mount PROJECT.
 
         Both the accepted/result spec and the attempt-owned dispatched spec use
         this one normalization path so their state.json representations cannot
-        drift. In-place and outside-worktree paths remain verbatim.
+        drift. In-place and outside-mount-project paths remain verbatim.
+
+        A relative spelling is always project-relative (DW-379): ``mount_project`` is
+        ``ProjectPaths.rebased(<mount>).project`` — the mount root itself unless the
+        project is nested inside ``repo_root`` (then ``<mount>/<offset>``). It
+        defaults to ``worktree_path``, which is exactly that answer for the default
+        config, so a state.json written before the offset existed keeps its meaning.
         """
         if not path or not self.worktree_path:
             return path
+        anchor = mount_project if mount_project is not None else Path(self.worktree_path)
         try:
             # as_posix: persist the relative path with forward slashes so state.json
             # stays portable across OSes (matches the in-worktree spec layout).
-            return Path(path).relative_to(self.worktree_path).as_posix()
+            return Path(path).relative_to(anchor).as_posix()
         except ValueError:
-            return path  # spec lives outside the worktree; keep absolute
+            return path  # spec lives outside the mount project; keep absolute
 
-    def release_spec_paths_from_mount(self) -> None:
+    def release_spec_paths_from_mount(self, mount_project: Path | None = None) -> None:
         """Give up the spec ownership a mount being DISCARDED carried.
 
         The counterpart to :meth:`rebase_spec_paths_on`, and deliberately not its
@@ -642,16 +828,17 @@ class StoryTask:
         unbound attempt is a legal state. `_record_dev_spec` cannot repair it either
         — it no-ops while `spec_file` is set.
 
-        Uses the same relativization as `to_dict`, so the discarded-mount spelling
-        and the persisted one cannot drift, which also means a spec OUTSIDE the mount
-        stays verbatim: it was never the mount's to give up. MUST be called while
-        `worktree_path` still names the mount.
+        Uses the same relativization as `to_dict` — ``mount_project`` is the same
+        anchor, defaulting to `worktree_path` — so the discarded-mount spelling and
+        the persisted one cannot drift, which also means a spec OUTSIDE the mount
+        project stays verbatim: it was never the mount's to give up. MUST be called
+        while `worktree_path` still names the mount.
         """
         self.dispatched_spec_file = None
         self.dispatched_spec_snapshot = None
-        self.spec_file = self._serialized_worktree_path(self.spec_file)
+        self.spec_file = self._serialized_worktree_path(self.spec_file, mount_project)
 
-    def release_mount_owned_state(self) -> None:
+    def release_mount_owned_state(self, mount_project: Path | None = None) -> None:
         """Give up EVERYTHING a mount owned: its spec ownership and the measurements
         taken inside it.
 
@@ -674,9 +861,10 @@ class StoryTask:
         no-op instead of a probe of the wrong tree.
 
         MUST be called while `worktree_path` still names the mount — the spec
-        relativization is measured against it.
+        relativization is measured against it (or against ``mount_project``, the
+        mount's project, when the caller knows it: see `release_spec_paths_from_mount`).
         """
-        self.release_spec_paths_from_mount()
+        self.release_spec_paths_from_mount(mount_project)
         self.artifact_baseline = None
         self.artifact_destination = None
         self.artifact_source_digests = None
@@ -708,8 +896,9 @@ class StoryTask:
         Idempotent: an absolute value is already anchored (a spec outside the mount
         is persisted verbatim) and passes through untouched, so re-running this
         against the same root cannot double-join. `root` is the tree the values were
-        persisted relative to — `task.worktree_path` — never the caller's cwd or
-        project.
+        persisted relative to — the MOUNT PROJECT, ``ProjectPaths.rebased(
+        task.worktree_path).project`` (`task.worktree_path` itself unless the project
+        is nested, DW-379) — never the caller's cwd or the main project.
         """
         self.spec_file = _rebased_on(self.spec_file, root)
         self.dispatched_spec_file = _rebased_on(self.dispatched_spec_file, root)
@@ -771,6 +960,20 @@ class StoryTask:
             salvage_refile_pending=bool(d.get("salvage_refile_pending", False)),
             migration_recovery_format=int(d.get("migration_recovery_format", 0)),
             migration_ledger_doubt_owned=bool(d.get("migration_ledger_doubt_owned", False)),
+            migration_commit_escalated=bool(d.get("migration_commit_escalated", False)),
+            migration_ledger_rival=bool(d.get("migration_ledger_rival", False)),
+            migration_rewrite_rejected=bool(d.get("migration_rewrite_rejected", False)),
+            migration_delivery_id=(
+                str(d["migration_delivery_id"])
+                if d.get("migration_delivery_id") is not None
+                else None
+            ),
+            migration_delivery_pending=bool(d.get("migration_delivery_pending", False)),
+            migration_delivery_counts=(
+                {str(k): int(v) for k, v in d["migration_delivery_counts"].items()}
+                if d.get("migration_delivery_counts") is not None
+                else None
+            ),
             baseline_commit=d.get("baseline_commit"),
             baseline_untracked=(
                 [str(p) for p in d["baseline_untracked"]]
@@ -799,6 +1002,13 @@ class StoryTask:
             harvested_deferrals=[deepcopy(dict(item)) for item in d.get("harvested_deferrals", [])],
             bundle_closes_intended=[str(i) for i in d.get("bundle_closes_intended", [])],
             story_closes_intended=[str(i) for i in d.get("story_closes_intended", [])],
+            ledger_seed_text=(
+                str(d.get("ledger_seed_text")) if d.get("ledger_seed_text") is not None else None
+            ),
+            pinned_config_rewrites={
+                str(rel): {str(k): str(v) for k, v in dict(entry).items()}
+                for rel, entry in dict(d.get("pinned_config_rewrites") or {}).items()
+            },
             board_advance_intended=(
                 str(d["board_advance_intended"])
                 if d.get("board_advance_intended") is not None
@@ -829,6 +1039,7 @@ class StoryTask:
             commit_sha=d.get("commit_sha"),
             operator_actions=[str(a) for a in d.get("operator_actions", [])],
             defer_reason=d.get("defer_reason"),
+            env_fault_site=d.get("env_fault_site"),
             preserve_ref=d.get("preserve_ref"),
             preserve_partial=bool(d.get("preserve_partial", False)),
             preserve_from_attempt=bool(d.get("preserve_from_attempt", False)),
@@ -838,14 +1049,57 @@ class StoryTask:
             plan_review_owed=bool(d.get("plan_review_owed", False)),
             sentinel_kind=str(d.get("sentinel_kind", "")),
             restore_patch=d.get("restore_patch"),
+            adopt_pending=bool(d.get("adopt_pending", False)),
+            reverify_from=str(d.get("reverify_from", "") or ""),
             dw_ids=[str(i) for i in d.get("dw_ids", [])],
             bundle_file=d.get("bundle_file"),
             worktree_path=str(d.get("worktree_path", "")),
+            worktree_identity=_identity_record_from(d.get("worktree_identity")),
             branch=str(d.get("branch", "")),
             sessions=[SessionRecord.from_dict(s) for s in d.get("sessions", [])],
             tokens=TokenUsage.from_dict(d.get("tokens", {})),
             token_budget_warned=bool(d.get("token_budget_warned", False)),
         )
+
+
+# Sites whose fault fired AFTER a session's own verdict: the decision seam re-probed a
+# failure the deciders were about to charge, or a session's claim was confirmed —
+# both reached for crashed and timed-out sessions too (a third-party adapter's
+# non-completed result can carry a claim). Only a COMPLETED session left a product
+# worth re-verifying there; a crashed or timed-out one did not, so its escalation
+# needs a plain re-arm (a dev re-drive), not a replay over an earlier record. All map
+# to the `dev` record role: `Engine._fix_phase` dispatches its repair sessions under
+# the dev adapter, so a fix session is recorded as `role="dev"` like the attempt it
+# repairs.
+_REVERIFY_DECISION_SITE_ROLES = {
+    "probe:decision:dev": "dev",
+    "probe:decision:fix": "dev",
+    "probe:claim:dev": "dev",
+    "probe:claim:fix": "dev",
+}
+
+
+def env_fault_site_reverifiable(task: StoryTask) -> bool:
+    """Whether an ESCALATED task's recorded environment fault leaves a product that
+    `resolve --reverify` can replay verify against (DW-522).
+
+    True for every site in `ENV_FAULT_SITES` except the dispatch sites
+    (`probe:dispatch:*`): those fired before a session ran, so there is nothing to
+    re-verify. `probe:decision:dev` / `probe:decision:fix` and `probe:claim:dev` /
+    `probe:claim:fix` additionally require the role's LATEST session record (plugin
+    workflow sessions excluded) to be `completed` — the seam re-probes crashed and timed-out sessions too, and those
+    produced no verifiable attempt. False for no
+    site, and for any value outside the closed vocabulary (fail closed)."""
+    site = task.env_fault_site
+    if site is None or site not in ENV_FAULT_SITES:
+        return False
+    if site.startswith(ENV_FAULT_SITE_DISPATCH_PREFIX):
+        return False
+    role = _REVERIFY_DECISION_SITE_ROLES.get(site)
+    if role is None:
+        return True
+    latest = next((s for s in reversed(task.sessions) if s.role == role and not s.label), None)
+    return latest is not None and latest.status == "completed"
 
 
 @dataclass
@@ -877,6 +1131,27 @@ class RunState:
     # row that names no root. Deliberately absent from `documents.py`'s `--json`
     # projection (schema 1), like `rearmed` / `resolved_redrive`.
     code_root_restamp_pending: bool = False
+    # One-resume latch for `bmad-loop resume --accept-baseline` (DW-371). Written
+    # True or False by `cli._prepare_resume_locked` on EVERY resume, so a plain,
+    # TUI, or `resolve` re-arm resume clears a stale latch; the engine also clears
+    # it once in-flight recovery returns normally. While set, the restart arms
+    # re-stamp each restarted in-place task's baseline from the current checkout
+    # BEFORE the rollback, so commits made while the run was down become the new
+    # baseline instead of being parked and reset over. Deliberately absent from
+    # `documents.py`'s `--json` projection (schema 1).
+    accept_baseline: bool = False
+    # The run dir's mint-time identity, ``(st_dev, st_ino)`` (DW-446): recorded by
+    # `runsetup.compose_run`/`compose_sweep` from the claim that minted the dir.
+    # `Journal.write_verify_stream` compares the run dir it opens against it, so
+    # `runs/` or `runs/<id>/` swapped for a link to a tree holding a real `<id>/`
+    # refuses. None — a pre-upgrade state.json, an unpinnable or zero-inode claim
+    # — refuses the verify stream (on the win32 arm too, which before DW-446 wrote
+    # through a zero-inode run dir) until `runs.reconcile_root_identities`
+    # backfills it on resume/re-arm; a zero-inode run dir never backfills. A
+    # non-None record is never overwritten except the locked `st_dev` re-bind
+    # (same `st_ino`, still a real directory). Deliberately absent from
+    # `documents.py`'s `--json` projection (schema 1).
+    run_dir_identity: tuple[int, int] | None = None
     policy_snapshot: dict[str, Any] = field(default_factory=dict)
     # SECONDARY copy of the host-exec baseline (#498) — runsetup.config_digest over
     # the agent-writable config that reaches HOST code execution: verify commands,
@@ -1040,6 +1315,28 @@ class RunState:
         rather than to a path that does not exist."""
         return Path(self.repo_root or self.project)
 
+    def mount_project(self, task: StoryTask) -> Path | None:
+        """The mount project of ``task``'s recorded mount, or None without one.
+
+        ``ProjectPaths.rebased(<mount>).project`` recomputed from what this state
+        records — ``project`` and :attr:`code_root` — through the one shared
+        definition, :func:`mountpaths.rebased_project`: the mount itself unless the
+        project is nested inside the code root (DW-379). The anchor every relative
+        spec spelling of that task is persisted against and read back from.
+
+        A recorded pair that looks DISJOINT answers the mount itself, the pre-DW-379
+        anchor. No mount is ever made for a disjoint layout (worktree isolation refuses
+        it), so a recorded mount beside such a pair means the recorded spellings went
+        stale — a project moved in the default config keeps its launch-time `project`
+        while resume re-stamps `repo_root` — and the default config's answer is the
+        mount root."""
+        if not task.worktree_path:
+            return None
+        mount = Path(task.worktree_path)
+        if project_offset(Path(self.project), self.code_root) is None:
+            return mount
+        return rebased_project(Path(self.project), self.code_root, mount)
+
     def handled_keys(self) -> set[str]:
         """Story keys this run already drove to a terminal phase."""
         return {k for k, t in self.tasks.items() if t.terminal}
@@ -1077,6 +1374,8 @@ class RunState:
             "project": self.project,
             "repo_root": self.repo_root,
             "code_root_restamp_pending": self.code_root_restamp_pending,
+            "accept_baseline": self.accept_baseline,
+            "run_dir_identity": _identity_record_to(self.run_dir_identity),
             "started_at": self.started_at,
             "policy_snapshot": self.policy_snapshot,
             "trusted_config_digest": self.trusted_config_digest,
@@ -1106,7 +1405,7 @@ class RunState:
             "sweeps_refused": self.sweeps_refused,
             "target_branch": self.target_branch,
             "plugin_shared": self.plugin_shared,
-            "tasks": {k: t.to_dict() for k, t in self.tasks.items()},
+            "tasks": {k: t.to_dict(self.mount_project(t)) for k, t in self.tasks.items()},
         }
 
     @classmethod
@@ -1116,6 +1415,8 @@ class RunState:
             project=d["project"],
             repo_root=str(d.get("repo_root", "")),
             code_root_restamp_pending=bool(d.get("code_root_restamp_pending", False)),
+            accept_baseline=bool(d.get("accept_baseline", False)),
+            run_dir_identity=_identity_record_from(d.get("run_dir_identity")),
             started_at=d["started_at"],
             policy_snapshot=d.get("policy_snapshot", {}),
             trusted_config_digest=str(d.get("trusted_config_digest", "")),
@@ -1157,8 +1458,9 @@ class VerifyOutcome:
     # fixable failures carry concrete evidence (failing command output) that a
     # feedback-driven repair session can act on; non-fixable retries start over
     fixable: bool = False
-    # the failure is the run environment's, not the story's (verify command
-    # not found / not executable): no repair session can fix it and every
+    # the failure is the run environment's, not the story's (a probe failed, a
+    # verify command could not run or declared one — `env_fault_cause` says
+    # which): no repair session can fix it and every
     # story shares the same commands, so it must never charge attempt budgets
     env_fault: bool = False
     # a session deliberately contradicted a state the orchestrator had already
@@ -1242,6 +1544,13 @@ class VerifyOutcome:
     # (`bundle-artifact-only-accepted`'s `count`). `None` whenever no receipt was
     # accepted, including on every non-bundle leg.
     artifact_only_residue: int | None = None
+    # WHY an `env_fault` outcome is one (DW-523), so the pause text can name the
+    # cause instead of guessing it. "" whenever `env_fault` is False. Vocabulary:
+    # "probe" (an [environment] probe failed, no [verify] command ran),
+    # "declared-rc" (a command exited with `[verify] env_fault_rc`), "shell-rc"
+    # (rc 126/127), "cmd" (win32 cmd.exe could not run the command), "spawn"
+    # (the command could not be started at all).
+    env_fault_cause: str = ""
 
     @classmethod
     def passed(
@@ -1273,6 +1582,7 @@ class VerifyOutcome:
         severity: str = "CRITICAL",
         env_fault: bool = False,
         contradiction: bool = False,
+        env_fault_cause: str = "",
     ) -> "VerifyOutcome":
         return cls(
             ok=False,
@@ -1280,6 +1590,7 @@ class VerifyOutcome:
             severity=severity,
             env_fault=env_fault,
             contradiction=contradiction,
+            env_fault_cause=env_fault_cause,
         )
 
     @property

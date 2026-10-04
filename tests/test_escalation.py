@@ -1,6 +1,9 @@
 """Unit tests for the dev/review retry-budget decisions — specifically the
 resolved-escalation guard that re-escalates instead of silently deferring."""
 
+import dataclasses
+import os
+
 import pytest
 
 from bmad_loop import escalation
@@ -11,12 +14,14 @@ from bmad_loop.escalation import (
     critical_escalations,
     critical_session_reason,
     decide_dev,
+    decide_reverify,
     decide_review_session,
     display_critical_reason,
+    display_pause_reason,
     preference_escalations,
     review_retry_or_exhaust,
 )
-from bmad_loop.model import StoryTask
+from bmad_loop.model import PAUSE_ESCALATION, PAUSE_STORY_GATE, RunState, StoryTask
 from bmad_loop.policy import LimitsPolicy, NotifyPolicy, Policy, ReviewPolicy
 from bmad_loop.verify import VerifyOutcome
 
@@ -262,6 +267,81 @@ def test_no_work_reason_keeps_the_lost_session_suffix():
     assert "no work produced" not in review.reason
 
 
+_PARKED_EVIDENCE = "Notification(permission_prompt) -> PermissionPrompt"
+
+
+@pytest.mark.parametrize("attempt", [1, 2])  # budget left, then spent
+def test_dev_parked_session_pauses_whatever_the_budget(attempt):
+    """DW-348/DW-350: a session the adapter ended parked (the CLI was waiting on a
+    human, so the stall nudge was withheld) PAUSEs instead of RETRYing into the
+    same prompt — with budget left, and ahead of exhaustion.
+
+    ABLATION: delete the `parked` arm in `decide_dev` and the budget-left row
+    RETRYs, the spent row DEFERs."""
+    parked = SessionResult(status="stalled", parked=True, parked_evidence=_PARKED_EVIDENCE)
+    decision = decide_dev(_task(attempt=attempt), parked, None, POLICY)
+    assert decision.action == Action.PAUSE
+    assert decision.reason.startswith("parked: dev session stalled (")
+    assert _PARKED_EVIDENCE in decision.reason
+    assert "the stall nudge was withheld" in decision.reason
+
+
+def test_dev_env_fault_outranks_parked():
+    both = SessionResult(
+        status="stalled",
+        env_fault=True,
+        env_fault_evidence="API Error: ETIMEDOUT",
+        parked=True,
+        parked_evidence=_PARKED_EVIDENCE,
+    )
+    decision = decide_dev(_task(attempt=1), both, None, POLICY)
+    assert decision.action == Action.PAUSE
+    assert decision.reason.startswith("environment fault: dev session stalled")
+
+
+def test_dev_parked_outranks_no_work():
+    """A named prompt explains the silence better than the silence does: the
+    parked arm is tested before the #727 `produced_work=False` arm."""
+    both = SessionResult(
+        status="stalled", parked=True, parked_evidence=_PARKED_EVIDENCE, produced_work=False
+    )
+    decision = decide_dev(_task(attempt=1), both, None, POLICY)
+    assert decision.reason.startswith("parked: dev session stalled")
+    assert "no work produced" not in decision.reason
+
+
+def test_parked_reason_keeps_the_lost_session_suffix_and_has_a_fallback():
+    """Composed over `session_failure_reason` (#489), and never an empty
+    parenthetical when the adapter kept no evidence string."""
+    result = SessionResult(status="stalled", parked=True)
+    assert escalation.parked_pause_reason("fix", result) == (
+        "parked: fix session stalled (parked-session signal; the CLI was waiting on "
+        "a human — the stall nudge was withheld so it could not answer the prompt)"
+    )
+    vanished = SessionResult(status="crashed", parked=True, session_vanished=True)
+    assert "multiplexer no longer reports the session" in escalation.parked_pause_reason(
+        "dev", vanished
+    )
+
+
+def test_review_parked_session_pauses_instead_of_charging_a_cycle():
+    """ABLATION: delete the `parked` arm in `decide_review_session` and this
+    RETRYs a review cycle."""
+    parked = SessionResult(status="stalled", parked=True, parked_evidence=_PARKED_EVIDENCE)
+    decision = decide_review_session(_task(attempt=1), parked, POLICY)
+    assert decision.action == Action.PAUSE
+    assert decision.reason.startswith("parked: review session stalled")
+
+
+def test_review_env_fault_outranks_parked():
+    both = SessionResult(
+        status="stalled", env_fault=True, parked=True, parked_evidence=_PARKED_EVIDENCE
+    )
+    decision = decide_review_session(_task(attempt=1), both, POLICY)
+    assert decision.action == Action.PAUSE
+    assert decision.reason.startswith("environment fault: review session stalled")
+
+
 def test_dev_plain_noncompleted_still_retries_with_budget():
     """Guard pin: a NON-env-fault timeout with budget left still RETRYs — the
     env-fault branch must not swallow ordinary transient failures."""
@@ -345,6 +425,64 @@ def test_review_exhausted_reescalates_resolved_redrive():
     decision = decide_review_session(task, crashed, POLICY)
     assert decision.action == Action.PAUSE
     assert "re-escalating instead of deferring" in decision.reason
+
+
+def test_exhausted_decisions_carry_budget_exhausted():
+    """Every action `_exhausted_action` drives is marked `budget_exhausted`
+    (DW-523), so the engine's environment seam re-probes before it lands; a RETRY
+    and a non-budget PAUSE stay unmarked. Ablate any one `budget_exhausted=True`
+    and its row reddens."""
+    crashed = SessionResult(status="crashed")
+    exhausted = {
+        "dev verify defer": decide_dev(_task(attempt=2), COMPLETED, FAILING, POLICY),
+        "dev session defer": decide_dev(_task(attempt=2), crashed, None, POLICY),
+        "dev resolved-redrive pause": decide_dev(
+            _task(attempt=2, resolved_redrive=True), COMPLETED, FAILING, POLICY
+        ),
+        "review_exhausted": escalation.review_exhausted(_task(), "harvest unreadable"),
+        "review budget spent": decide_review_session(_task(review_cycle=2), crashed, POLICY),
+        "on_timeout=defer": decide_review_session(
+            _task(review_cycle=1), SessionResult(status="timeout"), _policy("defer")
+        ),
+    }
+    for name, decision in exhausted.items():
+        assert decision.action in (Action.DEFER, Action.PAUSE), name
+        assert decision.budget_exhausted is True, name
+        assert decision.env_site is None, name  # only the engine seam sets it
+    assert exhausted["dev resolved-redrive pause"].action == Action.PAUSE
+
+    charged_retries = (
+        decide_dev(_task(attempt=1), COMPLETED, FAILING, POLICY),
+        decide_dev(_task(attempt=1), crashed, None, POLICY),
+        decide_review_session(_task(review_cycle=1), crashed, POLICY),
+    )
+    for decision in charged_retries:
+        assert decision.action == Action.RETRY
+        assert decision.budget_exhausted is False
+    critical = VerifyOutcome.escalate("rc=127", env_fault=True)
+    assert decide_dev(_task(attempt=2), COMPLETED, critical, POLICY).budget_exhausted is False
+
+
+def test_env_fault_claim_reader_is_total():
+    """Only a mapping's non-blank ``env_fault_claim`` string is a claim —
+    stripped and bounded; anything else (a non-mapping document, a missing,
+    non-string or blank value) reads as no claim and never raises."""
+    for document in (
+        None,
+        {},
+        [],
+        "Environment fault: db down",
+        7,
+        {"env_fault_claim": None},
+        {"env_fault_claim": 7},
+        {"env_fault_claim": ["db down"]},
+        {"env_fault_claim": ""},
+        {"env_fault_claim": " \n\t "},
+    ):
+        assert escalation.env_fault_claim(document) is None
+    assert escalation.env_fault_claim({"env_fault_claim": "  db down \n"}) == "db down"
+    bounded = escalation.env_fault_claim({"env_fault_claim": "x" * 2000})
+    assert bounded == "x" * escalation.ENV_FAULT_CLAIM_LIMIT
 
 
 # ------------------------------- review.on_timeout routing (#271)
@@ -434,3 +572,130 @@ def test_review_retry_or_exhaust_helper_matches_budget_semantics():
     assert review_retry_or_exhaust(_task(review_cycle=2), POLICY, "r").action == Action.DEFER
     latched = review_retry_or_exhaust(_task(review_cycle=2, resolved_redrive=True), POLICY, "r")
     assert latched.action == Action.PAUSE
+
+
+# ------------------------------------------ pause reasons shaped at display (DW-491)
+
+# A multi-line reason carrying an ESC byte, e.g. a `({error})` a RunPaused builder
+# interpolated raw: displayed, its second line must not land as a loose line.
+_MULTILINE_REASON = "ledger refused (fatal: x\x1b[31m\nhint: y)"
+_SHAPED_REASON = "ledger refused (fatal: x\\x1b[31m ⏎ hint: y)"
+
+
+def _paused_state(reason: str, stage: str, task: StoryTask | None = None) -> RunState:
+    state = RunState(run_id="r1", project="/p", started_at="now")
+    state.paused_reason = reason
+    state.paused_stage = stage
+    if task is not None:
+        state.tasks[task.story_key] = task
+        state.paused_story_key = task.story_key
+    return state
+
+
+@pytest.mark.parametrize("stage", [PAUSE_STORY_GATE, PAUSE_ESCALATION])
+def test_display_pause_reason_shapes_an_esc_and_newline_reason(stage):
+    """`display_pause_reason` folds a reason's line breaks into `` ⏎ `` segments and
+    escapes its control characters, so `status` and the TUI print one line; the
+    persisted reason stays raw (DW-491).
+
+    Ablation: drop the `notice_line` around the reason and the raw ESC and line
+    break come back."""
+    state = _paused_state(_MULTILINE_REASON, stage)
+
+    assert display_pause_reason(state) == _SHAPED_REASON
+    assert state.paused_reason == _MULTILINE_REASON
+
+
+def test_display_pause_reason_shapes_the_recovery_trail():
+    """The escalation recovery trail is a path, shaped like the reason (DW-491).
+
+    Ablation: drop the `notice_line` around the source and the raw line break
+    lands in the trail."""
+    task = StoryTask(story_key="1-1-a", epic=1, spec_file="/p/spec\nx\x1b.md")
+    state = _paused_state("CRITICAL escalation from dev session: d", PAUSE_ESCALATION, task)
+
+    # `task_spec_path` renders the trail with the platform separator.
+    trail = f"{os.sep}p{os.sep}spec ⏎ x\\x1b.md"
+    assert display_pause_reason(state) == (
+        f"CRITICAL escalation from dev session: d [recovery trail: {trail}]"
+    )
+
+
+@pytest.mark.parametrize("stage", [PAUSE_STORY_GATE, PAUSE_ESCALATION])
+def test_display_pause_reason_keeps_a_plain_reason_unchanged(stage):
+    reason = "CRITICAL escalation from dev session: needs a human — resolve it"
+    assert display_pause_reason(_paused_state(reason, stage)) == reason
+
+
+# ---------------------------------------------------------- decide_reverify (DW-522)
+
+
+def _reverify_task(origin: str = "deferred", *, resolved_redrive: bool = False) -> StoryTask:
+    return StoryTask(
+        story_key="1-1-a", epic=1, reverify_from=origin, resolved_redrive=resolved_redrive
+    )
+
+
+def test_decide_reverify_proceeds_on_ok():
+    for origin in ("deferred", "escalated"):
+        decision = decide_reverify(_reverify_task(origin), VerifyOutcome.passed())
+        assert decision.action == Action.PROCEED
+        assert decision.reason == ""
+
+
+def test_decide_reverify_pauses_on_env_fault():
+    """A still-broken environment re-pauses even a deferred origin — deferring it
+    again would charge the story for the environment once more.
+
+    Ablation, performed: drop the `outcome.env_fault` conjunct in `decide_reverify`
+    and this reddens (the deferred origin DEFERs)."""
+    outcome = VerifyOutcome.escalate("verify environment fault (rc=75): e2e", env_fault=True)
+    # `escalate` carries a severity, which would PAUSE on its own; strip it so the
+    # env-fault conjunct is the only thing that can pause here
+    outcome = dataclasses.replace(outcome, severity="")
+    decision = decide_reverify(_reverify_task("deferred"), outcome)
+    assert decision.action == Action.PAUSE
+    assert decision.reason.startswith("reverify failed: verify environment fault")
+
+
+def test_decide_reverify_pauses_on_a_non_retryable_failure():
+    outcome = VerifyOutcome.escalate("contract violated")
+    decision = decide_reverify(_reverify_task("deferred"), outcome)
+    assert decision.action == Action.PAUSE
+
+
+def test_decide_reverify_defers_a_deferred_origin():
+    decision = decide_reverify(
+        _reverify_task("deferred"), VerifyOutcome.retry("e2e failed", fixable=True)
+    )
+    assert decision.action == Action.DEFER
+    assert decision.reason == "reverify failed: e2e failed"
+    assert decision.budget_exhausted is False  # nothing was charged
+
+
+def test_decide_reverify_reescalates_an_escalated_origin():
+    decision = decide_reverify(_reverify_task("escalated"), VerifyOutcome.retry("e2e failed"))
+    assert decision.action == Action.PAUSE
+    assert decision.reason == "reverify failed: e2e failed"
+
+
+def test_decide_reverify_reescalates_a_resolved_redrive():
+    """A resolved-escalation re-drive must never downgrade to deferred work, the
+    `_exhausted_action` rule.
+
+    Ablation, performed: drop the `not task.resolved_redrive` conjunct and this
+    reddens."""
+    decision = decide_reverify(
+        _reverify_task("deferred", resolved_redrive=True), VerifyOutcome.retry("e2e failed")
+    )
+    assert decision.action == Action.PAUSE
+
+
+def test_decide_reverify_never_retries():
+    for origin in ("deferred", "escalated", "unknown-future-value"):
+        for outcome in (
+            VerifyOutcome.retry("x"),
+            VerifyOutcome.retry("x", fixable=True),
+            VerifyOutcome.escalate("x"),
+        ):
+            assert decide_reverify(_reverify_task(origin), outcome).action != Action.RETRY

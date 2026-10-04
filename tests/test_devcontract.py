@@ -1873,7 +1873,7 @@ def test_repair_write_failure_never_truncates_spec(tmp_path, monkeypatch, writer
     simply never fire, a silent false green. `pytest.raises` is what catches it."""
     sp = _write(tmp_path, "spec-a.md", original)
 
-    def boom(path, data, *, confine_root, require_writable_target=False):
+    def boom(path, data, *, confine_root, require_writable_target=False, root_identity=None):
         raise OSError("no space left on device")
 
     monkeypatch.setattr(devcontract, "atomic_write_bytes_confined", boom)
@@ -1906,7 +1906,7 @@ def test_atomic_write_spec_hands_the_helper_bytes_not_text(tmp_path, monkeypatch
     seen: list[bytes | str] = []
     real = devcontract.atomic_write_bytes_confined
 
-    def record(path, data, *, confine_root, require_writable_target=False):
+    def record(path, data, *, confine_root, require_writable_target=False, root_identity=None):
         seen.append(data)
         blob = data if isinstance(data, bytes) else data.encode("utf-8")
         real(
@@ -1914,6 +1914,7 @@ def test_atomic_write_spec_hands_the_helper_bytes_not_text(tmp_path, monkeypatch
             blob,
             confine_root=confine_root,
             require_writable_target=require_writable_target,
+            root_identity=root_identity,
         )
 
     # the CONFINED binding (#593) — the arm an in-tree spec takes. Patching
@@ -2085,7 +2086,7 @@ def test_operator_confirmation_write_failure_raises_and_keeps_the_spec(tmp_path,
     never made."""
     sp = _write(tmp_path, "spec-a.md", _PARKED)
 
-    def boom(path, data, *, confine_root, require_writable_target=False):
+    def boom(path, data, *, confine_root, require_writable_target=False, root_identity=None):
         raise OSError("no space left on device")
 
     # the CONFINED binding: `sp` is under `tmp_path`, so the chokepoint takes that
@@ -2538,3 +2539,323 @@ def test_harvest_fingerprint_marks_sha1_as_non_security_use(monkeypatch):
     monkeypatch.setattr(devcontract.hashlib, "sha1", recording_sha1)
     assert devcontract.harvest_fingerprint("a", "b") == "4a3dec2d1f82"
     assert seen == [False]
+
+
+# --------------------------------------------- worktree-mount pin (DW-423)
+#
+# `root_identity=` threads through `_atomic_write_spec` for the writers a
+# `live_spec_root` caller reaches. The swap: the mount renamed aside and a link
+# planted at its name to an outside tree carrying the same spec subpath.
+
+requires_symlinked_mount_swap = pytest.mark.skipif(
+    not platform_util.DIR_FD_ANCHORED_WRITES or sys.platform == "win32",
+    reason="dir-fd anchoring and POSIX symlinks",
+)
+
+_MOUNT_SPEC = "---\nstatus: done\n---\n\n## Intent\n\nbody\n\n## Auto Run Result\n\nStatus: done\n"
+
+
+def _mount_swap_pair(tmp_path: Path) -> tuple[Path, Path, os.stat_result]:
+    """(mount, outside spec, the mount's accepted identity), the swap already made."""
+    mount = tmp_path / "project" / ".bmad-loop" / "runs" / "r1" / "worktrees" / "1"
+    (mount / "specs").mkdir(parents=True)
+    (mount / "specs" / "6-4.md").write_text(_MOUNT_SPEC, encoding="utf-8")
+    identity = os.lstat(mount)
+    outside = tmp_path / "outside"
+    (outside / "specs").mkdir(parents=True)
+    (outside / "specs" / "6-4.md").write_text(_MOUNT_SPEC, encoding="utf-8")
+    mount.rename(mount.with_name("1-aside"))
+    mount.symlink_to(outside, target_is_directory=True)
+    return mount, outside / "specs" / "6-4.md", identity
+
+
+@requires_symlinked_mount_swap
+def test_strip_auto_run_result_pinned_mount_refuses_a_mount_swapped_for_a_link(tmp_path):
+    """The pinned strip refuses a swapped mount; outside bytes unchanged. The unpinned
+    control shows the same swap really strips the outside copy.
+
+    Ablation: drop the `root_identity=` forward in `strip_auto_run_result` (or in
+    `_atomic_write_spec`) and the pinned call strips the outside copy instead."""
+    mount, outside_spec, identity = _mount_swap_pair(tmp_path)
+    spec = mount / "specs" / "6-4.md"
+
+    with pytest.raises(platform_util.UnconfinedWriteError):
+        devcontract.strip_auto_run_result(spec, confine_root=mount, root_identity=identity)
+    assert outside_spec.read_text(encoding="utf-8") == _MOUNT_SPEC
+
+    assert devcontract.strip_auto_run_result(spec, confine_root=mount)  # control
+    assert "## Auto Run Result" not in outside_spec.read_text(encoding="utf-8")
+
+
+@requires_symlinked_mount_swap
+def test_reset_spec_for_replan_pinned_mount_refuses_a_mount_swapped_for_a_link(tmp_path):
+    """The pinned replan refuses a swapped mount at its first write; outside bytes
+    unchanged. The unpinned control shows the same swap really replans the outside
+    copy.
+
+    Ablation: drop the `root_identity=` forward from `reset_spec_for_replan` to
+    `reset_spec_status` and the pinned call resets the outside copy to draft."""
+    mount, outside_spec, identity = _mount_swap_pair(tmp_path)
+    spec = mount / "specs" / "6-4.md"
+
+    with pytest.raises(platform_util.UnconfinedWriteError):
+        devcontract.reset_spec_for_replan(spec, confine_root=mount, root_identity=identity)
+    assert outside_spec.read_text(encoding="utf-8") == _MOUNT_SPEC
+
+    assert devcontract.reset_spec_for_replan(spec, confine_root=mount)  # control
+    replanned = outside_spec.read_text(encoding="utf-8")
+    assert "status: draft" in replanned and "## Auto Run Result" not in replanned
+
+
+@requires_symlinked_mount_swap
+def test_reset_spec_for_replan_pinned_restore_refuses_a_mount_swapped_mid_replan(
+    tmp_path, monkeypatch
+):
+    """The replan's RESTORE is pinned too: a mount swapped after the reset landed
+    fails the strip, and the undo then refuses to write through the link rather
+    than landing the preimage outside.
+
+    Ablation: drop the `root_identity=` forward on the restore `_atomic_write_spec`
+    call and the undo writes the preimage into the outside copy."""
+    mount = tmp_path / "project" / ".bmad-loop" / "runs" / "r1" / "worktrees" / "1"
+    (mount / "specs").mkdir(parents=True)
+    spec = mount / "specs" / "6-4.md"
+    spec.write_text(_MOUNT_SPEC, encoding="utf-8")
+    identity = os.lstat(mount)
+    outside = tmp_path / "outside"
+    (outside / "specs").mkdir(parents=True)
+    outside_spec = outside / "specs" / "6-4.md"
+    real_strip = devcontract.strip_auto_run_result
+
+    def swap_then_strip(path, **kwargs):
+        # The reset has landed in the real mount; swap the mount for a link to a
+        # copy of what is there now, so the strip and the undo both hit the link.
+        outside_spec.write_bytes(spec.read_bytes())
+        mount.rename(mount.with_name("1-aside"))
+        mount.symlink_to(outside, target_is_directory=True)
+        return real_strip(path, **kwargs)
+
+    monkeypatch.setattr(devcontract, "strip_auto_run_result", swap_then_strip)
+    with pytest.raises(platform_util.UnconfinedWriteError):
+        devcontract.reset_spec_for_replan(spec, confine_root=mount, root_identity=identity)
+    swapped_in = outside_spec.read_text(encoding="utf-8")
+    assert "status: draft" in swapped_in  # the reset's bytes, never the undo's preimage
+    assert swapped_in != _MOUNT_SPEC
+
+
+_MARKERLESS_SPEC = "---\nstatus: done\n---\n\n## Intent\n\nbody\n"
+
+
+@requires_symlinked_mount_swap
+def test_append_auto_run_result_pinned_mount_refuses_a_mount_swapped_for_a_link(tmp_path):
+    """DW-445: the marker-repair append is pinned like the DW-423 writers — a mount
+    swapped for a link refuses and the outside copy is unchanged. The unpinned
+    control shows the same swap really appends to the outside copy.
+
+    Ablation: drop the `root_identity=` forward from `append_auto_run_result` to
+    `_atomic_write_spec` and the pinned call appends the marker outside."""
+    mount = tmp_path / "project" / ".bmad-loop" / "runs" / "r1" / "worktrees" / "1"
+    (mount / "specs").mkdir(parents=True)
+    (mount / "specs" / "6-4.md").write_text(_MARKERLESS_SPEC, encoding="utf-8")
+    identity = os.lstat(mount)
+    outside = tmp_path / "outside"
+    (outside / "specs").mkdir(parents=True)
+    outside_spec = outside / "specs" / "6-4.md"
+    outside_spec.write_text(_MARKERLESS_SPEC, encoding="utf-8")
+    mount.rename(mount.with_name("1-aside"))
+    mount.symlink_to(outside, target_is_directory=True)
+    spec = mount / "specs" / "6-4.md"
+
+    with pytest.raises(platform_util.UnconfinedWriteError):
+        devcontract.append_auto_run_result(spec, "done", confine_root=mount, root_identity=identity)
+    assert outside_spec.read_text(encoding="utf-8") == _MARKERLESS_SPEC
+
+    assert devcontract.append_auto_run_result(spec, "done", confine_root=mount)  # control
+    assert "## Auto Run Result" in outside_spec.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("writer", ["reset_spec_status", "append_auto_run_result"])
+def test_pinned_writers_keep_the_missing_spec_no_op_for_a_gone_mount(tmp_path, writer):
+    """DW-445 "mount gone" row: the engine takes the identity of a mount that no
+    longer exists — `runs.mount_root_identity` answers never-matching, not a raise —
+    and the pinned writer still answers its missing-spec ``False`` before any open,
+    so a gone mount stays the no-op it was rather than becoming a refusal."""
+    from bmad_loop import runs
+
+    mount = tmp_path / "project" / ".bmad-loop" / "runs" / "r1" / "worktrees" / "1"
+    mount.mkdir(parents=True)
+    record = (os.lstat(mount).st_dev, os.lstat(mount).st_ino)  # recorded at the mint
+    mount.rmdir()  # gone since
+    identity = runs.mount_root_identity(mount, mount=mount, recorded=record)
+    spec = mount / "specs" / "6-4.md"
+
+    if writer == "reset_spec_status":
+        wrote = devcontract.reset_spec_status(
+            spec, "in-progress", confine_root=mount, root_identity=identity
+        )
+    else:
+        wrote = devcontract.append_auto_run_result(
+            spec, "done", confine_root=mount, root_identity=identity
+        )
+
+    assert wrote is False
+    assert not mount.exists()
+
+
+@requires_symlinked_mount_swap
+@pytest.mark.parametrize("writer", ["reset_spec_status", "append_auto_run_result"])
+def test_atomic_write_spec_external_arm_refuses_a_swapped_pinned_root(tmp_path, writer):
+    """DW-445: `_atomic_write_spec`'s external arm pre-checks a given pin. The spec's
+    RESOLVED spelling after a mount swap lies outside ``confine_root`` — what the
+    engine's resets write — so the pinned write refuses and the outside bytes are
+    unchanged; the unpinned control writes them as before.
+
+    Ablation: drop the `require_root_pinned` pre-check from `_atomic_write_spec`'s
+    external arm and the pinned call rewrites the outside copy."""
+    text = _MARKERLESS_SPEC if writer == "append_auto_run_result" else _MOUNT_SPEC
+    mount, outside_spec, identity = _mount_swap_pair(tmp_path)
+    outside_spec = outside_spec.resolve()
+    outside_spec.write_text(text, encoding="utf-8")
+
+    def write(**kw):
+        if writer == "reset_spec_status":
+            return devcontract.reset_spec_status(outside_spec, "in-progress", **kw)
+        return devcontract.append_auto_run_result(outside_spec, "done", **kw)
+
+    with pytest.raises(platform_util.UnconfinedWriteError, match="pinned to"):
+        write(confine_root=mount, root_identity=identity)
+    assert outside_spec.read_text(encoding="utf-8") == text
+
+    assert write(confine_root=mount)  # control: unpinned, unchanged behaviour
+    assert outside_spec.read_text(encoding="utf-8") != text
+
+
+@requires_symlinked_mount_swap
+def test_atomic_write_spec_external_arm_writes_through_an_intact_pinned_root(tmp_path):
+    """An intact pinned mount whose `_bmad-output` is a link resolving outside it:
+    the pre-check passes and the write lands exactly as unpinned."""
+    mount = tmp_path / "project" / ".bmad-loop" / "runs" / "r1" / "worktrees" / "1"
+    mount.mkdir(parents=True)
+    shared = tmp_path / "shared-output"
+    (shared / "specs").mkdir(parents=True)
+    spec = (shared / "specs" / "6-4.md").resolve()
+    spec.write_text(_MOUNT_SPEC, encoding="utf-8")
+    (mount / "_bmad-output").symlink_to(shared, target_is_directory=True)
+
+    assert devcontract.reset_spec_status(
+        spec, "in-progress", confine_root=mount, root_identity=os.lstat(mount)
+    )
+    assert "status: in-progress" in spec.read_text(encoding="utf-8")
+
+
+# ---------------------------------- the session's environment-fault claim (DW-523)
+
+
+def _env_fault_spec(tmp_path, *, line: str | None, extra: str = ""):
+    """A done spec whose genuine marker carries (or omits) an environment-fault line."""
+    marker = "\n## Auto Run Result\n\n- Status: done\n"
+    if line is not None:
+        marker += f"{line}\n"
+    marker += extra
+    return _spec(tmp_path / "s.md", status="done", auto_run=None, body_extra=marker)
+
+
+@pytest.mark.parametrize(
+    ("line", "claim"),
+    [
+        ("Environment fault: postgres container is down", "postgres container is down"),
+        ("- Environment fault: postgres container is down", "postgres container is down"),
+        ("- **Environment fault:** postgres down", "postgres down"),
+        ("**Environment fault: postgres down**", "postgres down"),
+        ("environment_fault: postgres down", "postgres down"),
+        ("Environment fault: postgres down  ", "postgres down"),
+    ],
+    ids=["prose", "bullet", "bold-label", "bold-line", "snake", "nbsp-trailing-space"],
+)
+def test_environment_fault_line_synthesizes_claim(tmp_path, line, claim):
+    """A genuine marker's `Environment fault:` line becomes ``env_fault_claim``
+    — bullet/bold tolerant like the artifact-only line — and the claim changes
+    nothing else in the result: status and escalations stay the session's own.
+    No authorship proof is needed (the claim only triggers a probe).
+
+    Ablation: drop the ``env_fault_claim`` write in ``synthesize_result`` and
+    every parameter fails."""
+    sp = _env_fault_spec(tmp_path, line=line)
+
+    rj = devcontract.synthesize_result(sp, story_key="1-1-a").result_json
+
+    assert rj is not None
+    assert rj["env_fault_claim"] == claim
+    assert rj["status"] == "done"
+    assert rj["escalations"] == []
+
+
+def test_environment_fault_claim_is_bounded(tmp_path):
+    sp = _env_fault_spec(tmp_path, line="Environment fault: " + "x" * 2000)
+
+    rj = devcontract.synthesize_result(sp, story_key="1-1-a").result_json
+
+    assert rj is not None
+    assert rj["env_fault_claim"] == "x" * devcontract.ENV_FAULT_CLAIM_LIMIT
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        "\n```\nEnvironment fault: postgres down\n```\n",
+        f"Environment fault: postgres down\n\n{devcontract.ORCHESTRATOR_SYNTH_NOTE}\n",
+    ],
+    ids=["fenced", "orchestrator-synth"],
+)
+def test_fenced_or_orchestrator_env_fault_line_is_not_a_claim(tmp_path, extra):
+    """A fenced example inside the marker is documentation, and a marker the
+    orchestrator synthesized speaks for no session — neither is a claim.
+
+    Ablation: drop the ``_fenced`` skip in ``_env_fault_claim_of`` (fenced) or
+    the ``ORCHESTRATOR_SYNTH_NOTE`` guard in ``synthesize_result``
+    (orchestrator-synth) and that parameter fails."""
+    sp = _env_fault_spec(tmp_path, line=None, extra=extra)
+
+    rj = devcontract.synthesize_result(sp, story_key="1-1-a").result_json
+
+    assert rj is not None
+    assert "env_fault_claim" not in rj
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "Environment fault:",
+        "Environment fault:   ",
+        "- **Environment fault:** ****",
+        "Environment fault:\npostgres down",
+        "Environment fault:\x0bpostgres down",
+    ],
+    ids=["bare", "spaces", "bold-only", "next-line", "vertical-tab"],
+)
+def test_blank_env_fault_line_is_not_a_claim(tmp_path, line):
+    """A label with no text on its own line claims nothing — the text is never
+    borrowed from the following line.
+
+    Ablation: drop the ``if text`` check in ``_env_fault_claim_of`` and the
+    blank parameters fail."""
+    sp = _env_fault_spec(tmp_path, line=line)
+
+    rj = devcontract.synthesize_result(sp, story_key="1-1-a").result_json
+
+    assert rj is not None
+    assert "env_fault_claim" not in rj
+
+
+def test_env_fault_claim_reads_only_the_last_real_marker(tmp_path):
+    """A claim in an earlier marker is a previous session's word, not this one's."""
+    body = (
+        "\n## Auto Run Result\n\nStatus: blocked\nEnvironment fault: db down\n"
+        "\n## Auto Run Result\n\nStatus: done\n"
+    )
+    sp = _spec(tmp_path / "s.md", status="done", auto_run=None, body_extra=body)
+
+    rj = devcontract.synthesize_result(sp, story_key="1-1-a").result_json
+
+    assert rj is not None
+    assert "env_fault_claim" not in rj

@@ -11,6 +11,7 @@ Everything binds 127.0.0.1; no real opencode binary or network access anywhere.
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import inspect
 import json
 import os
@@ -38,6 +39,7 @@ from bmad_loop import runs
 from bmad_loop.adapters import base as adapter_base
 from bmad_loop.adapters import generic, opencode_http
 from bmad_loop.adapters.base import (
+    ZERO_TOKEN_TIMEOUT_EVIDENCE,
     AdapterTaskDirectoryError,
     SessionHandle,
     SessionResult,
@@ -50,6 +52,7 @@ from bmad_loop.adapters.opencode_http import (
     USAGE_STASH_CAP,
     OpencodeDevAdapter,
     OpencodeHttpAdapter,
+    OpencodeNudgeSendError,
     OpencodeServerError,
     _free_port,
     _now_ms,
@@ -199,7 +202,7 @@ def run_turn():
         finish_turn(); push(idle_event())
     elif SCENARIO == "stall":
         finish_turn(); push(idle_event())
-    elif SCENARIO in ("busy-forever", "busy-big-usage"):
+    elif SCENARIO in ("busy-forever", "busy-big-usage", "busy-zero-errored", "busy-zero-aborted"):
         write_spec()  # visible only post-kill: the turn never ends or idles
     elif SCENARIO == "big-usage-then-complete":
         time.sleep(0.35)  # stay busy through several fast heartbeat samples
@@ -243,6 +246,21 @@ class Handler(BaseHTTPRequestHandler):
                         "tokens": {"input": 4000000, "output": 1000000, "reasoning": 0,
                                    "cache": {"read": 0, "write": 0}},
                         "cost": 1.0,
+                    },
+                    "parts": [],
+                }]
+            elif SCENARIO in ("busy-zero-errored", "busy-zero-aborted"):
+                # A finished zero-token step: a provider refusal (APIError) or
+                # the step the timeout's abort cancelled (MessageAbortedError).
+                name = "APIError" if SCENARIO == "busy-zero-errored" else "MessageAbortedError"
+                msgs = [{
+                    "info": {
+                        "id": "msg_zero1", "role": "assistant",
+                        "time": {"created": now_ms() - 10, "completed": now_ms()},
+                        "tokens": {"input": 0, "output": 0, "reasoning": 0,
+                                   "cache": {"read": 0, "write": 0}},
+                        "error": {"name": name, "data": {"message": "fake"}},
+                        "cost": 0,
                     },
                     "parts": [],
                 }]
@@ -485,6 +503,220 @@ def test_session_env_carries_contract(tmp_path):
     json.loads(env["OPENCODE_CONFIG_CONTENT"])  # valid JSON
 
 
+# ------------------------------------------------------- serve argv (DW-374)
+
+
+def _wrapper_adapter(tmp_path: Path, launch_args: tuple[str, ...], **kwargs) -> OpencodeHttpAdapter:
+    profile = dataclasses.replace(get_profile("opencode"), launch_args=launch_args)
+    return OpencodeHttpAdapter(
+        run_dir=tmp_path / "run", policy=_policy(), profile=profile, binary="npx", **kwargs
+    )
+
+
+def test_serve_argv_default_profile_is_unchanged(tmp_path):
+    """The shipped profile has no launch_args: the argv is exactly the pinned one."""
+    adapter = make_adapter(tmp_path, extra_args=("--x", "1"))
+    assert adapter._serve_argv("/bin/opencode", 4242) == [
+        "/bin/opencode",
+        "serve",
+        "--port",
+        "4242",
+        "--hostname",
+        "127.0.0.1",
+        "--print-logs",
+        "--x",
+        "1",
+    ]
+
+
+def test_serve_argv_puts_launch_args_between_binary_and_serve(tmp_path):
+    """DW-374: a wrapper profile (`npx -y opencode-ai`) must launch
+    `npx -y opencode-ai serve …`, not `npx serve …`; extra_args stay last."""
+    adapter = _wrapper_adapter(tmp_path, ("-y", "opencode-ai"), extra_args=("--x",))
+    assert adapter._serve_argv("/usr/bin/npx", 7) == [
+        "/usr/bin/npx",
+        "-y",
+        "opencode-ai",
+        "serve",
+        "--port",
+        "7",
+        "--hostname",
+        "127.0.0.1",
+        "--print-logs",
+        "--x",
+    ]
+
+
+def test_spawn_hands_popen_the_wrapper_argv(tmp_path, monkeypatch):
+    """End to end through `_spawn_server`: Popen receives the resolved wrapper
+    binary, then launch_args, then `serve` and the adapter-owned flags."""
+    adapter = _wrapper_adapter(tmp_path, ("-y", "opencode-ai"))
+    seen: list[list[str]] = []
+
+    class _Stop(Exception):
+        pass
+
+    def fake_popen(argv, **_kw):
+        seen.append(list(argv))
+        raise _Stop
+
+    monkeypatch.setattr(opencode_http.shutil, "which", lambda name: f"/resolved/{name}")
+    monkeypatch.setattr(opencode_http.subprocess, "Popen", fake_popen)
+    spec = SessionSpec(task_id="t", role="triage", prompt="p", cwd=tmp_path)
+    with pytest.raises(_Stop):
+        adapter._spawn_server(spec)
+    assert len(seen) == 1
+    argv = seen[0]
+    assert argv[:4] == ["/resolved/npx", "-y", "opencode-ai", "serve"]
+    assert argv[4:6] == ["--port", argv[5]] and argv[5].isdigit()
+    assert argv[6:] == ["--hostname", "127.0.0.1", "--print-logs"]
+
+
+def test_spawn_give_up_error_names_the_wrapper_launch(tmp_path, monkeypatch):
+    """When every SPAWN_ATTEMPTS spawn dies, the give-up OpencodeServerError names
+    what was actually launched — `npx -y opencode-ai serve`, not `npx serve` — so
+    the operator reading it is not sent chasing the wrong command.
+
+    ABLATION: revert the message to `{self.binary} serve` and this reddens."""
+    adapter = _wrapper_adapter(tmp_path, ("-y", "opencode-ai"))
+    spawned: list[list[str]] = []
+
+    class _DeadProcess:
+        returncode = 1
+
+        def poll(self):
+            return 1
+
+    def fake_popen(argv, **_kw):
+        spawned.append(list(argv))
+        return _DeadProcess()
+
+    monkeypatch.setattr(opencode_http.shutil, "which", lambda name: f"/resolved/{name}")
+    monkeypatch.setattr(opencode_http.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(adapter, "_await_healthy", lambda _sess: False)
+    spec = SessionSpec(task_id="t", role="triage", prompt="p", cwd=tmp_path)
+    with pytest.raises(opencode_http.OpencodeServerError) as excinfo:
+        adapter._spawn_server(spec)
+    assert len(spawned) == opencode_http.SPAWN_ATTEMPTS
+    message = str(excinfo.value)
+    assert (
+        f"could not start `npx -y opencode-ai serve` after {opencode_http.SPAWN_ATTEMPTS}"
+        in message
+    )
+    assert "rc=1" in message
+
+
+@pytest.mark.parametrize(
+    "binary, launch_args, needle",
+    [
+        pytest.param("opencode", ("serve",), "'serve'", id="serve"),
+        pytest.param("npx", ("-y", "opencode-ai", "--port"), "'--port'", id="port"),
+        pytest.param("opencode", ("--port=4096",), "'--port=4096'", id="port-eq"),
+        pytest.param("opencode", ("--hostname",), "'--hostname'", id="hostname"),
+        pytest.param("opencode", ("--hostname=0.0.0.0",), "'--hostname=0.0.0.0'", id="host-eq"),
+        pytest.param("opencode", ("--print-logs",), "'--print-logs'", id="print-logs"),
+        pytest.param(
+            "opencode", ("--print-logs=false",), "'--print-logs=false'", id="print-logs-eq"
+        ),
+        pytest.param("python3", (), "needs a program", id="python3"),
+        pytest.param("python", (), "needs a program", id="python"),
+        pytest.param("/usr/bin/python3.12", (), "needs a program", id="python-path"),
+        pytest.param("C:\\Py\\PYTHON.EXE", (), "needs a program", id="win-exe"),
+        pytest.param("pythonw", (), "needs a program", id="pythonw"),
+        pytest.param("py", (), "needs a program", id="py"),
+        pytest.param("pypy", (), "needs a program", id="pypy"),
+        pytest.param("pypy3", (), "needs a program", id="pypy3"),
+        pytest.param("sh", (), "needs a program", id="sh"),
+        pytest.param("bash", (), "needs a program", id="bash"),
+        pytest.param("zsh", (), "needs a program", id="zsh"),
+        pytest.param("dash", (), "needs a program", id="dash"),
+        pytest.param("node", (), "needs a program", id="node"),
+        pytest.param("nodejs", (), "needs a program", id="nodejs"),
+        pytest.param("bun", (), "needs a program", id="bun"),
+        pytest.param("deno", (), "needs a program", id="deno"),
+        pytest.param("perl", (), "needs a program", id="perl"),
+        pytest.param("ruby", (), "needs a program", id="ruby"),
+        pytest.param("env", (), "needs a program", id="env"),
+        pytest.param("npx", (), "needs a program", id="npx"),
+        pytest.param("bunx", (), "needs a program", id="bunx"),
+        pytest.param("pnpx", (), "needs a program", id="pnpx"),
+        pytest.param("C:\\nodejs\\npx.cmd", (), "needs a program", id="win-cmd-shim"),
+        pytest.param("C:\\tools\\py.bat", (), "needs a program", id="win-bat-shim"),
+        pytest.param("C:\\x\\node.com", (), "needs a program", id="win-com"),
+        # Options only: `serve` still lands in the script/module slot.
+        pytest.param("python3", ("-u",), "needs a program", id="python-u"),
+        pytest.param("python3", ("-m",), "needs a program", id="python-m-no-module"),
+        pytest.param("node", ("--inspect",), "needs a program", id="node-inspect"),
+        pytest.param("npx", ("-y",), "needs a program", id="npx-y-no-package"),
+    ],
+)
+def test_launch_args_unservable_flags_unservable_shapes(binary, launch_args, needle):
+    reason = opencode_http.launch_args_unservable(binary, launch_args)
+    assert reason is not None and needle in reason
+
+
+@pytest.mark.parametrize(
+    "binary, launch_args",
+    [
+        pytest.param("opencode", (), id="default"),
+        pytest.param("npx", ("-y", "opencode-ai"), id="npx-wrapper"),
+        pytest.param("bunx", ("opencode-ai",), id="bunx"),
+        pytest.param("pnpx", ("opencode-ai",), id="pnpx"),
+        pytest.param("C:\\nodejs\\npx.cmd", ("-y", "opencode-ai"), id="win-npx-shim"),
+        pytest.param("env", ("opencode",), id="env-program"),
+        pytest.param("node", ("/opt/opencode/bin/opencode.js",), id="node-script"),
+        pytest.param("python3", ("-m", "some_launcher"), id="python-with-program"),
+        pytest.param("pythonic", (), id="not-an-interpreter"),
+        pytest.param("/opt/sh/opencode", (), id="interpreter-dir-not-basename"),
+        pytest.param("opencode", ("--portal",), id="port-prefix-not-flag"),
+        pytest.param("pyenv", (), id="py-prefix-not-interpreter"),
+        pytest.param("opencode.cmd", (), id="win-opencode-shim"),
+    ],
+)
+def test_launch_args_unservable_is_silent_on_servable_shapes(binary, launch_args):
+    assert opencode_http.launch_args_unservable(binary, launch_args) is None
+
+
+@pytest.mark.parametrize(
+    "extra_args, needle",
+    [
+        pytest.param(("--port", "5000"), "'--port'", id="port"),
+        pytest.param(("--model", "x", "--hostname", "0.0.0.0"), "'--hostname'", id="hostname"),
+        pytest.param(("--print-logs",), "'--print-logs'", id="print-logs"),
+        pytest.param(("--port=1",), "'--port=1'", id="port-eq"),
+        pytest.param(("--hostname=0.0.0.0",), "'--hostname=0.0.0.0'", id="hostname-eq"),
+        pytest.param(("--print-logs=false",), "'--print-logs=false'", id="print-logs-eq"),
+    ],
+)
+def test_extra_args_unservable_flags_owned_flags(extra_args, needle):
+    """DW-483: extra_args land AFTER the owned flags in `_serve_argv`, so a repeat
+    overrides the port the health poll dials."""
+    reason = opencode_http.extra_args_unservable(extra_args)
+    assert reason is not None and needle in reason and "extra_args" in reason
+
+
+@pytest.mark.parametrize(
+    "extra_args",
+    [
+        pytest.param((), id="empty"),
+        pytest.param(("serve",), id="serve-is-a-positional-here"),
+        pytest.param(("--portal",), id="port-prefix-not-flag"),
+        pytest.param(("--model", "anthropic/claude"), id="unrelated-flag"),
+    ],
+)
+def test_extra_args_unservable_is_silent_on_non_colliding_args(extra_args):
+    assert opencode_http.extra_args_unservable(extra_args) is None
+
+
+def test_extra_args_unservable_owns_every_serve_argv_flag(tmp_path):
+    """The owned flags are read off `_serve_argv` itself, so a flag added there
+    without widening the predicate reddens here."""
+    argv = make_adapter(tmp_path)._serve_argv("/bin/opencode", 4242)
+    flags = {token for token in argv[argv.index("serve") + 1 :] if token.startswith("--")}
+    for flag in flags:
+        assert opencode_http.extra_args_unservable((flag,)) is not None, flag
+
+
 def test_sse_parser_accumulates_and_tolerates_junk():
     lines = [
         "data: " + json.dumps({"type": "server.connected", "properties": {}}),
@@ -498,6 +730,162 @@ def test_sse_parser_accumulates_and_tolerates_junk():
     ]
     events = list(_parse_sse_lines(lines))
     assert [e["type"] for e in events] == ["server.connected", "session.idle"]
+
+
+def test_parse_sse_lines_reports_each_dropped_frame():
+    """DW-462: an undecodable payload is still skipped, but reported to the
+    caller's `on_drop` — the frames around it parse exactly as before."""
+    lines = [
+        "data: not json",
+        "",
+        "data: " + json.dumps({"type": "server.connected", "properties": {}}),
+        "",
+        "data: {",
+        "",
+    ]
+    drops: list[str] = []
+    events = list(_parse_sse_lines(lines, drops.append))
+    assert [e["type"] for e in events] == ["server.connected"]
+    assert len(drops) == 2 and all(d.startswith("JSONDecodeError: ") for d in drops)
+
+
+class _FakeSseResp:
+    def __init__(self, status_code, lines, end_exc):
+        self.status_code = status_code
+        self._lines = lines
+        self._end_exc = end_exc
+
+    def iter_lines(self):
+        yield from self._lines
+        if self._end_exc is not None:
+            raise self._end_exc
+
+
+class _FakeSseHttpx:
+    """Stands in for the httpx module inside `_sse_loop`, one scripted stream
+    attempt per connect: ``("raise", exc)`` fails the connect,
+    ``("stream", status, lines, end_exc)`` answers and streams ``lines`` then
+    raises ``end_exc`` (None = clean end), and ``("stop", exc)`` is the teardown
+    — it sets ``sse_stop`` and raises as the killed server's socket would."""
+
+    def __init__(self, sess, attempts):
+        self.sess = sess
+        self.attempts = list(attempts)
+
+    def Timeout(self, *_a, **_kw):  # noqa: N802 - mirrors httpx.Timeout
+        return None
+
+    def Client(self, **_kw):  # noqa: N802 - mirrors httpx.Client
+        fake = self
+
+        class _Client:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_exc):
+                return False
+
+            @contextlib.contextmanager
+            def stream(self, _method, _path):
+                kind, *rest = fake.attempts.pop(0)
+                if kind == "stop":
+                    fake.sess.sse_stop.set()
+                if kind in ("raise", "stop"):
+                    raise rest[0]
+                yield _FakeSseResp(*rest)
+
+        return _Client()
+
+
+def test_sse_loop_crumbs_each_stream_break_once(tmp_path):
+    """DW-462 acceptance: a raising stream still degrades to a `gap` (the wait
+    loop's poll fallback is unchanged), but each break is crumbed once —
+    `sse-stream-failed` at its first failure with the error and the running
+    dropped-frame count, `sse-stream-recovered` at the next connect — never once
+    per failed reconnect, and never for the teardown's own socket close. The
+    session's first undecodable frame is crumbed and every one is counted."""
+    adapter = make_adapter(tmp_path)
+    adapter.reconnect_sleep_s = 0.0
+    sess = _ServerSession(process=None, port=0, base_url="", password="", log_fh=None)
+    heartbeat = "data: " + json.dumps({"type": "server.heartbeat", "properties": {}})
+    adapter._httpx = _FakeSseHttpx(
+        sess,
+        [
+            ("raise", RuntimeError("refused")),
+            ("raise", RuntimeError("refused")),
+            (
+                "stream",
+                200,
+                ["data: nope", "", heartbeat, "", "data: {", ""],
+                RuntimeError("reset"),
+            ),
+            ("stream", 503, [], None),  # the same break: no second crumb
+            ("stop", RuntimeError("closed by teardown")),
+        ],
+    )
+
+    adapter._sse_loop(sess, "t-sse")
+
+    crumbs = [
+        {k: v for k, v in ln.items() if k != "ts"} for ln in _lifecycle_lines(adapter, "t-sse")
+    ]
+    assert crumbs[0] == {
+        "event": "sse-stream-failed",
+        "error": "RuntimeError: refused",
+        "frames_dropped": 0,
+    }
+    assert crumbs[1] == {"event": "sse-stream-recovered", "failures": 2}
+    assert crumbs[2]["event"] == "sse-frame-dropped"
+    assert crumbs[2]["error"].startswith("JSONDecodeError: ")
+    assert crumbs[3] == {
+        "event": "sse-stream-failed",
+        "error": "RuntimeError: reset",
+        "frames_dropped": 2,
+    }
+    assert len(crumbs) == 4
+    assert sess.sse_frames_dropped == 2 and sess.sse_failures == 2
+    # behaviour unchanged: one gap per ended stream, none after the stop
+    gaps = []
+    while not sess.events.empty():
+        gaps.append(sess.events.get_nowait())
+    assert gaps == ["gap"] * 4
+    assert sess.sse_connected.is_set()
+
+
+def test_sse_loop_healthy_stream_writes_no_crumb(tmp_path):
+    """A stream that connects and ends cleanly leaves the lifecycle file alone."""
+    adapter = make_adapter(tmp_path)
+    adapter.reconnect_sleep_s = 0.0
+    sess = _ServerSession(process=None, port=0, base_url="", password="", log_fh=None)
+    frame = "data: " + json.dumps({"type": "server.heartbeat", "properties": {}})
+    adapter._httpx = _FakeSseHttpx(
+        sess, [("stream", 200, [frame, ""], None), ("stop", RuntimeError("closed"))]
+    )
+
+    adapter._sse_loop(sess, "t-sse")
+
+    assert _lifecycle_lines(adapter, "t-sse") == []
+    assert sess.sse_frames_dropped == 0
+
+
+def test_heartbeat_carries_sse_frames_dropped(tmp_path, monkeypatch):
+    """DW-462: the running dropped-frame count reaches heartbeat.json, where an
+    operator watching a live session can see a stream shipping garbage."""
+    adapter = make_adapter(tmp_path)
+    clock = _install_clock(monkeypatch)
+    (adapter.tasks_dir / "t-1").mkdir(parents=True)
+
+    def advance():
+        clock["mono"] += 11.0
+
+    sess = _timeout_driven_session(adapter, advance)
+    sess.sse_frames_dropped = 3
+    adapter.wait_for_completion(
+        SessionHandle(task_id="t-1", native_id="ses_1"), _timeout_spec(tmp_path)
+    )
+    hb = json.loads((adapter.tasks_dir / "t-1" / "heartbeat.json").read_text(encoding="utf-8"))
+    assert hb["sse_frames_dropped"] == 3
+    assert hb["usage_sample_failures"] == 0
 
 
 def test_sse_dispatch_filters_child_sessions(tmp_path):
@@ -1307,7 +1695,38 @@ def test_sum_usage_maps_opencode_tokens():
     assert usage == TokenUsage(
         input_tokens=110, output_tokens=75, cache_read_tokens=8, cache_creation_tokens=5
     )
-    assert _sum_usage("garbage") == TokenUsage()
+    # Untracked is None, never a zero (DW-364): a zero reads as a measured
+    # no-spend session, which the base adapter classifies as an env fault.
+    assert _sum_usage("garbage") is None
+    assert _sum_usage([]) is None
+    assert _sum_usage([{"info": {"role": "user", "tokens": {"input": 9}}}]) is None
+    assert _sum_usage([{"info": {"role": "assistant"}}]) is None
+    assert _sum_usage([{"info": {"role": "assistant", "tokens": {}}}]) is None
+    zero = {"input": 0, "output": 0}
+    # All-zero tokens on a still-in-flight first step: no usage signal yet.
+    assert _sum_usage([{"info": {"role": "assistant", "tokens": zero}}]) is None
+    # A completed assistant message makes the zero a measured one.
+    assert (
+        _sum_usage([{"info": {"role": "assistant", "tokens": zero, "time": {"completed": 1}}}])
+        == TokenUsage()
+    )
+    # An aborted step is stamped completed by opencode's cleanup; still in flight.
+    aborted = {"name": "MessageAbortedError", "data": {"message": "Aborted"}}
+    assert (
+        _sum_usage(
+            [
+                {
+                    "info": {
+                        "role": "assistant",
+                        "tokens": zero,
+                        "time": {"completed": 1},
+                        "error": aborted,
+                    }
+                }
+            ]
+        )
+        is None
+    )
 
 
 def test_missing_httpx_names_the_extra(tmp_path, monkeypatch):
@@ -2045,13 +2464,13 @@ def test_capture_usage_stashes_through_the_cap(tmp_path):
 
     for i in range(USAGE_STASH_CAP + 2):
         task_id = f"t{i}"
-        # a missing parent raises into `_capture_usage`'s except and skips the stash
+        # without the task dir the transcript dump fails and the call returns None
         (adapter.tasks_dir / task_id).mkdir(parents=True)
         sess = _ServerSession(process=None, port=0, base_url="", password="", log_fh=None)
         sess.session_id = f"ses_{i}"
         sess.client = _Client200()
         handle = SessionHandle(task_id=task_id, native_id=sess.session_id)
-        assert adapter._capture_usage(handle, sess) is not None  # the stash really ran
+        assert adapter._capture_usage(handle, sess) is not None  # the capture really ran
 
     assert len(adapter._usage) == USAGE_STASH_CAP
     assert adapter.read_usage(SessionResult(status="completed", session_id="ses_0")) is None
@@ -2061,33 +2480,243 @@ def test_capture_usage_stashes_through_the_cap(tmp_path):
     ) == TokenUsage(input_tokens=3, output_tokens=1)
 
 
-def test_sample_weighted_usage_inert_on_http_failure(tmp_path):
-    """The budget guard's mid-session sample must never break the wait loop:
-    no live session yet, a transport error, or a non-200 all read as None
-    (guard inert this tick)."""
+class _ScriptedGetClient:
+    """A control client whose ``/message`` GET answers come off a script, one per
+    call: an int is a bare status code, an Exception is raised, anything else is
+    a 200 whose body is that value. The last entry repeats once the script runs
+    out. Every other GET (the wait loop's ``/session/status`` probe) is a 404, so
+    it reads as unknown and consumes nothing."""
+
+    def __init__(self, *answers):
+        self.answers = list(answers)
+        self.posts: list[str] = []
+
+    def get(self, path):
+        if not path.endswith("/message"):
+            answer: object = 404
+        elif len(self.answers) > 1:
+            answer = self.answers.pop(0)
+        else:
+            answer = self.answers[0]
+        if isinstance(answer, Exception):
+            raise answer
+
+        class _Resp:
+            status_code = answer if isinstance(answer, int) else 200
+
+            @staticmethod
+            def json():
+                return answer
+
+        return _Resp()
+
+    def post(self, path, **_kw):
+        self.posts.append(path)
+
+        class _Resp:
+            status_code = 200
+
+        return _Resp()
+
+    def close(self):
+        pass
+
+
+_HEALTHY_MESSAGES = [
+    {"info": {"role": "assistant", "tokens": {"input": 3, "output": 1}, "time": {"completed": 1}}}
+]
+
+
+def test_sample_weighted_usage_separates_faults_from_inert(tmp_path):
+    """DW-461: the budget guard's mid-session sample never breaks the wait loop,
+    and a sample that FAILED (transport error, non-200, malformed body) is told
+    apart from one that is merely inert (no live session yet, nothing tallied),
+    so the loop can crumb the streak instead of leaving enforce mode silently off."""
     adapter = make_adapter(tmp_path)
     spec = SessionSpec(task_id="t", role="triage", prompt="p", cwd=tmp_path)
     sess = _ServerSession(process=None, port=0, base_url="", password="", log_fh=None)
-    assert adapter._sample_weighted_usage(sess, spec) is None  # no session id yet
+    assert adapter._sample_weighted_usage(sess, spec) == (None, None)  # no session id yet
 
     sess.session_id = "ses_1"
+    sess.client = _ScriptedGetClient(RuntimeError("connection refused"))
+    assert adapter._sample_weighted_usage(sess, spec) == (
+        None,
+        "RuntimeError: connection refused",
+    )
+    sess.client = _ScriptedGetClient(500)
+    assert adapter._sample_weighted_usage(sess, spec) == (None, "HTTP 500")
+    sess.client = _ScriptedGetClient({"error": "not a list"})
+    weighted, fault = adapter._sample_weighted_usage(sess, spec)
+    assert weighted is None and fault == "payload is dict, not a message list"
+    sess.client = _ScriptedGetClient(["not-a-message"])
+    weighted, fault = adapter._sample_weighted_usage(sess, spec)
+    assert weighted is None and fault is not None and fault.startswith("malformed message list")
 
-    class _BoomClient:
-        def get(self, path):
-            raise RuntimeError("connection refused")
+    # healthy: nothing tallied yet is inert, not a fault; a tally is a sample
+    sess.client = _ScriptedGetClient([])
+    assert adapter._sample_weighted_usage(sess, spec) == (None, None)
+    sess.client = _ScriptedGetClient(_HEALTHY_MESSAGES)
+    assert adapter._sample_weighted_usage(sess, spec) == (4, None)
 
-    sess.client = _BoomClient()
-    assert adapter._sample_weighted_usage(sess, spec) is None
 
-    class _Client500:
-        def get(self, path):
-            class _Resp:
-                status_code = 500
+@pytest.mark.parametrize(
+    "payload",
+    [
+        "garbage",
+        {"messages": []},
+        ["not-a-message"],
+        [{"info": "not-a-dict"}],
+        [{"info": {"role": "assistant", "time": "later", "tokens": {"input": 1}}}],
+        [{"info": {"role": "assistant", "tokens": {"input": 1, "cache": "warm"}}}],
+        [{"info": {"role": "assistant", "tokens": {"input": "many"}}}],
+        [{"info": {"role": "assistant", "tokens": {"input": [1]}}}],
+    ],
+    ids=["str", "dict", "entry", "info", "time", "cache", "count-str", "count-list"],
+)
+def test_tally_messages_malformed_is_unknown_with_a_fault(payload):
+    """DW-461: a malformed usage payload is None ("unknown") with a fault, never a
+    real-looking zero or a partial sum, and `_sum_usage` itself never raises on
+    one (the wrong-shaped entries used to raise into the callers' catch-alls)."""
+    usage, fault = opencode_http._tally_messages(payload)
+    assert usage is None and fault
+    assert _sum_usage(payload) is None
 
-            return _Resp()
 
-    sess.client = _Client500()
-    assert adapter._sample_weighted_usage(sess, spec) is None
+def test_tally_messages_healthy_and_untracked_carry_no_fault():
+    """The DW-461 fault channel is for malformed bodies only: a tally, an empty
+    list and an untracked (tokens-less) list all answer with fault None."""
+    assert opencode_http._tally_messages(_HEALTHY_MESSAGES) == (
+        TokenUsage(input_tokens=3, output_tokens=1),
+        None,
+    )
+    assert opencode_http._tally_messages([]) == (None, None)
+    assert opencode_http._tally_messages([{"info": {"role": "assistant"}}]) == (None, None)
+    # a non-dict tokens block is still "no usage on this message", not a fault
+    assert opencode_http._tally_messages([{"info": {"role": "assistant", "tokens": "n/a"}}]) == (
+        None,
+        None,
+    )
+
+
+def _capture(adapter, client, task_id="t-cap", make_dir=True):
+    if make_dir:
+        (adapter.tasks_dir / task_id).mkdir(parents=True, exist_ok=True)
+    sess = _ServerSession(process=None, port=0, base_url="", password="", log_fh=None)
+    sess.session_id = f"ses_{task_id}"
+    sess.client = client
+    handle = SessionHandle(task_id=task_id, native_id=sess.session_id)
+    return adapter._capture_usage(handle, sess), sess
+
+
+def _capture_crumbs(adapter, task_id="t-cap"):
+    return [
+        ln for ln in _lifecycle_lines(adapter, task_id) if ln["event"] == "usage-capture-failed"
+    ]
+
+
+@pytest.mark.parametrize(
+    ("answer", "error"),
+    [(RuntimeError("connection refused"), "RuntimeError: connection refused"), (502, "HTTP 502")],
+    ids=["transport", "non-200"],
+)
+def test_capture_usage_fetch_fault_is_crumbed(tmp_path, answer, error):
+    """DW-461: the pre-teardown usage read failing is crumbed (`stage=fetch`) and
+    stashes nothing, so read_usage() answers None — untracked, never zero."""
+    adapter = make_adapter(tmp_path)
+    transcript, sess = _capture(adapter, _ScriptedGetClient(answer))
+    assert transcript is None
+    assert adapter._usage == {}
+    (crumb,) = _capture_crumbs(adapter)
+    assert crumb["stage"] == "fetch" and crumb["error"] == error
+
+
+def test_capture_usage_malformed_payload_is_crumbed_and_still_dumped(tmp_path):
+    """DW-461: a malformed body stashes nothing (usage unknown, not zero) and is
+    crumbed `stage=payload`; the raw body is still dumped — it is the evidence."""
+    adapter = make_adapter(tmp_path)
+    transcript, sess = _capture(adapter, _ScriptedGetClient({"oops": True}))
+    assert transcript is not None
+    assert json.loads(Path(transcript).read_text(encoding="utf-8")) == {"oops": True}
+    assert adapter.read_usage(SessionResult(status="timeout", session_id=sess.session_id)) is None
+    (crumb,) = _capture_crumbs(adapter)
+    assert crumb["stage"] == "payload"
+    assert crumb["error"] == "payload is dict, not a message list"
+
+
+def test_capture_usage_dump_fault_is_crumbed_and_keeps_the_usage(tmp_path):
+    """DW-461: an unwritable transcript is crumbed `stage=dump`, and the tally is
+    stashed before the dump, so the write fault no longer costs the usage."""
+    adapter = make_adapter(tmp_path)
+    # no task dir: the dump's write_text raises FileNotFoundError; the crumb's own
+    # write creates the dir, so it still lands
+    transcript, sess = _capture(adapter, _ScriptedGetClient(_HEALTHY_MESSAGES), make_dir=False)
+    assert transcript is None
+    assert adapter.read_usage(
+        SessionResult(status="completed", session_id=sess.session_id)
+    ) == TokenUsage(input_tokens=3, output_tokens=1)
+    (crumb,) = _capture_crumbs(adapter)
+    assert crumb["stage"] == "dump" and crumb["error"].startswith("FileNotFoundError")
+
+
+def test_capture_usage_healthy_writes_no_crumb(tmp_path):
+    adapter = make_adapter(tmp_path)
+    transcript, sess = _capture(adapter, _ScriptedGetClient(_HEALTHY_MESSAGES))
+    assert transcript is not None
+    assert adapter.read_usage(
+        SessionResult(status="completed", session_id=sess.session_id)
+    ) == TokenUsage(input_tokens=3, output_tokens=1)
+    assert _lifecycle_lines(adapter, "t-cap") == []
+
+
+def test_usage_sample_fault_streak_is_crumbed_at_transitions(tmp_path, monkeypatch):
+    """DW-461 acceptance, the generic adapter's DW-452 model on the HTTP
+    transport: a streak of failed budget samples crumbs `usage-sample-failed`
+    once at its first failure and `usage-sample-recovered` (with its length) at
+    the first clean sample — never once per failed tick — and heartbeat.json
+    carries the running streak. The guard's verdicts are unchanged: the session
+    still runs to its timeout."""
+    adapter = make_adapter(tmp_path)
+    clock = _install_clock(monkeypatch)
+    (adapter.tasks_dir / "t-1").mkdir(parents=True)
+
+    def advance():
+        clock["mono"] += generic.HEARTBEAT_INTERVAL_S + 1  # every tick samples
+
+    sess = _timeout_driven_session(adapter, advance)
+    sess.client = _ScriptedGetClient(503, RuntimeError("reset"), 503, _HEALTHY_MESSAGES)
+    beats: list[dict] = []
+    real_write = adapter._write_heartbeat
+
+    def record(task_id, payload):
+        beats.append(dict(payload))
+        real_write(task_id, payload)
+
+    adapter._write_heartbeat = record
+    spec = SessionSpec(
+        task_id="t-1",
+        role="dev",
+        prompt="p",
+        cwd=tmp_path,
+        timeout_s=(generic.HEARTBEAT_INTERVAL_S + 1) * 6,
+        token_budget=1_000_000,
+        token_budget_mode="warn",
+    )
+
+    result = adapter.wait_for_completion(SessionHandle(task_id="t-1", native_id="ses_1"), spec)
+
+    assert result.status == "timeout"
+    events = [
+        {k: v for k, v in ln.items() if k != "ts"}
+        for ln in _lifecycle_lines(adapter)
+        if ln["event"].startswith("usage-sample")
+    ]
+    assert events == [
+        {"event": "usage-sample-failed", "error": "HTTP 503"},
+        {"event": "usage-sample-recovered", "failures": 3},
+    ]
+    # the heartbeat precedes each tick's sample, so it lags the streak by one
+    assert [b["usage_sample_failures"] for b in beats[:5]] == [0, 1, 2, 3, 0]
+    assert all(b["sse_frames_dropped"] == 0 for b in beats)
 
 
 # ------------------------------------------------------------------- E2E tests
@@ -2251,6 +2880,35 @@ def test_e2e_timeout_aborts(tmp_path, fake_opencode):
     aborts = read_jsonl(rec / "aborts.jsonl")
     assert aborts and "/abort" in aborts[0]["path"]
     assert_server_gone(rec)
+
+
+def test_e2e_timeout_with_tracked_zero_usage_is_env_fault(tmp_path, fake_opencode):
+    """DW-364 through the real adapter: the timeout exit captures a finished
+    zero-token step, stashes it by session id, and the base post-mortem reads
+    it back as a tracked zero."""
+    launcher, rec = fake_opencode
+    adapter = make_adapter(tmp_path, binary=str(launcher))
+    spec = make_spec(tmp_path, rec, "busy-zero-errored", timeout_s=1.5)
+
+    result = adapter.run(spec)
+
+    assert result.status == "timeout"
+    assert adapter.read_usage(result) == TokenUsage()
+    assert result.env_fault is True
+    assert result.env_fault_evidence == ZERO_TOKEN_TIMEOUT_EVIDENCE
+
+
+def test_e2e_timeout_on_aborted_zero_step_is_not_env_fault(tmp_path, fake_opencode):
+    """The step the timeout's own abort cancelled is not a measured zero."""
+    launcher, rec = fake_opencode
+    adapter = make_adapter(tmp_path, binary=str(launcher))
+    spec = make_spec(tmp_path, rec, "busy-zero-aborted", timeout_s=1.5)
+
+    result = adapter.run(spec)
+
+    assert result.status == "timeout"
+    assert adapter.read_usage(result) is None
+    assert result.env_fault is False
 
 
 # ------------------------------ mid-session token-budget guard (#158)
@@ -2476,7 +3134,8 @@ def test_budget_grace_fires_on_wall_clock_when_monotonic_frozen(tmp_path, monkey
 def test_budget_nudge_send_failure_still_arms_grace(tmp_path, monkeypatch):
     """A dead/hung server can reject the wrap-up nudge (the HTTP send raises);
     the trip must survive it and the grace still arm — the session is then
-    scored via the normal paths (here: grace expiry → over_budget)."""
+    scored via the normal paths (here: grace expiry → over_budget). The
+    undelivered nudge is crumbed `nudge-send-failed` (`budget`, DW-503)."""
     adapter = make_adapter(tmp_path, policy=_budget_policy())
     clock = _install_clock(monkeypatch)
     (adapter.tasks_dir / "t-1").mkdir(parents=True)
@@ -2488,7 +3147,7 @@ def test_budget_nudge_send_failure_still_arms_grace(tmp_path, monkeypatch):
     sess.client = _BigUsageClient()
 
     def boom(handle, text):
-        raise RuntimeError("http send failed")
+        raise OpencodeNudgeSendError("http send failed")
 
     adapter.send_text = boom
 
@@ -2498,6 +3157,9 @@ def test_budget_nudge_send_failure_still_arms_grace(tmp_path, monkeypatch):
 
     assert result.status == "over_budget"
     assert result.budget_weighted == 5_000_000
+    (failed,) = [ln for ln in _lifecycle_lines(adapter) if ln["event"] == "nudge-send-failed"]
+    assert failed["nudge"] == "budget"
+    assert failed["error"] == "OpencodeNudgeSendError: http send failed"
 
 
 def test_budget_zero_grace_dead_server_takes_crash_path(tmp_path, monkeypatch):
@@ -2907,6 +3569,39 @@ def test_dev_stall_arms_at_launch_without_stop(tmp_path, monkeypatch):
 
     assert (result.status, sent) == ("stalled", [STALL_NUDGE_TEXT] * 2)
     assert heartbeats[0]["stall_armed"] is True
+
+
+def test_dev_stall_nudge_send_failure_is_crumbed_and_loop_continues(tmp_path, monkeypatch):
+    """DW-503: an undelivered stall nudge raises out of `send_text`; the stall
+    site crumbs `nudge-send-failed` (`stall`) per failed attempt and the loop
+    reaches the same `stalled` verdict as a delivered pair would. Ablation: drop
+    the site's guard and the typed fault escapes `wait_for_completion`."""
+    adapter, _ = make_dev_adapter(tmp_path)
+    adapter._stall_grace_s = 10.0
+    adapter._stall_nudges = 2
+    adapter.silence_threshold_s = float("inf")
+    clock = _install_clock(monkeypatch)
+    (adapter.tasks_dir / "t-1").mkdir(parents=True)
+
+    def advance():
+        clock["mono"] += 11.0
+
+    _timeout_driven_session(adapter, advance)
+    monkeypatch.setattr(adapter, "_session_status", lambda _sess: False)
+
+    def boom(_handle, text):
+        raise OpencodeNudgeSendError("prompt_async failed: 500")
+
+    monkeypatch.setattr(adapter, "send_text", boom)
+
+    result = adapter.wait_for_completion(
+        SessionHandle(task_id="t-1", native_id="ses_1"),
+        _timeout_spec(tmp_path, timeout_s=100.0),
+    )
+
+    assert result.status == "stalled"
+    failed = [ln for ln in _lifecycle_lines(adapter) if ln["event"] == "nudge-send-failed"]
+    assert [ln["nudge"] for ln in failed] == ["stall", "stall"]
 
 
 def test_dev_activity_rearms_launch_stall_grace(tmp_path, monkeypatch):
@@ -3607,11 +4302,28 @@ def test_opencode_env_fault_skips_completed_and_result_bearing(tmp_path):
     assert not (adapter.tasks_dir / _EF_TASK / "session-lifecycle.jsonl").exists()
 
 
-def test_opencode_env_fault_missing_log_degrades_silently(tmp_path):
-    """Best-effort doctrine: an unreadable log leaves the verdict untouched."""
+def test_opencode_env_fault_missing_log_declines_with_a_crumb(tmp_path):
+    """Best-effort doctrine: an unreadable log leaves the verdict untouched — and
+    says so (DW-460). This host reaches the crumb through the same
+    `_note_lifecycle` it inherits from `_ResultFileMixin`, and names the file it
+    actually scans (`.server.out`), not the transcript."""
     adapter = make_adapter(tmp_path)
     result = _ef_classify(adapter, "timeout", task_id="never-ran")
     assert result.env_fault is False
+    events = _lifecycle_lines(adapter, "never-ran")
+    assert [e["event"] for e in events] == ["env-fault-scan-failed"]
+    assert events[0]["stage"] == "read"
+    assert events[0]["log"] == str(adapter.logs_dir / "never-ran.server.out")
+    assert events[0]["error"].startswith("FileNotFoundError: ")
+
+
+def test_opencode_env_fault_clean_scan_leaves_no_crumb(tmp_path):
+    """The healthy half of DW-460: a readable log with no match is an answer, and
+    writes nothing."""
+    adapter = make_adapter(tmp_path)
+    _write_ef_log(adapter, "cleanup prune=7.days\n")
+    assert _ef_classify(adapter, "timeout").env_fault is False
+    assert _lifecycle_lines(adapter, _EF_TASK) == []
 
 
 def test_e2e_env_fault_classified_through_run(tmp_path, fake_opencode):
@@ -3682,4 +4394,115 @@ def test_env_fault_log_is_dropped_at_session_start(tmp_path, fake_opencode):
 
     assert result.status == "timeout"
     assert result.env_fault is False, f"classified off a stale log: {result.env_fault_evidence}"
+    # No token-bearing assistant message: untracked, never stashed as a zero (DW-364).
+    assert adapter.read_usage(result) is None
     assert "Usage limit reached" not in stale.read_text(encoding="utf-8", errors="replace")
+
+
+# ---------------------------------- undelivered nudges are not "sent" (DW-503)
+#
+# `send_text` used to swallow every `_prompt` fault, so the `_DevSynthesisMixin`
+# contract nudge's else-arm always crumbed `contract-nudge-sent`. It now raises
+# the typed `OpencodeNudgeSendError` (a `MultiplexerError`), which the mixin's
+# existing except-arm turns into `nudge-send-failed`; the wait loop's own nudge
+# sites catch it locally so the completion loop never breaks.
+
+
+def test_send_text_raises_typed_fault_on_prompt_failure(tmp_path):
+    """The transport contract itself: a failing `_prompt` surfaces as the typed
+    seam fault, chained from the cause, and a nudge to an unknown task is
+    undelivered too — never a silent return."""
+    adapter = make_adapter(tmp_path)
+    _timeout_driven_session(adapter, lambda: None)
+    cause = OpencodeServerError("prompt_async failed: 500 boom")
+
+    def failing(_sess, _text):
+        raise cause
+
+    adapter._prompt = failing
+
+    with pytest.raises(OpencodeNudgeSendError) as info:
+        adapter.send_text(SessionHandle(task_id="t-1", native_id="ses_1"), "nudge")
+    assert isinstance(info.value, generic.MultiplexerError)
+    assert info.value.__cause__ is cause
+    assert str(info.value) == "OpencodeServerError: prompt_async failed: 500 boom"
+
+    with pytest.raises(OpencodeNudgeSendError, match="no live opencode session"):
+        adapter.send_text(SessionHandle(task_id="gone", native_id="ses_2"), "nudge")
+
+
+def test_dev_contract_nudge_send_failure_crumbs_failed_not_sent(tmp_path, monkeypatch):
+    """The seam DW-503 is about: an opencode dev session's contract nudge whose
+    `prompt_async` fails goes through the REAL `send_text`, so the shared mixin
+    crumbs `nudge-send-failed` (`contract`) and never `contract-nudge-sent`; the
+    exactly-once budget still holds and the next stable Stop synthesizes.
+    Ablation: restore the swallowing `send_text` and `contract-nudge-sent`
+    reappears while `nudge-send-failed` vanishes."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    task_id = "3-1-dev-1"
+    (adapter.tasks_dir / task_id).mkdir(parents=True)
+    _timeout_driven_session(adapter, lambda: None, task_id=task_id)
+    calls = {"n": 0}
+
+    def failing(_sess, _text):
+        calls["n"] += 1
+        raise OpencodeServerError("prompt_async failed: 503 unavailable")
+
+    adapter._prompt = failing
+    spec_file = impl / "spec-3-1-foo.md"
+    spec_file.write_text("---\nstatus: done\nbaseline_revision: abc123\n---\n\n# Story\n\nDone.\n")
+    handle = SessionHandle(task_id=task_id, native_id="ses_1", launched_ns=0)
+    spec = SessionSpec(
+        task_id=task_id,
+        role="dev",
+        prompt="/bmad-dev-auto 3-1",
+        cwd=tmp_path,
+        env={"BMAD_LOOP_STORY_KEY": "3-1"},
+    )
+
+    assert adapter._result_json(handle, spec, wait=True) is None
+
+    assert calls["n"] == 1
+    events = _lifecycle_lines(adapter, task_id)
+    assert [ln for ln in events if ln["event"] == "contract-nudge-sent"] == []
+    (failed,) = [ln for ln in events if ln["event"] == "nudge-send-failed"]
+    assert failed["nudge"] == "contract"
+    assert failed["error"] == (
+        "OpencodeNudgeSendError: OpencodeServerError: prompt_async failed: 503 unavailable"
+    )
+
+    # second stable Stop: already attempted -> no retry, and the fallback harvests
+    rj = adapter._result_json(handle, spec, wait=True)
+    assert rj is not None and rj["synthesized_from_frontmatter"] is True
+    assert calls["n"] == 1
+
+
+def test_e2e_result_less_stop_nudge_send_failure_is_crumbed(tmp_path, fake_opencode):
+    """The stop-nudge site over a real server: the wake-up nudge's POST fails,
+    the site crumbs `nudge-send-failed` (`stop`) and the loop settles through
+    its ordinary verdict paths instead of raising out of `run()`."""
+    launcher, rec = fake_opencode
+    adapter = make_adapter(tmp_path, binary=str(launcher))
+    adapter._stall_grace_s = 0.0
+    spec = make_spec(tmp_path, rec, "nudge-then-complete", timeout_s=2.5)
+    real_prompt = adapter._prompt
+    calls = {"n": 0}
+
+    def fail_the_nudge(sess, text):
+        calls["n"] += 1
+        if calls["n"] > 1:
+            raise OpencodeServerError("prompt_async failed: 500 nudge refused")
+        real_prompt(sess, text)
+
+    adapter._prompt = fail_the_nudge
+
+    result = adapter.run(spec)
+
+    # the wake-up never reached the server, so no second idle arrives: the loop
+    # runs out the clock exactly as it did when the fault was swallowed
+    assert result.status == "timeout"
+    assert prompt_texts(rec)[1:] == []
+    failed = [ln for ln in _lifecycle_lines(adapter) if ln["event"] == "nudge-send-failed"]
+    assert [ln["nudge"] for ln in failed] == ["stop"]
+    assert_server_gone(rec)

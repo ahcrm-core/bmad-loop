@@ -881,6 +881,40 @@ def gates(entry: DWEntry) -> EntryGates:
     )
 
 
+def field_values(entry: DWEntry, field: str) -> tuple[str, ...]:
+    """Every value one entry's canonical span declares for ``field``, order-preserving.
+
+    :func:`field_line_present` answers the appenders' dedupe question ("does the
+    entry hold this key"), while this one answers "which dedupe keys does the
+    entry hold" for ``validate_migration``, which has to hold a rewrite to them.
+    Filtered through :func:`_quoted` like every gate scan here, so an entry
+    quoting a worked example does not have the example's ``origin:`` snapshotted
+    as a key it owns.
+
+    Anchored like ``status:`` — lowercase, column 0 — which is the only spelling
+    :func:`field_line_present` matches, so an indented or capitalised line is no
+    key to either reader. Both readers apply the same fence rule too (DW-408), so
+    a FENCED column-0 line is a key to neither: dropping one is accepted, while a
+    live key moved into a fence is refused — the loss this guards against is of
+    the key an appender wrote, and appenders write it live. Each value drops surrounding
+    whitespace and ONE wrapping backtick pair: :func:`append_entry` writes
+    ``source_spec`` backtick-wrapped and :func:`field_line_present` matches
+    either spelling, so a rewrap between the two is not a changed key.
+    Duplicates collapse — a repeated line is one key, not two.
+    """
+    pattern = re.compile(rf"^{re.escape(field)}:[ \t]*(.*)$", re.MULTILINE)
+    values: list[str] = []
+    for m in pattern.finditer(entry.body):
+        if _quoted(entry, m.start()):
+            continue
+        value = m.group(1).strip(" \t")
+        if len(value) >= 2 and value.startswith("`") and value.endswith("`"):
+            value = value[1:-1]
+        if value not in values:
+            values.append(value)
+    return tuple(values)
+
+
 def _matchable_token(token: str) -> bool:
     """Whether ``token`` could gate any legal story key — the test that decides
     :attr:`EntryGates.tokens` vs :attr:`EntryGates.malformed`.
@@ -1565,7 +1599,9 @@ _MARK_DONE_TAIL_RE = re.compile(
 )
 
 
-def _apply_open(text: str, dw_id: str, note: str, undo_owner: str) -> str | None:
+def _apply_open(
+    text: str, dw_id: str, note: str, undo_owner: str, archive: str | None = None
+) -> str | None:
     """Undo one reopenable close *within* `text`. None when the entry is missing,
     already open, or does not carry this operation's adjacent resolution and
     undo-marker lines.
@@ -1582,7 +1618,20 @@ def _apply_open(text: str, dw_id: str, note: str, undo_owner: str) -> str | None
     A live ``archived:`` stamp is demoted to :data:`_ARCHIVED_BODY_FIELD` rather
     than dropped: the reopened entry is no longer archived, but the body its
     close moved out still is, and that line is the only thing a later triage has
-    to find it with."""
+    to find it with.
+
+    `archive` is the archive sidecar's text, or None when the caller did not
+    read it (it was absent, or no id needed it). Given, and the entry is a stub
+    written before severity preservation (:func:`_needs_severity_recovery`), the
+    severity lines of the stamp's archive block (:func:`_archived_severity_lines`)
+    are restored immediately before the first live stamp, so the reopened entry
+    stays selectable by a severity floor (DW-334/DW-394). A modern stub keeps
+    the same lines in body order among its other preserved fields, so the bytes
+    match a reopen of the modern twin only when severity follows `gate:`,
+    `origin:` and `source_spec:` in the archived body — the order
+    :func:`append_entry` writes. Nothing else is rehydrated. The archive arrives as text so
+    this stays pure; reading it, and failing loud when it cannot be, is
+    :func:`mark_open_many`'s job."""
     entry = _find_entry(text, dw_id)
     if entry is None or entry.open:
         return None
@@ -1640,6 +1689,17 @@ def _apply_open(text: str, dw_id: str, note: str, undo_owner: str) -> str | None
     # Cuts are disjoint (an `^archived:` line cannot start inside the status
     # line or its adjacent tail) and applied back-to-front so earlier offsets
     # stay valid.
+    #
+    # A recovered severity rides on the FIRST stamp's replacement rather than
+    # as a zero-width cut of its own at the same offset: one cut per span keeps
+    # the back-to-front order unambiguous.
+    restored = ""
+    if archive is not None and _needs_severity_recovery(entry):
+        archived_stamp = _archived_stamp(entry)
+        assert archived_stamp is not None  # _needs_severity_recovery requires one
+        restored = "".join(
+            f"{line}\n" for line in _archived_severity_lines(archive, entry.id, archived_stamp)
+        )
     cuts = [(start, end, previous_status_line)]
     for cut_start, cut_end in _archived_line_spans(entry):
         # Everything after the field name — value, spacing and the terminating
@@ -1650,16 +1710,21 @@ def _apply_open(text: str, dw_id: str, note: str, undo_owner: str) -> str | None
             (
                 entry.span[0] + cut_start,
                 entry.span[0] + cut_end,
-                f"{_ARCHIVED_BODY_FIELD}{stamp}",
+                f"{restored}{_ARCHIVED_BODY_FIELD}{stamp}",
             )
         )
+        restored = ""
     for cut_start, cut_end, replacement in sorted(cuts, reverse=True):
         text = text[:cut_start] + replacement + text[cut_end:]
     return text
 
 
 def _apply_open_many(
-    text: str, dw_ids: Sequence[str], note: str, undo_owner: str
+    text: str,
+    dw_ids: Sequence[str],
+    note: str,
+    undo_owner: str,
+    archive: str | None = None,
 ) -> tuple[str, list[str]]:
     """Fold every id in `dw_ids` through :func:`_apply_open` *within* `text`,
     returning the new text and the ids actually reopened, in the order given.
@@ -1668,10 +1733,14 @@ def _apply_open_many(
     advisory pre-lock probe and the locked pass, so the two cannot drift. The
     `undo_owner` match is part of the decision: an entry closed by a different
     operation is skipped here, which is what makes "no id was eligible" a
-    question only this fold can answer."""
+    question only this fold can answer.
+
+    `archive` is threaded to every :func:`_apply_open` untouched. It changes
+    which lines a reopen restores, never whether an id reopens, so the ids this
+    returns do not depend on it."""
     reopened: list[str] = []
     for dw_id in dw_ids:
-        updated = _apply_open(text, dw_id, note, undo_owner)
+        updated = _apply_open(text, dw_id, note, undo_owner, archive)
         if updated is None:
             continue
         text = updated
@@ -1696,7 +1765,21 @@ def mark_open_many(path: Path, dw_ids: Sequence[str], note: str, operation_id: s
     Nothing is written when no id was eligible, and no lock is taken either
     (#736): a replayed rollback over already-reopened entries is answered from
     one advisory read, so it leaves the file untouched rather than rewriting it
-    byte-for-byte, and cannot fail on a lock it had no write to serialize."""
+    byte-for-byte, and cannot fail on a lock it had no write to serialize.
+
+    A reopened stub written before severity preservation gets its severity back
+    from the archive sidecar (DW-334/DW-394; see :func:`_apply_open`). The
+    sidecar is read under the same hold, whenever some id being reopened is an
+    archived stub with no live severity line (:func:`_needs_severity_recovery`)
+    — a modern stub whose body never had a severity looks exactly like a
+    pre-695d4d6e one until the archive is read. Only a batch whose reopened
+    stubs all carry a severity line never reads it. An absent archive restores
+    nothing, but a REFUSED one (:class:`LedgerReadFault`/:class:`LedgerReadError`)
+    raises and publishes nothing for the WHOLE batch — a severity-less reopen
+    over an archive that exists would be the silent degrade this recovery
+    exists to end, the same disposition as :func:`archive_closed`'s read of
+    that file. The advisory
+    probe decides only "would anything reopen" and never reads the archive."""
     undo_owner = _operation_digest(operation_id)
     if not dw_ids:
         # No ids, no lock — see `_mark_done_many`. The `operation_id` above is
@@ -1722,12 +1805,24 @@ def mark_open_many(path: Path, dw_ids: Sequence[str], note: str, operation_id: s
     with ledger_lock(path):
         # REPAIR/WRITE (DW-146): this text is edited and published below. `None`
         # is absence alone; a refusal raises out of the reader (DW-221/255).
-        text = read_for_write(path)
-        if text is None:
+        original = read_for_write(path)
+        if original is None:
             return []
-        text, reopened = _apply_open_many(text, dw_ids, note, undo_owner)
+        text, reopened = _apply_open_many(original, dw_ids, note, undo_owner)
         if not reopened:
             return []
+        # Each reopen edits only its own entry, so the original text answers
+        # "does this stub need recovery" for every id the fold reopened.
+        if any(
+            (entry := _find_entry(original, dw_id)) is not None and _needs_severity_recovery(entry)
+            for dw_id in reopened
+        ):
+            # REPAIR/WRITE (DW-146): what this read returns is written into the
+            # ledger below, so a refusal raises rather than publishing a reopen
+            # that silently lost the severity it was read to restore.
+            archive = read_for_write(path.parent / ARCHIVE_REL)
+            if archive is not None:
+                text, reopened = _apply_open_many(original, dw_ids, note, undo_owner, archive)
         _publish(path, text)
         return reopened
 
@@ -1913,23 +2008,41 @@ def append_decision(path: Path, dw_id: str, date: str, label: str, detail: str) 
 
 
 DW_ID_RE = re.compile(r"\bDW-(\d+)\b")
+# The id a `### DW-<n>` heading line carries, read looser than `HEADING_RE` on
+# purpose: a heading with no colon, a blank title, extra whitespace after the
+# hashes or a few spaces of indent is malformed, but its number is still spoken
+# for. Fences are not masked either — erring toward a burned number, never a
+# reused one.
+_SEQ_HEADING_RE = re.compile(r"^ {0,3}###[ \t]+DW-(\d+)\b", re.MULTILINE)
 
 
 def next_seq(text: str) -> int:
-    """The next free DW sequence number — one past the highest DW-<n> anywhere
-    in the ledger (malformed entries included, so a number is never reused and
-    the sweep numbering check stays satisfied)."""
-    nums = [int(m.group(1)) for m in DW_ID_RE.finditer(text)]
+    """The next free DW sequence number — one past the highest id any
+    ``### DW-<n>`` heading carries (malformed headings included, so a number is
+    never reused and the sweep numbering check stays satisfied).
+
+    Headings only (DW-384): a ``DW-<n>`` mentioned in an entry's body, in
+    surrounding prose, or later in a heading's own title names an entry rather
+    than allocating one, so a note citing a far-higher id no longer burns the
+    id space up to it."""
+    nums = [int(m.group(1)) for m in _SEQ_HEADING_RE.finditer(text)]
     return (max(nums) + 1) if nums else 1
 
 
-def field_line_present(body: str, field: str, value: str) -> bool:
-    """True when `body` has a `field:` line whose value is exactly `value`,
+def field_line_present(entry: DWEntry, field: str, value: str) -> bool:
+    """True when `entry` has a live `field:` line whose value is exactly `value`,
     matching the shapes append_entry writes (plain, or backtick-wrapped as for
     `source_spec:`). Anchored per-line so an incidental substring elsewhere in
-    the body (e.g. inside `reason:`) never counts as a match."""
-    v = re.escape(value)
-    return re.search(rf"(?m)^{re.escape(field)}:[ \t]*`?{v}`?[ \t]*$", body) is not None
+    the body (e.g. inside `reason:`) never counts as a match.
+
+    Fence-aware through :func:`_quoted`, like :func:`field_values` (DW-408): an
+    entry quoting a worked example carries the example's `origin:` and
+    `source_spec:` lines in column 0, right where the anchor looks, and a quoted
+    example is not a key the entry holds. Read over the raw body, it suppressed
+    a legitimate append and a harvest filing whose only "twin" was that
+    example."""
+    pattern = re.compile(rf"^{re.escape(field)}:[ \t]*`?{re.escape(value)}`?[ \t]*$", re.MULTILINE)
+    return any(not _quoted(entry, m.start()) for m in pattern.finditer(entry.body))
 
 
 @dataclass(frozen=True)
@@ -1945,7 +2058,17 @@ class EntrySpec:
     ``origin`` alone. It is opt-in because only producers whose origin is already
     a complete, spec-independent work identity may safely collapse rows from
     different source specs. The scan remains open-only so resolved work can be
-    filed again when it recurs."""
+    filed again when it recurs.
+
+    ``dedupe_any_status`` (DW-388) is the opposite trade: an entry of ANY status —
+    open, done, legacy, or an :func:`archive_closed` stub, which keeps its
+    ``origin:`` line — carrying the same ``origin`` suppresses the append, whatever
+    its ``source_spec``. It is for producers whose origin names ONE immutable
+    commitment (a retro action item's stable id), where recurrence is meaningless
+    and a finished item must never be re-filed. With it set, the advisory pre-lock
+    no-op in :func:`append_entries_published` stays safe: entries are never deleted
+    and stubs keep ``origin:``, so a twin observed before the lock is still there
+    under it — unlike the open-only arms, whose twin can close in between."""
 
     title: str
     origin: str
@@ -1955,6 +2078,7 @@ class EntrySpec:
     status: str = "open"
     severity: str | None = None
     cross_spec_dedupe: bool = False
+    dedupe_any_status: bool = False
 
 
 def _apply_append(text: str, spec: EntrySpec) -> tuple[str, str | None]:
@@ -1980,7 +2104,9 @@ def _apply_append(text: str, spec: EntrySpec) -> tuple[str, str | None]:
     The scan is deliberately open-only for both match arms: a closed entry with
     the same marker does not suppress the append, because the work has come
     back. The origin-only arm is opt-in so non-harvest producers keep the
-    released exact-pair semantics."""
+    released exact-pair semantics. ``dedupe_any_status`` is the one exception,
+    and it is opt-in too: its origin-only match counts entries of every status
+    (see :class:`EntrySpec`)."""
     given_title = bool(spec.title)
     title = _one_line(spec.title)
     origin = _one_line(spec.origin)
@@ -1988,9 +2114,13 @@ def _apply_append(text: str, spec: EntrySpec) -> tuple[str, str | None]:
     reason = _one_line(spec.reason)
     location = _one_line(spec.location)
     for entry in parse_ledger(text):
-        if not entry.open or not field_line_present(entry.body, "origin", origin):
+        if spec.dedupe_any_status:
+            if field_line_present(entry, "origin", origin):
+                return text, None
             continue
-        if spec.cross_spec_dedupe or field_line_present(entry.body, "source_spec", source_spec):
+        if not entry.open or not field_line_present(entry, "origin", origin):
+            continue
+        if spec.cross_spec_dedupe or field_line_present(entry, "source_spec", source_spec):
             return text, None
     dw_id = f"DW-{next_seq(text)}"
     if given_title and not title.strip():
@@ -2043,6 +2173,21 @@ def _apply_appends(text: str, specs: Sequence[EntrySpec]) -> tuple[str, list[str
         text, dw_id = _apply_append(text, spec)
         minted.append(dw_id)
     return text, minted
+
+
+def appended_text(text: str, specs: Sequence[EntrySpec]) -> str:
+    """The text :func:`append_entries` would publish over `text` for `specs`.
+
+    Pure — text in, text out — and the SAME fold the writer runs
+    (:func:`_apply_appends`), so a caller recomputing what a batch append WROTE
+    cannot drift from what it writes. The ids it would mint are dropped: a caller
+    that needs them is a writer and belongs in :func:`append_entries`. Nothing is
+    validated here, because nothing is written: a spec the writer's up-front
+    status/severity checks would refuse may still fold into text the writer would
+    never publish, or raise from the fold itself — a caller comparing against the
+    result must hand it only specs the writer accepts. The engine's harvested-carry
+    ownership proof (DW-355) recomputes its intended ledger through this."""
+    return _apply_appends(text, specs)[0]
 
 
 def append_entries(path: Path, specs: Sequence[EntrySpec]) -> list[str | None]:
@@ -2118,7 +2263,10 @@ def append_entries_published(
     An opted-in cross-spec batch always reaches the lock, even when the advisory
     fold suppresses every spec, because an observed open twin may close before
     the authoritative decision; the locked re-read must then file the recurrence
-    fresh. Deliberately NO missing-ledger guard, unlike its sibling mutators: an
+    fresh. An any-status batch (``dedupe_any_status``, DW-388) keeps the
+    lock-free no-op: its twin cannot vanish between the probe and the lock,
+    because entries are never deleted and archive stubs keep ``origin:``.
+    Deliberately NO missing-ledger guard, unlike its sibling mutators: an
     absent ledger here means CREATE, which is a write, and a write must take the
     lock.
 
@@ -2187,7 +2335,7 @@ def append_entry(
     severity: str | None = None,
 ) -> str | None:
     """Append a new canonical `### DW-<seq>` entry numbered past the highest
-    existing DW id, returning the new id (e.g. "DW-42").
+    `### DW-<n>` heading id (:func:`next_seq`), returning the new id (e.g. "DW-42").
 
     Idempotent: returns None without writing when an open entry already carries
     the same `origin:` marker and `source_spec:` — so re-running the same defer
@@ -2363,6 +2511,56 @@ def _preserved_stub_lines(entry: DWEntry) -> list[str]:
         if tail is not None:
             lines = [tail.group(0).lstrip("\n")] + lines
     return lines
+
+
+# The severity arm of `_PRESERVED_FIELD_RE` on its own: what a stub keeps of an
+# archived body's severity metadata, and so exactly what a reopen of a stub
+# written before that arm existed has to recover (DW-334/DW-394).
+_PRESERVED_SEVERITY_RE = re.compile(rf"^{_PRESERVED_SEVERITY_LINE}$", re.MULTILINE)
+
+
+def _live_severity_lines(entry: DWEntry) -> list[str]:
+    """The entry's unfenced severity/priority lines, verbatim and in body order —
+    the lines :func:`_preserved_stub_lines` copies into a stub for this arm."""
+    return [
+        entry.body[m.start() : m.end()]
+        for m in _PRESERVED_SEVERITY_RE.finditer(entry.body)
+        if not _quoted(entry, m.start())
+    ]
+
+
+def _needs_severity_recovery(entry: DWEntry) -> bool:
+    """Whether reopening `entry` must look in the archive for its severity.
+
+    A stub written before severity preservation (695d4d6e) carries a live
+    ``archived:`` stamp and no live severity/priority line, although its
+    archived body may have had one; reopened as-is it reads severity-less and a
+    ``min_severity`` sweep drops it (DW-334/DW-394). A modern stub whose
+    archived body never had a severity qualifies too: without the archive the
+    two cannot be told apart, so the archive is read for it (and a refused
+    archive refuses its reopen). Only a stub already carrying a severity line
+    never qualifies — the archive is then never read for it."""
+    return _archived_stamp(entry) is not None and not _live_severity_lines(entry)
+
+
+def _archived_severity_lines(archive: str, dw_id: str, stamp: str) -> list[str]:
+    """The live severity/priority lines of the LAST archive block for `dw_id`
+    whose own ``archived:`` stamp is `stamp`, or ``[]`` when no block matches.
+
+    Last because the archive is append-only, so for one id file order is
+    closure order — :func:`_archived_stamp`'s documented tie-break between two
+    closures archived on the same day. Lines are the ones a modern stub would
+    have preserved from that block's body (:func:`_live_severity_lines`), so a
+    recovered reopen always carries the same severity lines as a reopen of the
+    modern twin, and the same bytes when severity follows the other preserved
+    fields (`gate:`/`origin:`/`source_spec:`) in the body — the order
+    :func:`append_entry` writes. Restored lines always land just before the
+    stamp, where a modern stub keeps body order."""
+    block = None
+    for candidate in parse_ledger(archive):
+        if candidate.id == dw_id and _archived_stamp(candidate) == stamp:
+            block = candidate
+    return _live_severity_lines(block) if block is not None else []
 
 
 def _close_date(entry: DWEntry) -> str | None:

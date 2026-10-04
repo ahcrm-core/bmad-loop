@@ -28,6 +28,7 @@ from .. import policy
 from ..escalation import display_pause_reason
 from ..journal import UNREADABLE_LINE_KIND
 from ..model import (
+    PAUSE_ENVIRONMENT,
     PAUSE_EPIC_BOUNDARY,
     PAUSE_ESCALATION,
     PAUSE_PLAN_CHECKPOINT,
@@ -78,6 +79,7 @@ _PAUSE_BADGES: dict[str, tuple[str, str, str]] = {
     PAUSE_EPIC_BOUNDARY: ("epic", "epic gate", "yellow"),
     PAUSE_STORY_GATE: ("gate", "story gate", "yellow"),
     PAUSE_ESCALATION: ("esc", "escalation", "bold red"),
+    PAUSE_ENVIRONMENT: ("env", "environment fault", "bold red"),
 }
 
 
@@ -157,8 +159,13 @@ class RunHeader(Static):
         state: RunState | None,
         decision: tuple[str, str] | None = None,
         stopping: bool = False,
-        agent: data.ActiveAgent | None = None,
+        agent: data.ActiveAgent | data.UnreadableAgent | None = None,
+        state_fault: str | None = None,
+        read_faults: tuple[str, ...] = (),
     ) -> None:
+        """``state_fault`` (DW-472) marks the state shown as the last good read of a
+        state.json that no longer parses; ``read_faults`` (DW-475) are the other
+        run-dir files the poll could not read this tick, each already a sentence."""
         text = Text()
         text.append(run_id, style="bold")
         if state is not None and state.run_type != "story":
@@ -170,8 +177,15 @@ class RunHeader(Static):
         )
         if state is None:
             text.append("\nstate unavailable", style="dim")
+            if state_fault:
+                text.append(f" — {state_fault}", style="dim")
+            _append_read_faults(text, read_faults)
             self.update(text)
             return
+        if state_fault:
+            text.append(
+                f"\n⚠ state stale — {state_fault}; showing the last good read", style="yellow"
+            )
         text.append(f"  started {state.started_at}", style="dim")
         if state.current_epic is not None:
             text.append(f"  epic {state.current_epic}", style="dim")
@@ -198,7 +212,13 @@ class RunHeader(Static):
         text.append(f"  {weighted:,} tokens ({raw:,} raw)", style="dim")
 
         # The agent line: who is driving (or, when idle, who is configured to).
-        if agent is not None:
+        if isinstance(agent, data.UnreadableAgent):
+            # A session is open but its identity could not be derived (DW-474): say
+            # so, rather than fall through to the configured-agents line, which is
+            # what "no session open" looks like.
+            text.append("\nagent unreadable", style="yellow")
+            text.append(f" — {agent.error}", style="dim")
+        elif agent is not None:
             # A session is open: show the live agent, its model and stage role.
             text.append("\nagent ", style="dim")
             text.append(agent.name, style="bold cyan")
@@ -233,6 +253,20 @@ class RunHeader(Static):
                     triage = rebuilt.resolved("triage")
                     line += f" triage {agent_label(triage.name, triage.model)}"
                 text.append(line, style="dim")
+
+        # Auto-sweep outcome (#603): a refused sweep must not read like one that
+        # ran — the deferred work it would have drained is still sitting there.
+        # Wording mirrors `cmd_status`; the delivered line stays dim.
+        sweeps = data.sweep_outcomes(state)
+        if sweeps.refused:
+            detail = ", ".join(f"{trigger} ({why})" for trigger, why in sweeps.refused)
+            text.append(
+                f"\n⚠ auto-sweep not run: {detail} — deferred work is untouched",
+                style="bold yellow",
+            )
+            text.append("\n  run `bmad-loop sweep` with a clean worktree", style="dim")
+        if sweeps.triggered:
+            text.append(f"\nauto-sweep ran: {', '.join(sweeps.triggered)}", style="dim")
 
         if stopping:
             # A RUNNING or UNKNOWN run with a pending graceful-stop request: it never
@@ -276,7 +310,15 @@ class RunHeader(Static):
             if question:
                 text.append(f" — {_short(question, 100)}", style="yellow")
             text.append("\n  press a to attach and answer", style="bold yellow")
+        _append_read_faults(text, read_faults)
         self.update(text)
+
+
+def _append_read_faults(text: Text, read_faults: tuple[str, ...]) -> None:
+    # Dim, like the other observation notes: the view may be incomplete, nothing is
+    # wrong with the run itself.
+    for fault in read_faults:
+        text.append(f"\n⚠ {fault}", style="dim")
 
 
 # ------------------------------------------------------------ journal lines
@@ -290,6 +332,7 @@ _UNREADABLE_LINE_STYLE = "red"
 # kind substrings -> style, first match wins; anything else renders dim
 _JOURNAL_STYLES = (
     ("escalation-resolved", "green"),  # positive — must precede the "escalat" -> red rule
+    ("escalation-adopted", "green"),  # positive (DW-386) — same ordering constraint
     ("escalat", "red"),
     ("failed", "red"),
     ("done", "green"),

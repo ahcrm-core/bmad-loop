@@ -5,9 +5,13 @@ CLI's process under whatever interpreter the host has, so it is stdlib-only by
 contract (its docstring says so) and cannot import ``bmad_loop`` to reach this
 module — and this module cannot import it back, since it ships as package DATA
 rather than as an importable module. Hence a twin rather than shared code:
-``_LINK_REPARSE_TAGS``, ``_first_workspace``, ``_is_link_like``, ``_write_all``
-and ``_write_event`` below are byte-identical copies of the hook's, pinned that
-way by ``tests/test_events.py::test_the_twinned_source_is_identical`` — which
+``_LINK_REPARSE_TAGS``, ``_first_workspace``, ``_notification_type``,
+``_source``, the DW-507 lineage block (``_LAUNCH_SHIM_WINDOW_S``,
+``_proc_stat``, ``_cmdline``, ``_HOOK_SHELLS``, ``_runs_relay``,
+``_is_hook_wrapper``, ``_lineage``), ``_is_link_like``,
+``_write_all`` and ``_write_event`` below are byte-identical copies of the
+hook's, pinned that way by
+``tests/test_events.py::test_the_twinned_source_is_identical`` — which
 AST-extracts both sides and compares the source segments, so a fix applied to one
 writer of the events control plane and not the other cannot pass review silently.
 
@@ -28,6 +32,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import stat
 import time
 from typing import IO, Any
@@ -53,6 +58,176 @@ def _first_workspace(payload):
     if isinstance(paths, list) and paths and isinstance(paths[0], str):
         return paths[0]
     return None
+
+
+def _notification_type(payload):
+    # A Notification payload's subtype (DW-348), snake_case (claude) or camelCase.
+    # Only a string is forwarded: anything else would reach the orchestrator as a
+    # value no profile table can key on.
+    value = payload.get("notification_type") or payload.get("notificationType")
+    return value if isinstance(value, str) else None
+
+
+def _source(payload):
+    # A SessionStart payload's `source` (#767): claude/gemini send
+    # startup|resume|clear|compact; codex/copilot send their own values. Only a
+    # string is forwarded, like the notification subtype above.
+    value = payload.get("source")
+    return value if isinstance(value, str) else None
+
+
+# How long after the launched CLI the rest of its launch chain may start
+# (DW-507): a forking default-shell starts the CLI and a node shim starts the
+# real binary at once. Limitation: anything the CLI itself starts at launch (an
+# MCP server, a project SessionStart hook running another CLI) also falls inside
+# the window and reads "match", so only the #767 rules apply to it; only what an
+# agent starts after a model turn is reliably outside it.
+_LAUNCH_SHIM_WINDOW_S = 5
+
+
+def _proc_stat(pid):
+    """`(ppid, starttime in clock ticks)` from `/proc/<pid>/stat`, or None when
+    the process is gone or there is no `/proc` (Windows, macOS).
+
+    The comm field is parenthesized and may itself hold spaces or ")", so the
+    fields are split after the LAST ")": state is index 0 there, ppid index 1,
+    and starttime index 19 (fields 4 and 22 of proc(5))."""
+    path = f"/proc/{pid}/stat"  # portability: Linux-only; absent elsewhere -> None
+    try:
+        with open(path, "rb") as handle:
+            data = handle.read()
+    except (OSError, ValueError):
+        return None
+    fields = data[data.rfind(b")") + 1 :].split()
+    try:
+        return int(fields[1]), int(fields[19])
+    except (IndexError, ValueError):
+        return None
+
+
+def _cmdline(pid):
+    # The process's argv; [] when it cannot be read.
+    path = f"/proc/{pid}/cmdline"  # portability: Linux-only; absent elsewhere -> []
+    try:
+        with open(path, "rb") as handle:
+            data = handle.read()
+    except (OSError, ValueError):
+        return []
+    if not data:
+        return []
+    return [arg.decode("utf-8", "replace") for arg in data.rstrip(b"\0").split(b"\0")]
+
+
+# Shells a hook host runs a registered hook command under (`<shell> -c <command>`),
+# by basename; a login shell's argv[0] carries a leading "-".
+_HOOK_SHELLS = frozenset({"sh", "bash", "dash", "zsh", "ksh", "mksh", "ash", "fish"})
+
+
+def _runs_relay(words, event_name, invocation):
+    # Whether `words` hold `invocation` then `event_name` as consecutive words:
+    # its program by basename (`/opt/bin/bmad-loop`), the rest literally.
+    program, rest = invocation[0], [*invocation[1:], event_name]
+    for index, word in enumerate(words):
+        if word.rsplit("/", 1)[-1] == program and words[index + 1 : index + 1 + len(rest)] == rest:
+            return True
+    return False
+
+
+def _is_hook_wrapper(argv, event_name, invocation):
+    """Whether a process between the relay and the launched CLI only runs the
+    registered hook command (DW-507), read structurally from its argv:
+      - a process whose argv ENDS in the relay invocation and the event name
+        (`uv run --no-project python .../bmad_loop_hook.py Stop`), or
+      - a shell (`_HOOK_SHELLS`) whose `-c` command string holds them as
+        consecutive words, split on whitespace, quotes and shell operators (so
+        `sh -c '.../bmad-loop relay Stop && true'` counts).
+    Nothing else in the argv is read: a nested CLI whose prompt, or whose
+    launching shell's command, merely names the relay is not a wrapper — the
+    nested CLI itself is never a shell running a `-c` string."""
+    tail = argv[-len(invocation) - 1 :]
+    if len(tail) == len(invocation) + 1 and _runs_relay(tail, event_name, invocation):
+        return True
+    if not argv or argv[0].rsplit("/", 1)[-1].lstrip("-") not in _HOOK_SHELLS:
+        return False
+    args = iter(argv[1:])
+    for arg in args:
+        if not arg.startswith(("-", "+")) or arg == "--":
+            return False  # an operand before -c: a script file, not a command string
+        if arg.startswith("-") and not arg.startswith("--") and "c" in arg[1:]:
+            break
+    else:
+        return False
+    for arg in args:
+        if not arg.startswith(("-", "+")):
+            words = [word for word in re.split(r"[\s;&|()<>'\"`]+", arg) if word]
+            return _runs_relay(words, event_name, invocation)
+    return False
+
+
+def _lineage(event_name, invocation):
+    """Whether the process that fired this hook is the CLI bmad-loop launched
+    (DW-507): "match", "mismatch", or "unknown".
+
+    A nested coding CLI started from inside the session inherits the relay
+    environment, so its hooks land in the parent's event stream. The tmux
+    launch records the launched pid in $BMAD_LOOP_LAUNCH_PID; this walks the
+    relay's own parent chain toward it. Being a descendant is not enough — a
+    CLI started from the launched CLI's Bash tool is one — so the walk skips
+    only what a hook invocation legitimately puts in between:
+      - the launch chain: any process started within _LAUNCH_SHIM_WINDOW_S of
+        the launched pid. A forking default-shell (fish, dash) is the launched pid
+        and the CLI its child; a node shim's real binary is a child again.
+        Whatever the CLI starts at launch (MCP servers, a SessionStart hook
+        running another CLI) is inside the window too and reads "match".
+      - a hook-command wrapper running this relay's `invocation` (its program's
+        basename, then its literal words) for this event: see
+        `_is_hook_wrapper`.
+    Any other process on the way is a nested CLI or its shell: "mismatch". So
+    is reaching pid 1 or below without meeting the launched pid while it is
+    alive: a process from another tree.
+
+    "unknown" whenever the answer cannot be read: the variable unset or not a
+    pid, no `/proc` (Windows, macOS), the launched process gone, a process
+    vanishing mid-walk, more than 64 hops, or any unexpected fault. The tag
+    only informs the orchestrator; it never stops the event from being written.
+    """
+    try:
+        try:
+            launch_pid = int(os.environ.get("BMAD_LOOP_LAUNCH_PID") or "")
+        except ValueError:
+            return "unknown"
+        if launch_pid <= 1:
+            return "unknown"
+        launch = _proc_stat(launch_pid)
+        if launch is None:
+            return "unknown"
+        try:
+            ticks = os.sysconf("SC_CLK_TCK")
+        except (AttributeError, OSError, ValueError):
+            return "unknown"
+        if ticks <= 0:
+            return "unknown"
+        chain_window = _LAUNCH_SHIM_WINDOW_S * ticks
+        pid = os.getppid()
+        for _hop in range(64):
+            if pid == launch_pid:
+                return "match"
+            if pid <= 1:
+                return "mismatch"
+            current = _proc_stat(pid)
+            if current is None:
+                return "unknown"
+            parent, started = current
+            if 0 <= started - launch[1] <= chain_window:
+                pid = parent
+                continue
+            if _is_hook_wrapper(_cmdline(pid), event_name, invocation):
+                pid = parent
+                continue
+            return "mismatch"
+        return "unknown"
+    except Exception:
+        return "unknown"
 
 
 def _is_link_like(path):
@@ -187,8 +362,18 @@ def event_file_name(ts: int, task_id: str, event_name: str) -> str:
     return f"{ts}-{task_id}-{event_name}.json"
 
 
-def shape_event(ts: int, event_name: str, task_id: str, payload: dict[str, Any]) -> dict[str, Any]:
-    """The event record the orchestrator consumes, built from one hook payload."""
+def shape_event(
+    ts: int,
+    event_name: str,
+    task_id: str,
+    payload: dict[str, Any],
+    lineage: str | None = None,
+) -> dict[str, Any]:
+    """The event record the orchestrator consumes, built from one hook payload.
+
+    ``lineage`` is the relay-side process-lineage tag (DW-507, see
+    :func:`_lineage`); :func:`relay` computes it, since it reads this process's
+    own parent chain rather than anything in the payload."""
     return {
         "ts": ts,
         "event": event_name,
@@ -205,6 +390,17 @@ def shape_event(ts: int, event_name: str, task_id: str, payload: dict[str, Any])
         "transcript_path": payload.get("transcript_path") or payload.get("transcriptPath"),
         # agy sends no cwd — it sends workspacePaths, a list of workspace roots.
         "cwd": payload.get("cwd") or _first_workspace(payload),
+        # A Notification payload's subtype (DW-348): claude sends
+        # `notification_type` (e.g. "permission_prompt"); the profile maps it onto
+        # a parked kind. Kept only when it is a string; absent everywhere else.
+        "notification_type": _notification_type(payload),
+        # Why a SessionStart fired (#767): a "clear"/"compact" start with a new id
+        # is still the launched session, so attribution rebinds instead of
+        # reading it as a nested CLI. Kept only when it is a string.
+        "source": _source(payload),
+        # Whether the launched CLI itself fired this hook (DW-507): a tag, never
+        # a filter — the orchestrator decides what a "mismatch" means.
+        "lineage": lineage,
     }
 
 
@@ -247,7 +443,9 @@ def relay(event_name: str, stdin: IO[str]) -> int:
     if not run_dir or not task_id:
         return 0
     ts = time.time_ns()
-    event = shape_event(ts, event_name, task_id, _read_payload(stdin))
+    event = shape_event(
+        ts, event_name, task_id, _read_payload(stdin), _lineage(event_name, ("bmad-loop", "relay"))
+    )
     # $BMAD_LOOP_EVENTS_DIR when the orchestrator names one (#494 moved the
     # channel out of the project tree), else the legacy in-tree location — the
     # same preference, spelled the same way, as the copied hook script's `main()`.

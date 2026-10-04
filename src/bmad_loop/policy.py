@@ -36,9 +36,10 @@ SWEEP_AUTO_MODES = {"never", "per-epic", "run-end"}
 REVIEW_TRIGGER_MODES = {"always", "recommended"}
 REVIEW_ON_TIMEOUT_MODES = {"retry", "salvage-if-done", "defer"}
 REVIEW_ON_STATUS_CONTRADICTION_MODES = {"escalate", "retry"}
+OPERATOR_ON_REVIEW_DEMOTION_MODES = {"escalate", "park"}
 # Session stages, in run order. Lives here rather than in the TUI because
 # settings_schema's expand_stages loop fans a template section out over it.
-STAGES = ("dev", "review", "triage")
+STAGES = ("dev", "review", "triage", "retro")
 # Where the run gets its story queue. "sprint-status" (default) is the classic
 # flow — bmad-sprint-planning writes sprint-status.yaml from prose epics.
 # "stories" is the opt-in folder+id dispatch flow (BMAD-METHOD #2549): a typed,
@@ -199,6 +200,23 @@ class VerifyPolicy:
     # lands with null pointers and the full byte counts, so the journal keeps
     # saying what the command emitted even when none of it is retained.
     stream_capture_kb: int = 256
+    # env_fault_rc is the exit status a [verify] command uses to declare "the
+    # environment is broken, not the code" (DW-523): a command exiting with it is
+    # an environment fault — the run pauses and the attempt is not charged —
+    # instead of an ordinary, budget-burning verify failure. 0 = disabled. 75
+    # (EX_TEMPFAIL) is the documented suggestion: no common tool exits with it.
+    env_fault_rc: int = 0
+
+
+@dataclass(frozen=True)
+class EnvironmentPolicy:
+    # Operator-declared health checks (DW-523), run by the orchestrator in the
+    # project root before any [verify] command. A failing probe (nonzero exit,
+    # timeout, or a command that cannot be started) is an environment fault:
+    # the run pauses and the attempt is not charged. Empty = nothing spawns.
+    probes: tuple[str, ...] = ()
+    # Wall-clock bound on each probe; a probe that runs past it is a failure.
+    probe_timeout_s: int = 60
 
 
 @dataclass(frozen=True)
@@ -326,6 +344,16 @@ class OperatorPolicy:
     # know the status, so a session that writes it anyway is retried with that
     # mismatch as feedback rather than silently committing.
     enabled: bool = True
+    # What a REVIEW pass that finalizes the spec at `awaiting-operator` gets
+    # (DW-383). "escalate" (default) keeps the historical behavior: the review
+    # prompt carries no park clause, the demotion is not accepted, and the loop
+    # cycles on it like any non-terminal status. "park" takes it down the normal
+    # commit path as a park: the board moves `done -> awaiting-operator` through
+    # the one allowlisted regression (statemachine.BOARD_REGRESSIONS), the review
+    # verify gate holds it to the park pair + non-empty actions + verify commands,
+    # and the story commits to AWAITING_OPERATOR. Inert unless parking itself is
+    # live (`enabled` in sprint mode) — stories/sweep runs never park.
+    on_review_demotion: str = "escalate"
 
 
 @dataclass(frozen=True)
@@ -428,9 +456,17 @@ class AdapterPolicy:
     dev: StageAdapterPolicy = field(default_factory=StageAdapterPolicy)
     review: StageAdapterPolicy = field(default_factory=StageAdapterPolicy)
     triage: StageAdapterPolicy = field(default_factory=StageAdapterPolicy)
+    # The headless epic-boundary retrospective (`gates.retrospective = "auto"`,
+    # DW-389). Appended last: every other stage is keyword-constructed.
+    retro: StageAdapterPolicy = field(default_factory=StageAdapterPolicy)
 
     def resolved(self, role: str) -> ResolvedAdapter:
-        stage = {"dev": self.dev, "review": self.review, "triage": self.triage}.get(role)
+        stage = {
+            "dev": self.dev,
+            "review": self.review,
+            "triage": self.triage,
+            "retro": self.retro,
+        }.get(role)
         if stage is None:
             return ResolvedAdapter(
                 self.name,
@@ -511,7 +547,7 @@ def adapter_policy_from_snapshot(snapshot: dict[str, Any] | None) -> AdapterPoli
 
     ``snapshot`` is ``RunState.policy_snapshot`` — the json-round-tripped
     ``asdict(Policy)``. This reconstructs the ``[adapter]`` sub-tree (the base
-    plus the dev/review/triage :class:`StageAdapterPolicy` stages) so display
+    plus the dev/review/triage/retro :class:`StageAdapterPolicy` stages) so display
     paths can reuse the canonical :meth:`AdapterPolicy.resolved` instead of
     re-deriving its stage-inheritance / client-switch rules against a raw dict.
 
@@ -544,6 +580,7 @@ def adapter_policy_from_snapshot(snapshot: dict[str, Any] | None) -> AdapterPoli
             dev=_stage_from_snapshot(adapter_d.get("dev")),
             review=_stage_from_snapshot(adapter_d.get("review")),
             triage=_stage_from_snapshot(adapter_d.get("triage")),
+            retro=_stage_from_snapshot(adapter_d.get("retro")),
         )
     except Exception:
         return None
@@ -576,12 +613,13 @@ class ScmPolicy:
     # attempt's source but preserves the corrected spec under the BMAD artifact
     # folders, which it treats as orchestrator-owned.
     rollback_on_failure: bool = False
-    # preserve_keep bounds both recovery-ref families auto-rollback parks before
-    # its hard reset — the attempt-preserve/* branches and the
-    # refs/attempt-preserve-dirty/* worktree snapshots: each run start keeps only
-    # the N most recent per family (by committer date) and deletes the tail, so a
-    # long-lived project with rollback_on_failure on doesn't accumulate them
-    # forever. 0 = never prune (maximum safety).
+    # preserve_keep bounds the three recovery-ref families — the attempt-preserve/*
+    # branches and refs/attempt-preserve-dirty/* rollback snapshots auto-rollback
+    # parks before its hard reset, and the refs/merge-preflight-preserve/* merge
+    # pre-flight snapshots of operator edits it restores (DW-356): each run start
+    # keeps only the N most recent per family (by committer date) and deletes the
+    # tail, so a long-lived project doesn't accumulate them forever. 0 = never
+    # prune (maximum safety).
     preserve_keep: int = 20
     # failed_diff_max_mb caps the per-file size (MB) of untracked files captured
     # into a kept-failed unit's forensic changes.patch, so a stray build dir or
@@ -642,6 +680,7 @@ class Policy:
     gates: GatesPolicy = field(default_factory=GatesPolicy)
     limits: LimitsPolicy = field(default_factory=LimitsPolicy)
     verify: VerifyPolicy = field(default_factory=VerifyPolicy)
+    environment: EnvironmentPolicy = field(default_factory=EnvironmentPolicy)
     notify: NotifyPolicy = field(default_factory=NotifyPolicy)
     review: ReviewPolicy = field(default_factory=ReviewPolicy)
     stories: StoriesPolicy = field(default_factory=StoriesPolicy)
@@ -859,6 +898,7 @@ def loads(text: str, plugin_schemas: dict[str, Any] | None = None) -> Policy:
     gates_d = _section(doc, "gates")
     limits_d = _section(doc, "limits")
     verify_d = _section(doc, "verify")
+    environment_d = _section(doc, "environment")
     notify_d = _section(doc, "notify")
     review_d = _section(doc, "review")
     stories_d = _section(doc, "stories")
@@ -1017,9 +1057,31 @@ def loads(text: str, plugin_schemas: dict[str, Any] | None = None) -> Policy:
         stream_capture_kb=_typed_int(
             verify_d, "verify", "stream_capture_kb", VerifyPolicy.stream_capture_kb
         ),
+        env_fault_rc=_typed_int(verify_d, "verify", "env_fault_rc", VerifyPolicy.env_fault_rc),
     )
     if verify.stream_capture_kb < 0:
         raise PolicyError(f"verify.stream_capture_kb must be >= 0: got {verify.stream_capture_kb}")
+    if not 0 <= verify.env_fault_rc <= 255:
+        raise PolicyError(
+            "verify.env_fault_rc must be 0 (disabled) or an exit status 1-255: "
+            f"got {verify.env_fault_rc}"
+        )
+    environment = EnvironmentPolicy(
+        probes=_typed_str_tuple(environment_d, "environment", "probes") or (),
+        probe_timeout_s=_typed_int(
+            environment_d, "environment", "probe_timeout_s", EnvironmentPolicy.probe_timeout_s
+        ),
+    )
+    # A blank probe is `sh -c ""`, which exits 0: it would read as a healthy
+    # environment while checking nothing, so it is refused rather than run.
+    if any(not probe.strip() for probe in environment.probes):
+        raise PolicyError(
+            f"environment.probes entries must be non-blank commands: got {list(environment.probes)!r}"
+        )
+    if environment.probe_timeout_s < 1:
+        raise PolicyError(
+            f"environment.probe_timeout_s must be >= 1: got {environment.probe_timeout_s}"
+        )
     notify = NotifyPolicy(
         desktop=_typed_bool(notify_d, "notify", "desktop", NotifyPolicy.desktop),
         file=_typed_bool(notify_d, "notify", "file", NotifyPolicy.file),
@@ -1092,6 +1154,7 @@ def loads(text: str, plugin_schemas: dict[str, Any] | None = None) -> Policy:
         dev=_stage_adapter(adapter_d, "dev"),
         review=_stage_adapter(adapter_d, "review"),
         triage=_stage_adapter(adapter_d, "triage"),
+        retro=_stage_adapter(adapter_d, "retro"),
     )
     sweep = SweepPolicy(
         auto=_typed_str(sweep_d, "sweep", "auto", SweepPolicy.auto),
@@ -1281,8 +1344,17 @@ def loads(text: str, plugin_schemas: dict[str, Any] | None = None) -> Policy:
         tasks_height=_tui_dim(tui_d, "tasks_height"),
     )
     operator = OperatorPolicy(
-        enabled=_typed_bool(operator_d, "operator", "enabled", OperatorPolicy.enabled)
+        enabled=_typed_bool(operator_d, "operator", "enabled", OperatorPolicy.enabled),
+        on_review_demotion=_typed_str(
+            operator_d, "operator", "on_review_demotion", OperatorPolicy.on_review_demotion
+        ).strip(),
     )
+    if operator.on_review_demotion not in OPERATOR_ON_REVIEW_DEMOTION_MODES:
+        raise PolicyError(
+            "operator.on_review_demotion must be one of "
+            f"{sorted(OPERATOR_ON_REVIEW_DEMOTION_MODES)}:"
+            f" got {operator.on_review_demotion!r}"
+        )
     mux = MuxPolicy(backend=_typed_str(mux_d, "mux", "backend", MuxPolicy.backend).strip())
     if mux.backend and not _MUX_NAME_RE.match(mux.backend):
         raise PolicyError(
@@ -1292,6 +1364,7 @@ def loads(text: str, plugin_schemas: dict[str, Any] | None = None) -> Policy:
         gates=gates,
         limits=limits,
         verify=verify,
+        environment=environment,
         notify=notify,
         review=review,
         stories=stories,
@@ -1341,7 +1414,7 @@ POLICY_TEMPLATE = """\
 
 [gates]
 mode = "per-epic"            # none | per-epic | per-story-spec-approval
-retrospective = "notify"     # never | notify | auto (auto unsupported in v1)
+retrospective = "notify"     # never | notify | auto — auto runs a headless /bmad-retrospective -H session at each epic boundary and for a finished last epic at run end ([adapter.retro]) and commits its doc + board
 
 [limits]
 max_review_cycles = 3
@@ -1368,6 +1441,15 @@ session_budget_grace_s = 240 # enforce mode: seconds a tripped session gets to w
 # Deterministic gates run by the orchestrator after a clean review, before commit.
 commands = []                # e.g. ["pytest -q", "ruff check ."]
 stream_capture_kb = 256      # per-stream cap (KiB) on the verifier stdout/stderr retained under the run's verify/ directory; the TAIL is kept and the journal records the full byte count plus a truncation flag. 0 = capture nothing (records still land, with null pointers)
+env_fault_rc = 0             # exit status a [verify] command uses to declare an environment fault (pause, attempt not charged) instead of a code failure. 0 = disabled; 75 (EX_TEMPFAIL) is a good choice
+
+[environment]
+# Orchestrator-run health checks (e.g. a local container or database). They run
+# before [verify] commands, before session launches, and before a failed attempt
+# is charged. A failing probe (nonzero exit, timeout, unrunnable) is an
+# environment fault: the run pauses and the attempt is not charged.
+probes = []                  # e.g. ["pg_isready -h localhost", "curl -fsS http://localhost:54321/health"]
+probe_timeout_s = 60         # per-probe wall-clock bound; running past it is a failure
 
 [notify]
 desktop = true               # notify-send (Linux) / osascript (macOS) / PowerShell toast (Windows), best-effort
@@ -1426,11 +1508,11 @@ cleanup_session_on_finish = true  # kill the run's tmux session when it finishes
 # usage_grace_s = 8.0                # seconds to poll the transcript for token usage after a session ends
 # stop_without_result_nudges = 5     # result-less Stop signals tolerated before a session is called stalled
 
-# Per-stage overrides for the dev, review and sweep-triage passes. Unset keys
-# inherit from [adapter] when the stage runs the same client; a stage that
-# switches client falls back to that profile's defaults instead (model, effort
-# and extra_args are client-specific). Stage tables must come after the
-# [adapter] keys above.
+# Per-stage overrides for the dev, review, sweep-triage and auto-retrospective
+# passes. Unset keys inherit from [adapter] when the stage runs the same client;
+# a stage that switches client falls back to that profile's defaults instead
+# (model, effort and extra_args are client-specific). Stage tables must come
+# after the [adapter] keys above.
 # [adapter.dev]
 # model = "opus"
 # [adapter.review]
@@ -1438,6 +1520,8 @@ cleanup_session_on_finish = true  # kill the run's tmux session when it finishes
 # model = "gpt-5-codex"
 # stop_without_result_nudges = 5     # e.g. a multi-turn review needs more nudges than dev
 # [adapter.triage]
+# model = "opus"
+# [adapter.retro]                    # gates.retrospective = "auto" sessions
 # model = "opus"
 # With an opencode-http base, effort tunes reasoning per stage (opencode-http
 # only — a tmux CLI ignores it and `bmad-loop validate` warns):
@@ -1475,7 +1559,7 @@ merge_strategy = "merge"     # ff | merge | squash (worktree mode merges the uni
 delete_branch = true         # delete the unit branch after a successful merge
 keep_failed = true           # keep a failed unit's worktree+branch for inspection
 rollback_on_failure = false  # in-place (isolation="none") recovery after a failed attempt. false = never touch the tree; pause with manual recovery steps. true = auto-revert the attempt's tracked changes + remove only the untracked files this run created (WARNING: discards the attempt's uncommitted work; never a blanket git clean). Governs unattended/stopped attempts only: a resolved escalation's re-drive always auto-recovers regardless (reverts the failed source, keeps the corrected spec). Prefer isolation="worktree" to avoid touching your main checkout.
-preserve_keep = 20           # attempt-preserve/* branches and attempt-preserve-dirty/* snapshots kept at run start (per family), newest by committer date; the tail is deleted (0 = never prune)
+preserve_keep = 20           # attempt-preserve/* recovery branches, attempt-preserve-dirty/* rollback snapshots and merge-preflight-preserve/* merge pre-flight snapshots kept at run start (per family), newest by committer date; the tail is deleted (0 = never prune)
 failed_diff_max_mb = 5       # per-file size cap (MB) for untracked files in a kept-failed unit's changes.patch; oversized files are skipped with a marker
 failed_diff_unlimited = false # true = capture the failed-unit diff with no size cap (may produce very large patches; warns when active)
 # commit_message_template: when set, the commit message dev sessions use for a
@@ -1537,6 +1621,12 @@ low_frame_rate = false
 # story with `bmad-loop confirm <story-key>` once you have done those actions.
 # Turn this off to hold sessions to the two older outcomes (done / blocked).
 enabled = true
+# What happens when a REVIEW pass concludes a `done` story still owes such
+# actions and finalizes its spec at awaiting-operator. "escalate" (default): the
+# review is not offered the park and the demotion is not accepted. "park": the
+# review prompt offers the park, and a demotion that passes the verify gate
+# moves the board done -> awaiting-operator, commits, and parks the story.
+# on_review_demotion = "escalate"
 
 [mux]
 # Terminal-multiplexer backend for this machine (the transport axis — which

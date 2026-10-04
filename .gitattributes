@@ -1,0 +1,3 @@
+# Raw pipe-pane captures are byte-exact evidence (CR CR LF line ends): never
+# convert their line endings on checkout.
+tests/fixtures/*.pipe-pane.log -text

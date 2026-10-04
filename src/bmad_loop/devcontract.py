@@ -33,6 +33,7 @@ verify.py against actual on-disk state.
 from __future__ import annotations
 
 import hashlib
+import os
 import re
 from collections.abc import Mapping, Sequence, Set
 from dataclasses import dataclass
@@ -42,7 +43,8 @@ from typing import Any
 from . import deferredwork
 from .fences import fenced as _fenced
 from .frontmatter import _edit_frontmatter_block, auto_dev_baseline_of, status_of
-from .platform_util import atomic_write_bytes, atomic_write_bytes_confined
+from .model import ENV_FAULT_CLAIM_LIMIT
+from .platform_util import atomic_write_bytes, atomic_write_bytes_confined, require_root_pinned
 from .verify import DEV_WORKFLOW, operator_actions_of, read_frontmatter
 
 # The section the skill appends on EVERY terminal path (success and blocked),
@@ -98,6 +100,36 @@ def _artifact_only_asserted(detail: str) -> bool:
     A match inside a fenced block is documentation, not an assertion — the same
     reading `_section_headings` gives a fenced heading."""
     return any(not _fenced(detail, m.start()) for m in ARTIFACT_ONLY_LINE_RE.finditer(detail))
+
+
+# The session's environment-fault claim (DW-523): an `Environment fault: <text>`
+# line (`environment_fault` / `Environment-fault` spell it too) in the last
+# `## Auto Run Result`, with the same bulleted/bolded label shapes and the same
+# one-line rule as `ARTIFACT_ONLY_LINE_RE` — the text is captured up to the end
+# of the line and never borrowed from the next one (`text` excludes every
+# `splitlines` boundary). A claim decides nothing: the engine only treats it as
+# a reason to run the operator's own `[environment] probes`, whose answer alone
+# can pause. Read through `_env_fault_claim_of`, which skips fenced matches and
+# blank text.
+ENV_FAULT_LINE_RE = re.compile(
+    rf"^{_HORIZONTAL_WS_RE}*(?:[-*]{_HORIZONTAL_WS_RE}*)?"
+    rf"(?:\*\*)?environment[ _-]+fault(?:\*\*)?{_HORIZONTAL_WS_RE}*:"
+    r"(?P<text>[^\r\n\x0b\x0c\x1c-\x1e\x85\u2028\u2029]*)",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def _env_fault_claim_of(detail: str) -> str | None:
+    """The first genuine (non-fenced, non-blank) environment-fault claim in the
+    marker body, bold markers and surrounding whitespace stripped, bounded to
+    `ENV_FAULT_CLAIM_LIMIT` characters; ``None`` when the body carries none."""
+    for m in ENV_FAULT_LINE_RE.finditer(detail):
+        if _fenced(detail, m.start()):
+            continue
+        text = m.group("text").strip().strip("*").strip()
+        if text:
+            return text[:ENV_FAULT_CLAIM_LIMIT]
+    return None
 
 
 # Terminal frontmatter statuses the skill can leave behind.
@@ -527,6 +559,14 @@ def synthesize_result(
     }
     if dw_ids:
         result["dw_ids"] = list(dw_ids)
+    # The session's environment-fault claim (DW-523), carried only when the last
+    # genuine marker states one — never from a repaired marker or frontmatter.
+    # Unlike the two mints above it needs no authorship proof: the claim decides
+    # nothing, it only makes the engine run its own probes.
+    if arr.present and ORCHESTRATOR_SYNTH_NOTE not in arr.detail:
+        claim = _env_fault_claim_of(arr.detail)
+        if claim is not None:
+            result["env_fault_claim"] = claim
     # bmad-build-auto (BMAD-METHOD PR #2505) self-reviews inline and, on a `done`
     # exit, sets `followup_review_recommended: true` when its review-driven
     # changes warrant an independent second-opinion pass. The skill never sets it
@@ -674,7 +714,13 @@ def is_frontmatter_candidate(path: Path, *, since_ns: int) -> bool:
     return status_of(fm) in (DONE, BLOCKED, AWAITING_OPERATOR)
 
 
-def _atomic_write_spec(spec_path: Path, text: str, *, confine_root: Path) -> None:
+def _atomic_write_spec(
+    spec_path: Path,
+    text: str,
+    *,
+    confine_root: Path,
+    root_identity: os.stat_result | None = None,
+) -> None:
     """Rewrite ``spec_path`` with ``text`` via a same-directory temp file + atomic
     rename, so an interrupted / short / disk-full write can never truncate the
     canonical spec — a failed repair must lose no work (fault injection on the old
@@ -708,13 +754,30 @@ def _atomic_write_spec(spec_path: Path, text: str, *, confine_root: Path) -> Non
     belongs to is a pyright error rather than an unconfined write. The two
     `frontmatter`-side writers of these same files land on the identical pair of
     calls (#379); this wrapper stays for its callers' ``str``-in signature and
-    this docstring."""
+    this docstring.
+
+    ``root_identity`` pins ``confine_root`` on the terms
+    `frontmatter.set_frontmatter_status` states — forwarded on the confined arm
+    (DW-423), pre-checked on the external arm (DW-445); ``None`` is the unpinned
+    write on both. Threaded through the writers a mount-rooted caller reaches
+    (`reset_spec_status`, `strip_auto_run_result`, `reset_spec_for_replan`,
+    `append_auto_run_result`): the ``live_spec_root`` re-arm/replan writers pin
+    via `runs.live_spec_root_identity` (DW-423), and the engine's writers — which
+    confine to ``workspace.paths.project``, under worktree isolation the mount —
+    pin via `runs.mount_root_identity` when their workspace is a unit mount
+    (DW-445). `append_operator_confirmation` is project-rooted (``bmad-loop
+    confirm``) and stays unpinned."""
     payload = text.encode("utf-8")
     if spec_path.is_relative_to(confine_root):
         atomic_write_bytes_confined(
-            spec_path, payload, confine_root=confine_root, require_writable_target=True
+            spec_path,
+            payload,
+            confine_root=confine_root,
+            require_writable_target=True,
+            root_identity=root_identity,
         )
     else:
+        require_root_pinned(confine_root, root_identity)
         atomic_write_bytes(spec_path, payload, follow_symlinks=False, require_writable_target=True)
 
 
@@ -742,7 +805,13 @@ def _render_status_line(line: str, m: re.Match[str], value: str) -> str:
     return f"{pre}{q}{value}{q}{rest}" + ("\n" if line.endswith("\n") else "")
 
 
-def reset_spec_status(spec_path: Path, new_status: str, *, confine_root: Path) -> bool:
+def reset_spec_status(
+    spec_path: Path,
+    new_status: str,
+    *,
+    confine_root: Path,
+    root_identity: os.stat_result | None = None,
+) -> bool:
     """Rewrite the frontmatter ``status:`` value of a spec in place.
 
     Used by the generic-skill repair path: bmad-build-auto self-finalizes a spec to
@@ -799,12 +868,17 @@ def reset_spec_status(spec_path: Path, new_status: str, *, confine_root: Path) -
     if new_body is None:
         return False
     _atomic_write_spec(
-        spec_path, head + new_body + tail + text[fm.end() :], confine_root=confine_root
+        spec_path,
+        head + new_body + tail + text[fm.end() :],
+        confine_root=confine_root,
+        root_identity=root_identity,
     )
     return True
 
 
-def strip_auto_run_result(spec_path: Path, *, confine_root: Path) -> bool:
+def strip_auto_run_result(
+    spec_path: Path, *, confine_root: Path, root_identity: os.stat_result | None = None
+) -> bool:
     """Remove every ``## Auto Run Result`` section from a spec, in place.
 
     Companion to `reset_spec_status` on the re-drive path: re-opening a spec by
@@ -843,11 +917,15 @@ def strip_auto_run_result(spec_path: Path, *, confine_root: Path) -> bool:
         kept.append(text[pos : m.start()])
         pos = _next_heading_start(text, m.end())
     kept.append(text[pos:])
-    _atomic_write_spec(spec_path, "".join(kept), confine_root=confine_root)
+    _atomic_write_spec(
+        spec_path, "".join(kept), confine_root=confine_root, root_identity=root_identity
+    )
     return True
 
 
-def reset_spec_for_replan(spec_path: Path, *, confine_root: Path) -> bool:
+def reset_spec_for_replan(
+    spec_path: Path, *, confine_root: Path, root_identity: os.stat_result | None = None
+) -> bool:
     """Reset a spec to ``draft`` and strip its stale result transactionally.
 
     The TUI exposes those two writes as one operator action. Capture the exact
@@ -860,15 +938,23 @@ def reset_spec_for_replan(spec_path: Path, *, confine_root: Path) -> bool:
     two writes cannot leave a partial replan. A fault that leaves the preimage
     untouched does not rewrite it. If the restore itself fails, that failure
     escapes; otherwise the original stage failure is re-raised.
+
+    ``root_identity`` pins ``confine_root`` for all three writes — reset, strip
+    and the restore — so a worktree mount swapped for a link refuses the replan
+    rather than landing it outside the repository (DW-423).
     """
     original = spec_path.read_bytes()
     try:
-        reset = reset_spec_status(spec_path, "draft", confine_root=confine_root)
+        reset = reset_spec_status(
+            spec_path, "draft", confine_root=confine_root, root_identity=root_identity
+        )
         if not reset:
             if not spec_path.is_file():
                 raise FileNotFoundError(f"replan spec vanished during status reset: {spec_path}")
             return False
-        stripped = strip_auto_run_result(spec_path, confine_root=confine_root)
+        stripped = strip_auto_run_result(
+            spec_path, confine_root=confine_root, root_identity=root_identity
+        )
         if not stripped and not spec_path.is_file():
             raise FileNotFoundError(f"replan spec vanished during result strip: {spec_path}")
     except BaseException:
@@ -877,7 +963,12 @@ def reset_spec_for_replan(spec_path: Path, *, confine_root: Path) -> bool:
         except OSError:
             unchanged = False
         if not unchanged:
-            _atomic_write_spec(spec_path, original.decode("utf-8"), confine_root=confine_root)
+            _atomic_write_spec(
+                spec_path,
+                original.decode("utf-8"),
+                confine_root=confine_root,
+                root_identity=root_identity,
+            )
         raise
     return True
 
@@ -915,7 +1006,12 @@ OPERATOR_CONFIRM_NOTE = (
 
 
 def append_auto_run_result(
-    spec_path: Path, status: str, *, confine_root: Path, detail: str = ""
+    spec_path: Path,
+    status: str,
+    *,
+    confine_root: Path,
+    detail: str = "",
+    root_identity: os.stat_result | None = None,
 ) -> bool:
     """Append a synthesized ``## Auto Run Result`` marker section — the inverse of
     `strip_auto_run_result`.
@@ -949,7 +1045,11 @@ def append_auto_run_result(
     blank / ``Status: <status>`` / blank / the provenance note (plus an optional
     detail paragraph). ``status`` is normalized lowercase and MUST be the spec's
     own frontmatter ``status`` — the caller passes exactly that — so
-    `synthesize_result`'s ``consistent`` cross-check holds on every later re-read."""
+    `synthesize_result`'s ``consistent`` cross-check holds on every later re-read.
+
+    ``root_identity`` pins ``confine_root`` as `_atomic_write_spec` states: the
+    engine's marker repair passes `runs.mount_root_identity` of its unit mount
+    (DW-445), ``None`` otherwise."""
     if not spec_path.is_file():
         return False
     # Raw read (not read_text): preserve the file's exact line endings, and let an
@@ -974,7 +1074,9 @@ def append_auto_run_result(
     section = f"## Auto Run Result{nl}{nl}Status: {status}{nl}{nl}{ORCHESTRATOR_SYNTH_NOTE}{nl}"
     if detail:
         section += f"{nl}{detail.strip()}{nl}"
-    _atomic_write_spec(spec_path, text + section, confine_root=confine_root)
+    _atomic_write_spec(
+        spec_path, text + section, confine_root=confine_root, root_identity=root_identity
+    )
     return True
 
 

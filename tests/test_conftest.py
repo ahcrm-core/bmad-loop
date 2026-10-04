@@ -24,14 +24,15 @@ import shlex
 import subprocess
 import sys
 import tomllib
-from dataclasses import replace
+import warnings
+from dataclasses import fields, replace
 from pathlib import Path
 
 import conftest
 import pytest
 from conftest import make_git_noisy
 
-from bmad_loop import bmadconfig, verify
+from bmad_loop import bmadconfig, envvars, verify
 
 
 def test_template_drops_sample_hooks_but_keeps_hooks_dir_and_exclude(project):
@@ -57,6 +58,206 @@ def test_template_drops_sample_hooks_but_keeps_hooks_dir_and_exclude(project):
     assert list(hooks.glob("*.sample")) == []
     assert hooks.is_dir()
     assert (git_dir / "info" / "exclude").is_file()
+
+
+def test_state_roots_are_independent(_state_root_allocator, tmp_path):
+    """Every root is a distinct, freshly created, empty directory, and a write into one
+    is invisible in any other — including this test's own autouse root.
+
+    Ablation target: make `StateRootAllocator.allocate` hand back one fixed child (an
+    `exist_ok=True` mkdir of a constant name) and the distinctness and cross-write
+    assertions fail; point `_isolate_state_root` back at `tmp_path_factory.mktemp` and
+    the own-root assertion fails, because that root no longer lives under the
+    worker's allocator."""
+    own = Path(os.environ[envvars.STATE_DIR])
+    assert own.is_dir()
+    assert own.is_relative_to(
+        _state_root_allocator.base
+    ), "the autouse state root is not drawn from the per-worker allocator"
+
+    allocator = conftest.StateRootAllocator(tmp_path / "base")
+    allocator.base.mkdir()
+    first, second = allocator.allocate(), allocator.allocate()
+    live = _state_root_allocator.allocate()
+    roots = [own, first, second, live]
+    assert len({r.resolve() for r in roots}) == len(roots)
+    for root in (first, second, live):
+        assert root.is_dir()
+        assert list(root.iterdir()) == []
+
+    (first / "runs" / "RID").mkdir(parents=True)
+    (first / "runs" / "RID" / "state.json").write_text("first\n", encoding="utf-8")
+    (second / "marker").write_text("second\n", encoding="utf-8")
+
+    assert sorted(p.relative_to(first).as_posix() for p in first.rglob("*")) == [
+        "runs",
+        "runs/RID",
+        "runs/RID/state.json",
+    ]
+    assert [p.name for p in second.iterdir()] == ["marker"]
+    assert (second / "marker").read_text(encoding="utf-8") == "second\n"
+    assert list(live.iterdir()) == []
+    assert not (own / "marker").exists()
+    assert not (own / "runs" / "RID").exists()
+
+
+def test_state_allocation_does_not_rescan_prior_roots(tmp_path, tmp_path_factory):
+    """Allocation cost is a constant number of directory operations: no listing of the
+    roots already handed out, one `mkdir` per root plus one per bucket, and no
+    directory holding more than one bucket's worth of entries.
+
+    Counted, not timed: a wall-clock threshold would be both flaky and blind on a fast
+    disk. The control half proves the counter can see a scan at all — pytest's own
+    numbered `mktemp`, the allocation this replaced, lists its parent every call.
+
+    Ablation target: derive `allocate`'s index from `len(list(self.base.iterdir()))`
+    (or any other listing) and the zero-listing assertion fails; drop the bucketing and
+    the fanout assertion does."""
+    allocator = conftest.StateRootAllocator(tmp_path / "base")
+    allocator.base.mkdir()
+    size = conftest.StateRootAllocator.BUCKET_SIZE
+    count = 3 * size + 5
+    buckets = -(-count // size)
+
+    listings: list[str] = []
+    mkdirs: list[Path] = []
+    real_scandir, real_listdir, real_mkdir = os.scandir, os.listdir, Path.mkdir
+
+    def scandir(path=".", *args, **kwargs):
+        listings.append(str(path))
+        return real_scandir(path, *args, **kwargs)
+
+    def listdir(path=".", *args, **kwargs):
+        listings.append(str(path))
+        return real_listdir(path, *args, **kwargs)
+
+    def mkdir(self, *args, **kwargs):
+        mkdirs.append(self)
+        return real_mkdir(self, *args, **kwargs)
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(os, "scandir", scandir)
+        mp.setattr(os, "listdir", listdir)
+        mp.setattr(Path, "mkdir", mkdir)
+        roots = [allocator.allocate() for _ in range(count)]
+        allocation_listings, allocation_mkdirs = list(listings), len(mkdirs)
+        tmp_path_factory.mktemp("rescan-control")
+        control_listings = len(listings) - len(allocation_listings)
+
+    assert control_listings >= 1, "the listing counter cannot see pytest's own scan"
+    assert allocation_listings == []
+    assert allocation_mkdirs == count + buckets
+    assert len(set(roots)) == count
+    assert all(root.is_dir() for root in roots)
+    assert len(list(allocator.base.iterdir())) == buckets
+    assert max(len(list(b.iterdir())) for b in allocator.base.iterdir()) == size
+
+
+@pytest.mark.parametrize("operator", ["operator-state-root", None], ids=["set", "unset"])
+def test_state_root_override_is_restored(tmp_path, operator):
+    """`point_state_root` — the whole body of the autouse fixture — changes exactly one
+    variable, and only through the monkeypatch it is handed, so undoing that monkeypatch
+    restores the operator's own value or its absence. HOME and every other variable
+    are left as they were.
+
+    Driven with its own MonkeyPatch pair rather than the test's `monkeypatch`: the
+    restoration happens at teardown, where no assertion in the test body can see it.
+
+    Ablation target: write `os.environ[envvars.STATE_DIR]` directly in
+    `point_state_root` and both rows fail on the restored value."""
+    allocator = conftest.StateRootAllocator(tmp_path / "base")
+    allocator.base.mkdir()
+    with pytest.MonkeyPatch.context() as operator_env:
+        if operator is None:
+            operator_env.delenv(envvars.STATE_DIR, raising=False)
+        else:
+            operator_env.setenv(envvars.STATE_DIR, operator)
+        before = dict(os.environ)
+
+        fixture_mp = pytest.MonkeyPatch()
+        try:
+            root = conftest.point_state_root(fixture_mp, allocator)
+            during = dict(os.environ)
+        finally:
+            fixture_mp.undo()
+        after = dict(os.environ)
+
+    changed = {k for k in before.keys() | during.keys() if before.get(k) != during.get(k)}
+    assert changed == {envvars.STATE_DIR}
+    assert during[envvars.STATE_DIR] == str(root)
+    assert root.is_dir()
+    assert after.get(envvars.STATE_DIR) == operator
+    assert after == before
+
+
+def _project_shape(paths: bmadconfig.ProjectPaths) -> dict[str, str]:
+    root = paths.project.resolve()
+    return {
+        f.name: getattr(paths, f.name).resolve().relative_to(root).as_posix() for f in fields(paths)
+    }
+
+
+def _files_outside_git(root: Path) -> list[tuple[str, bytes | None]]:
+    return sorted(
+        (p.relative_to(root).as_posix(), p.read_bytes() if p.is_file() else None)
+        for p in root.rglob("*")
+        if ".git" not in p.relative_to(root).parts
+    )
+
+
+def test_project_tree_matches_project_paths_without_git(project_tree, _project_template, tmp_path):
+    """`project_tree` is `project` minus the repository: same `ProjectPaths` shape, same
+    sandbox name, byte-identical working files — and no `.git` at all.
+
+    Compared against a fresh copy of the real template rather than the `project`
+    fixture, because both fixtures claim `tmp_path / "sandbox"` and cannot coexist.
+
+    Ablation target: seed an extra file in `_project_template` only (after the shared
+    `seed_project_files` call) and the file comparison fails — the two fixtures would
+    describe different projects."""
+    real = conftest.copy_project(_project_template, tmp_path / "real" / "sandbox")
+
+    assert project_tree.project == tmp_path / "sandbox"
+    assert project_tree.project.name == real.project.name
+    assert _project_shape(project_tree) == _project_shape(real)
+    assert project_tree.implementation_artifacts.is_dir()
+    assert project_tree.planning_artifacts.is_dir()
+    assert _files_outside_git(project_tree.project) == _files_outside_git(real.project)
+    assert (real.project / ".git").is_dir()
+    assert not (project_tree.project / ".git").exists()
+
+
+def test_project_copies_keep_independent_index_refs_and_hooks(project, _project_template, tmp_path):
+    """Two sandbox copies share no Git state: a commit, a new branch, a staged change
+    and an installed hook in one leave the other copy and the template untouched.
+
+    Ablation target: make `copy_project` link instead of copy
+    (`shutil.copytree(..., copy_function=os.link)`) and the same-file assertions fail
+    before any mutation is even attempted."""
+    other = conftest.copy_project(_project_template, tmp_path / "other" / "sandbox")
+    a_git, b_git, t_git = (p / ".git" for p in (project.project, other.project, _project_template))
+    assert a_git.is_dir() and b_git.is_dir(), "a copy's .git must be its own directory"
+    for rel in ("index", "HEAD", "config", "refs/heads/main"):
+        for x, y in ((a_git, b_git), (a_git, t_git), (b_git, t_git)):
+            assert not os.path.samefile(x / rel, y / rel), f"{rel} is shared: {x} / {y}"
+    head = conftest.git(_project_template, "rev-parse", "HEAD")
+
+    (project.project / "src.txt").write_text("changed\n", encoding="utf-8")
+    conftest.git(project.project, "add", "src.txt")
+    conftest.git(project.project, "commit", "-q", "-m", "mutate a")
+    conftest.git(project.project, "branch", "side")
+    (project.project / "staged.txt").write_text("staged\n", encoding="utf-8")
+    conftest.git(project.project, "add", "staged.txt")
+    (a_git / "hooks" / "pre-commit").write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+    assert conftest.git(project.project, "rev-parse", "HEAD") != head
+
+    for repo in (other.project, _project_template):
+        assert conftest.git(repo, "rev-parse", "HEAD") == head
+        assert conftest.git(repo, "branch", "--list", "side") == ""
+        assert conftest.git(repo, "status", "--porcelain") == ""
+        assert conftest.git(repo, "ls-files") == ".gitignore\nsrc.txt"
+        assert not (repo / ".git" / "hooks" / "pre-commit").exists()
+        assert (repo / "src.txt").read_text(encoding="utf-8") == "original\n"
 
 
 def test_plant_root_markers_refuses_physical_aliases(tmp_path):
@@ -144,10 +345,12 @@ def test_scripted_verify_runner_refuses_the_wrong_canonical_cwd(tmp_path):
 
 
 def test_nested_repo_root_paths_round_trips_committed_config_and_conflict(project):
-    """The nested fixture is a production-loadable config, not a hand-built snapshot.
+    """The nested fixture is a production-loadable config, not a hand-built snapshot,
+    and it is the layout worktree isolation SUPPORTS (DW-379): the project lies inside
+    `repo_root`, so neither isolation mode is refused.
 
-    Ablation: short-circuit `worktree_isolation_conflict` for the worktree mode
-    and this row fails because the divergent loaded config is no longer refused.
+    Ablation: widen `worktree_isolation_conflict` back to "any `repo_root` override"
+    and this row fails because the nested loaded config is refused again.
     """
     paths = conftest.nested_repo_root_paths(project)
 
@@ -157,9 +360,9 @@ def test_nested_repo_root_paths_round_trips_committed_config_and_conflict(projec
     assert paths.project.parent == paths.repo_root
     config_rel = (paths.project / conftest.BMAD_CONFIG_REL).relative_to(paths.repo_root)
     assert conftest.git(paths.repo_root, "ls-files", "--error-unmatch", config_rel.as_posix())
+    assert paths.repo_root != paths.project, "premise: the roots really diverge"
     assert bmadconfig.worktree_isolation_conflict(paths, "none") is None
-    conflict = bmadconfig.worktree_isolation_conflict(paths, "worktree")
-    assert conflict is not None and "not supported" in conflict
+    assert bmadconfig.worktree_isolation_conflict(paths, "worktree") is None
 
 
 def test_nested_repo_root_paths_canonicalizes_a_dotdot_input(project):
@@ -1398,9 +1601,12 @@ def test_detach_ceiling_detector_reads_an_annotated_assignment():
 
 
 def _scan_tests() -> list[tuple[str, str, bool]]:
+    """Scan EVERY `test_*.py` module, resolving conftest's shared gates once for all of
+    them rather than letting each `_scan_source` call fall back to its own lookup."""
+    conftest_gates = _conftest_gate_names()
     found: list[tuple[str, str, bool]] = []
     for path in sorted(_TESTS_DIR.glob("test_*.py")):
-        found.extend(_scan_source(path.read_text(encoding="utf-8"), path.name))
+        found.extend(_scan_source(path.read_text(encoding="utf-8"), path.name, conftest_gates))
     return found
 
 
@@ -1467,7 +1673,7 @@ _OTHER_DEFS = "<other>"  # explicit catch-all; a module omitting it refuses unex
 _EXPECTED_E2E_DEF_COUNTS: dict[str, dict[str, int]] = {
     "test_generic_tmux.py": {"test_tmux_": 6},
     "test_stories_e2e.py": {
-        "test_e2e_": 16,
+        "test_e2e_": 18,
         "test_reap_e2e_": 3,
         # Not asserted, and deliberately so — see the residual note above. Today these are
         # the local-process identity harness defs: `test_detach_gate_*`,
@@ -1612,6 +1818,41 @@ def test_every_real_tmux_e2e_joins_the_serialized_xdist_group():
     )
     counts = _e2e_def_count_offenders(found)
     assert not counts, "\n".join(counts)
+
+
+def test_live_e2e_scan_reads_shared_gates_once(monkeypatch):
+    """The live scan resolves conftest's shared gates ONCE and hands that one set to
+    every module it scans — and still scans every `test_*.py` module.
+
+    `_scan_source` is replaced by a recorder, so this row reads the tree without
+    re-parsing it: the parse cost is the live guard's own, and doubling it here would
+    tax exactly the runtime this structure exists to bound.
+
+    Ablation target: stop passing `conftest_gates` from `_scan_tests` and the recorded
+    gates read `None` while the lookup count climbs to one per module; narrow the glob
+    and the module inventory assertion fails."""
+    module = sys.modules[__name__]
+    lookups: list[None] = []
+    scanned: list[tuple[str, frozenset[str] | None]] = []
+    real_gates = _conftest_gate_names
+
+    def counted_gates() -> frozenset[str]:
+        lookups.append(None)
+        return real_gates()
+
+    def recording_scan(src, rel, conftest_gates=None):
+        assert src, f"{rel} was handed to the scan empty"
+        scanned.append((rel, conftest_gates))
+        return []
+
+    monkeypatch.setattr(module, "_conftest_gate_names", counted_gates)
+    monkeypatch.setattr(module, "_scan_source", recording_scan)
+
+    assert _scan_tests() == []
+
+    assert len(lookups) == 1
+    assert [rel for rel, _gates in scanned] == sorted(p.name for p in _TESTS_DIR.glob("test_*.py"))
+    assert {gates for _rel, gates in scanned} == {real_gates()}
 
 
 def test_the_unexplained_stem_is_claimed_by_no_declared_prefix():
@@ -1812,6 +2053,25 @@ def test_pyproject_addopts_selects_the_loadgroup_scheduler():
         "pyproject.toml's [tool.pytest.ini_options] must pass `--dist loadgroup`; "
         f"without it every xdist_group mark is silently inert (got {addopts!r})"
     )
+
+
+@pytest.mark.parametrize("category", [DeprecationWarning, PendingDeprecationWarning])
+def test_pyproject_filterwarnings_turns_deprecations_into_errors(request, category):
+    """DW-370: without the `filterwarnings` posture a new deprecation — first-party,
+    a dependency's, or one a new Python leg introduces — is a line in the warnings
+    summary and the matrix stays green. Asserted twice: the loaded ini carries the
+    entry, and a warning emitted inside a test actually raises, which is the fact that
+    matters (a later blanket `ignore` would leave the entry present but inert).
+
+    Ablation: delete the pyproject `filterwarnings` line and the `getini` assert fails;
+    keep it but append a blanket `"ignore::DeprecationWarning"` after it and the
+    `DeprecationWarning` row fails on `pytest.raises` (DID NOT RAISE)."""
+    entry = f"error::{category.__name__}"
+    assert entry in request.config.getini(
+        "filterwarnings"
+    ), f"pyproject.toml's [tool.pytest.ini_options] filterwarnings must carry {entry!r}"
+    with pytest.raises(category):
+        warnings.warn("DW-370 posture probe", category, stacklevel=1)
 
 
 _MECHANISM_MODULE = """

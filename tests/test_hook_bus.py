@@ -27,6 +27,7 @@ from conftest import (
     write_sprint,
 )
 
+from bmad_loop import childrun
 from bmad_loop.adapters.mock import MockAdapter
 from bmad_loop.engine import Engine
 from bmad_loop.escalation import critical_escalations
@@ -109,6 +110,51 @@ def test_command_results_are_readonly_observation_data():
     assert c.command_results == (result,)
     with pytest.raises(AttributeError):
         c.command_results = ()
+
+
+def test_delivery_id_is_readonly_and_defaults_to_none():
+    assert ctx().delivery_id is None
+    c = ctx("post_migrate", delivery_id="abc123")
+    assert c.delivery_id == "abc123"
+    with pytest.raises(AttributeError):
+        c.delivery_id = "forged"  # type: ignore[misc]
+
+
+def test_declarative_env_carries_delivery_id_only_when_set():
+    seen: list[dict[str, str]] = []
+
+    def runner(cmd, *, cwd, env, timeout):
+        seen.append(dict(env))
+        return 0, ""
+
+    bus = HookBus(registry_of(declarative("post_migrate")), runner=runner)
+    bus.emit("post_migrate", ctx("post_migrate", delivery_id="deadbeef"))
+    bus.emit("post_migrate", ctx("post_migrate"))
+    assert seen[0]["BMAD_LOOP_DELIVERY_ID"] == "deadbeef"
+    assert "BMAD_LOOP_DELIVERY_ID" not in seen[1]
+
+
+def test_rollback_outcome_is_readonly_and_defaults_to_none():
+    assert ctx().rollback_outcome is None
+    assert ctx("pre_rollback").rollback_outcome is None
+    c = ctx("post_rollback", rollback_outcome="paused")
+    assert c.rollback_outcome == "paused"
+    with pytest.raises(AttributeError):
+        c.rollback_outcome = "completed"  # type: ignore[misc]
+
+
+def test_declarative_env_carries_rollback_outcome_only_when_set():
+    seen: list[dict[str, str]] = []
+
+    def runner(cmd, *, cwd, env, timeout):
+        seen.append(dict(env))
+        return 0, ""
+
+    bus = HookBus(registry_of(declarative("post_rollback")), runner=runner)
+    bus.emit("post_rollback", ctx("post_rollback", rollback_outcome="failed"))
+    bus.emit("post_rollback", ctx("post_rollback"))
+    assert seen[0]["BMAD_LOOP_ROLLBACK_OUTCOME"] == "failed"
+    assert "BMAD_LOOP_ROLLBACK_OUTCOME" not in seen[1]
 
 
 def test_a_plugin_cannot_erase_a_critical_escalation_through_result_json():
@@ -399,6 +445,56 @@ def test_real_subprocess_runner_replaces_undecodable_output(tmp_path):
     assert "before" in out and "after" in out
 
 
+@pytest.mark.parametrize("fail_closed", [False, True])
+def test_interrupted_declarative_hook_is_neither_error_nor_veto(fail_closed):
+    """A hook whose tree a hard stop killed (DW-353) journals
+    `plugin-hook-interrupted` and re-raises for the engine to stop on — never a
+    `plugin-hook-error`, and never a defer veto, even under `fail_closed`.
+
+    Ablation: drop the `except ChildInterrupted` arm and the ChildInterrupted
+    still propagates but the `plugin-hook-interrupted` record is missing; catch
+    it as `_HookError` instead and the fail_closed row vetoes and does not raise."""
+
+    def interrupted(*_a, **_k):
+        raise childrun.ChildInterrupted("hook interrupted by a hard stop request: X")
+
+    journal = _FakeJournal()
+    c = ctx()
+    bus = HookBus(
+        registry_of(declarative("pre_story", blocking=True, fail_closed=fail_closed)),
+        journal,
+        runner=interrupted,
+    )
+
+    with pytest.raises(childrun.ChildInterrupted):
+        bus.emit("pre_story", c)
+
+    assert journal.entries == [
+        {"kind": "plugin-hook-interrupted", "plugin": "d", "stage": "pre_story"}
+    ]
+    assert not c.vetoed
+
+
+def test_real_subprocess_runner_raises_child_interrupted_on_hard_stop(tmp_path):
+    """Through the real transport: a pending hard stop surfaces as
+    `ChildInterrupted`, not as `_HookError` (which fail_closed would turn into a
+    veto)."""
+    token = childrun.install_stop_probe(lambda: True)
+    try:
+        with pytest.raises(childrun.ChildInterrupted):
+            _run_subprocess("exit 0", cwd=str(tmp_path), env={}, timeout=10)
+    finally:
+        childrun.reset_stop_probe(token)
+
+
+def test_real_subprocess_runner_timeout_is_a_hook_error(tmp_path):
+    """The timeout leg keeps its shape through the new runner."""
+    script = tmp_path / "hang.py"
+    script.write_text("import time\ntime.sleep(30)\n", encoding="utf-8")
+    with pytest.raises(_HookError, match="timed out after 1s"):
+        _run_subprocess(f'"{sys.executable}" "{script}"', cwd=str(tmp_path), env={}, timeout=1)
+
+
 def test_shared_persists_across_stages():
     class P(Plugin):
         def on_pre_dev_phase(self, c):
@@ -496,8 +592,9 @@ def test_post_dev_verify_reaches_a_real_plugin_through_the_bus(project, monkeypa
     registered plugin, so the plumbing itself is covered end to end.
 
     Ablation: drop `command_results`, `verification_stage` or
-    `verification_sequence` from the engine's `post_dev_verify` emit and the
-    plugin observes that field's default (`()` / `None`) instead.
+    `verification_sequence` from the engine's `post_dev_verify` (or
+    `post_review_verify`) emit and the plugin observes that field's default
+    (`()` / `None`) instead.
     """
     from bmad_loop import verify
 
@@ -505,6 +602,9 @@ def test_post_dev_verify_reaches_a_real_plugin_through_the_bus(project, monkeypa
 
     class P(Plugin):
         def on_post_dev_verify(self, c):
+            seen.append((c.verification_stage, c.verification_sequence, c.command_results))
+
+        def on_post_review_verify(self, c):
             seen.append((c.verification_stage, c.verification_sequence, c.command_results))
 
     result = verify.CommandResult("pytest -q", 0, "tail", "out", "err")
@@ -518,18 +618,20 @@ def test_post_dev_verify_reaches_a_real_plugin_through_the_bus(project, monkeypa
     summary = engine.run()
 
     assert summary.done == 1
-    assert seen == [("dev", 1, (result,))]
-    # and the keys the plugin was handed are the ones its journal record carries,
-    # which is the correlation the whole surface exists for. Scoped to the dev
-    # stage: the review gate journals its own pass now, and that one deliberately
-    # reaches no plugin — the single `seen` entry above is the other half of that.
-    (entry,) = [
-        e
-        for e in engine.journal.entries()
-        if e["kind"] == "verify-command-result" and e["verification_stage"] == "dev"
-    ]
-    assert entry["verification_sequence"] == 1
-    assert entry["story_key"] == "1-1-a" and entry["command"] == "pytest -q"
+    # the dev pass on `post_dev_verify`, then the review gate's own pass on
+    # `post_review_verify` (DW-357), sharing the story's one sequence counter
+    assert seen == [("dev", 1, (result,)), ("review", 2, (result,))]
+    # and the keys the plugin was handed are the ones its journal records carry,
+    # which is the correlation the whole surface exists for.
+    for stage, sequence, _ in seen:
+        (entry,) = [
+            e
+            for e in engine.journal.entries()
+            if e["kind"] == "verify-command-result"
+            and e["verification_stage"] == stage
+            and e["verification_sequence"] == sequence
+        ]
+        assert entry["story_key"] == "1-1-a" and entry["command"] == "pytest -q"
 
 
 def _resume_committing(project, engine, registry):

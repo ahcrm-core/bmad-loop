@@ -247,11 +247,11 @@ effort = "high"
 """)
     pol = policy.load(p)
     assert pol.adapter.effort == "high"
-    for role in ("dev", "review", "triage"):
+    for role in ("dev", "review", "triage", "retro"):
         assert pol.adapter.resolved(role).effort == "high"
     # the base-only (unknown role) branch constructs ResolvedAdapter positionally
-    # and must carry effort too
-    assert pol.adapter.resolved("retro").effort == "high"
+    # and must carry effort too. (Not "retro": that became a stage in DW-389.)
+    assert pol.adapter.resolved("no-such-role").effort == "high"
 
 
 def test_stage_effort_overrides_base(tmp_path):
@@ -364,7 +364,7 @@ def test_adapter_policy_from_snapshot_roundtrips_resolved(body):
     pol = policy.loads(body)
     rebuilt = policy.adapter_policy_from_snapshot(_roundtrip_snapshot(pol))
     assert rebuilt is not None
-    for role in ("dev", "review", "triage"):
+    for role in ("dev", "review", "triage", "retro"):
         assert rebuilt.resolved(role) == pol.adapter.resolved(role)
 
 
@@ -678,6 +678,8 @@ def test_limits_integer_fields_reject_non_integer(key, bad):
     ("section", "key"),
     [
         ("verify", "stream_capture_kb"),
+        ("verify", "env_fault_rc"),
+        ("environment", "probe_timeout_s"),
         ("sweep", "max_bundles"),
         ("sweep", "max_triage_attempts"),
         ("sweep", "max_migration_attempts"),
@@ -740,6 +742,7 @@ def test_usage_grace_s_accepts_a_toml_integer(table):
     ("table", "key"),
     [
         ("verify", "commands"),
+        ("environment", "probes"),
         ("adapter", "extra_args"),
         ("adapter.dev", "extra_args"),
     ],
@@ -847,6 +850,7 @@ def test_boolean_policy_fields_accept_a_real_toml_false(section, key):
         ("scm", "target_branch"),
         ("scm", "merge_strategy"),
         ("scm", "commit_message_template"),
+        ("operator", "on_review_demotion"),
         ("mux", "backend"),
     ],
 )
@@ -1076,6 +1080,39 @@ def test_triage_client_switch_uses_profile_defaults(tmp_path):
     # base model/extra_args are client-specific and must not follow a client switch
     assert pol.adapter.resolved("triage") == policy.ResolvedAdapter("gemini", "", None)
     assert pol.adapter.resolved("dev") == policy.ResolvedAdapter("claude", "opus", ("--foo",))
+
+
+def test_retro_stage_adapter_parses_resolves_and_roundtrips():
+    """`[adapter.retro]` (DW-389) is a stage like `[adapter.triage]`: it parses,
+    resolves with the same client-switch rule, and survives the snapshot rebuild.
+
+    Ablation: drop `retro=_stage_adapter(adapter_d, "retro")` from `loads` and the
+    first assert fails (the stage falls back to the base `claude`); drop it from
+    `adapter_policy_from_snapshot` and the round-trip assert fails."""
+    pol = policy.loads(
+        '[adapter]\nmodel = "opus"\nextra_args = ["--foo"]\n'
+        '[adapter.retro]\nname = "codex"\nmodel = "gpt-5-codex"\n'
+    )
+    assert pol.adapter.resolved("retro").name == "codex"
+    assert pol.adapter.resolved("retro") == policy.ResolvedAdapter("codex", "gpt-5-codex", None)
+    # the other stages are untouched
+    assert pol.adapter.resolved("dev") == policy.ResolvedAdapter("claude", "opus", ("--foo",))
+    rebuilt = policy.adapter_policy_from_snapshot(_roundtrip_snapshot(pol))
+    assert rebuilt is not None
+    assert rebuilt.retro == pol.adapter.retro
+    assert rebuilt.resolved("retro") == pol.adapter.resolved("retro")
+    # without a stage table, retro inherits the base
+    assert policy.load(None).adapter.resolved("retro") == policy.ResolvedAdapter("claude", "", None)
+
+
+def test_retro_stage_adapter_must_be_a_table():
+    with pytest.raises(policy.PolicyError, match=r"\[adapter\.retro\] must be a table"):
+        policy.loads('[adapter]\nretro = "codex"\n')
+
+
+def test_retro_is_a_policy_stage():
+    # `STAGES` fans the `adapter.{stage}` settings template out (settings_schema)
+    assert "retro" in policy.STAGES
 
 
 def test_review_enabled_default_and_override(tmp_path):
@@ -1322,6 +1359,61 @@ def test_verify_stream_capture_kb(tmp_path):
         policy.load(p)
 
 
+def test_environment_policy_parses_and_defaults():
+    """`[environment]` (DW-523): absent, nothing is probed and the timeout is 60s;
+    present, the probes keep their order (they run fail-fast in sequence)."""
+    default = policy.loads("")
+    assert default.environment == policy.EnvironmentPolicy()
+    assert default.environment.probes == () and default.environment.probe_timeout_s == 60
+    assert default.verify.env_fault_rc == 0
+
+    parsed = policy.loads(
+        '[environment]\nprobes = ["pg_isready", "curl -fsS http://x"]\nprobe_timeout_s = 5\n'
+    )
+    assert parsed.environment.probes == ("pg_isready", "curl -fsS http://x")
+    assert parsed.environment.probe_timeout_s == 5
+    # a partial table keeps the other default
+    assert policy.loads("[environment]\nprobe_timeout_s = 9\n").environment.probes == ()
+
+
+@pytest.mark.parametrize("bad", [0, -1])
+def test_environment_probe_timeout_must_be_positive(bad):
+    """A 0s bound would fail every probe before it could answer. Ablation: drop
+    the `probe_timeout_s < 1` check and both rows parse."""
+    with pytest.raises(policy.PolicyError, match=r"environment\.probe_timeout_s must be >= 1"):
+        policy.loads(f"[environment]\nprobe_timeout_s = {bad}\n")
+
+
+@pytest.mark.parametrize("bad", ['[""]', '["   "]', '["pg_isready", "\\t"]'])
+def test_environment_probes_reject_blank_entries(bad):
+    """A blank probe is `sh -c ""`, which exits 0 — a check of nothing that reads
+    as a healthy environment. Ablation: drop the blank-entry check and every row
+    parses."""
+    with pytest.raises(policy.PolicyError, match=r"environment\.probes entries must be non-blank"):
+        policy.loads(f"[environment]\nprobes = {bad}\n")
+
+
+@pytest.mark.parametrize("value", [0, 75, 255])
+def test_verify_env_fault_rc_bounds_accept(value):
+    assert policy.loads(f"[verify]\nenv_fault_rc = {value}\n").verify.env_fault_rc == value
+
+
+@pytest.mark.parametrize(
+    ("bad", "match"),
+    [
+        ("-1", r"verify\.env_fault_rc must be 0 \(disabled\) or an exit status 1-255: got -1"),
+        ("256", r"verify\.env_fault_rc must be 0 \(disabled\) or an exit status 1-255: got 256"),
+        ("true", r"verify\.env_fault_rc must be an integer"),
+    ],
+)
+def test_verify_env_fault_rc_bounds(bad, match):
+    """0 disables; an exit status is 1-255, so anything else could never match a
+    real exit and would read as configured while doing nothing. Ablation: drop the
+    range check and the -1/256 rows parse."""
+    with pytest.raises(policy.PolicyError, match=match):
+        policy.loads(f"[verify]\nenv_fault_rc = {bad}\n")
+
+
 def test_scm_invalid_values(tmp_path):
     p = tmp_path / "policy.toml"
     p.write_text('[scm]\nisolation = "vm"\n')
@@ -1428,6 +1520,24 @@ def test_template_operator_block_parses_to_the_default():
     # unlike [mux]'s commented anchor, this key ships uncommented — the template
     # must therefore agree with the dataclass, not merely parse
     assert policy.loads(policy.POLICY_TEMPLATE).operator.enabled is True
+
+
+def test_operator_on_review_demotion_default_parse_and_template():
+    """Default "escalate" is today's behavior byte-for-byte (DW-383); "park" is the
+    opt-in. The template ships the key commented at its default, so the template
+    must still parse to the dataclass default."""
+    assert policy.loads("").operator.on_review_demotion == "escalate"
+    assert policy.OperatorPolicy().on_review_demotion == "escalate"
+    for mode in sorted(policy.OPERATOR_ON_REVIEW_DEMOTION_MODES):
+        loaded = policy.loads(f'[operator]\non_review_demotion = " {mode} "\n')
+        assert loaded.operator.on_review_demotion == mode
+    assert policy.loads(policy.POLICY_TEMPLATE).operator.on_review_demotion == "escalate"
+    assert '# on_review_demotion = "escalate"' in policy.POLICY_TEMPLATE
+
+
+def test_operator_on_review_demotion_invalid():
+    with pytest.raises(policy.PolicyError, match=r"operator\.on_review_demotion"):
+        policy.loads('[operator]\non_review_demotion = "defer"\n')
 
 
 # ---------------------------------------------------------------------------

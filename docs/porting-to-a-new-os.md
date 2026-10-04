@@ -112,7 +112,13 @@ out-of-tree adapter is
   `_window_launch` and the `_EXIT_CAPTURE`/`_ECHO`/`_PARK` fragments) —
   **without editing** `tmux_base.py` or its POSIX leaf `tmux_backend.py`
   (`TmuxMultiplexer`). The one method-body override left is `pipe_pane`, whose
-  POSIX `cat >>` redirection is not behind a hook.
+  POSIX `cat >>` redirection is not behind a hook. The base `_window_launch` is
+  dialect-neutral (`-e` flags plus the raw command); the POSIX `TmuxMultiplexer`
+  leaf adds a literal `/bin/sh -c` prelude that records the launched pid for the
+  relays' hook lineage (DW-507) and then execs `$SHELL -c <command>`. A leaf on
+  the base that does not record `BMAD_LOOP_LAUNCH_PID` gets `unknown` lineage,
+  which attribution ignores (psmux; with no `/proc` there, its lineage reads
+  `unknown` anyway).
 - **Implement `TerminalMultiplexer` fresh** when the host has no tmux-shaped CLI
   at all (e.g. a ConPTY-based window manager). You implement the full contract
   directly; `tmux_backend.py` is the reference for what each method must produce.
@@ -243,7 +249,8 @@ If your transport namespaces, four rules:
   about, precisely because the _other_ windows ride inheritance); an env dict a
   caller passed explicitly must survive regardless, and an in-command transport
   is the one that does. `_window_launch` is the dialect hook that owns each
-  family dialect's answer.
+  family dialect's answer; the base one passes bare `-e` flags, and a leaf
+  whose shell wraps the command (psmux) overrides it alongside `_shell_wrap`.
 - **Answer `has_registry_namespace()`, `registry_root()` and
   `legacy_registries()`.** The first tells cleanup your transport namespaces
   sessions at all, so a registry with no root in force reads as the shared
@@ -298,6 +305,11 @@ register_process_host("windows", lambda platform: platform == "win32", WindowsPr
   `None` where the platform can't provide one — callers then **refuse to
   force-kill** rather than risk an unrelated process that inherited the pid.
 - `hook_interpreter()` — seam 3, below.
+- `unsafe_shell_chars(path)` — the shell metacharacters `shell_quote()` leaves
+  exposed in `path`; `init` and `validate` warn on them (DW-346). The default
+  `()` suits hosts that always quote; override it alongside `shell_quote()`
+  when the host's quoting is conditional (Windows' list2cmdline quotes only on
+  whitespace).
 
 ---
 
@@ -314,7 +326,8 @@ A new OS overrides the quoting behavior on its `ProcessHost` as needed.
 
 ## Seam 4 — validate preflight
 
-`_platform_preflight(project)` (`src/bmad_loop/cli.py`, called from `cmd_validate`)
+`platform_preflight(project)` (`src/bmad_loop/runsetup.py`, imported into `cli.py` as
+`_platform_preflight` and called from `cmd_validate`)
 asks the selected multiplexer for its `available()` / `version()` and names the
 selected process host. A new OS therefore surfaces its readiness in `bmad-loop
 validate` **by registering** (seams 1–2) — not by adding a `win32` block to
@@ -378,6 +391,9 @@ Things **without** a seam still need a hand-guarded fallback behind a
 `sys.platform` branch with that ack: `cp --reflink` / CoW copies, symlinks,
 `/proc` scanning, `/tmp`, and `start_new_session`. Keep the Linux fast path
 byte-identical; the new-OS branch can be best-effort until exercised.
+Hook-event lineage (DW-507) is one such `/proc` reader with no seam: both relays
+walk the parent chain through Linux `/proc` only, so on any other OS every event
+is tagged `unknown` and attribution keeps only the #767 rules.
 
 ---
 

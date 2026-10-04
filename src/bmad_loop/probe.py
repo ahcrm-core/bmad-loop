@@ -55,11 +55,11 @@ from datetime import datetime, timezone
 from importlib import resources
 from pathlib import Path
 
-from . import runs, sanitize
+from . import childrun, runs, sanitize
 from .adapters.multiplexer import MultiplexerError, get_multiplexer
 from .adapters.profile import CLIProfile
 from .install import merge_hooks, relay_registered
-from .process_host import get_process_host
+from .process_host import ProcessHostError, get_process_host
 
 # cmd_probe catches `probe.LeakDetected` around the renderers, mirroring
 # diagnostics — the noqa keeps ruff's F401 autofix from deleting the re-export.
@@ -163,6 +163,8 @@ class ProfileFinding:
     declared_events: dict = field(default_factory=dict)  # native -> canonical
     registered: bool | None = None  # scan: hooks present in the CLI's config?
     hook_trust: str | None = None  # trusted | untrusted | unverifiable (Codex only)
+    # trusted | untrusted | unverifiable — only when --workspace was requested
+    workspace_trust: str | None = None
     captured_events: list[EventCapture] = field(default_factory=list)  # probe
     transcript: TranscriptFinding | None = None
     tokens: TokenSchema | None = None
@@ -207,34 +209,39 @@ def binary_runs(binary: str, timeout_s: float = 10) -> int | None:
     Never raises, and that is load-bearing rather than defensive style: machine.py
     records that every gate in ``cmd_validate`` runs inside a ``try`` so "the
     command has no error path of its own — its rc is purely the verdict". A probe
-    that raised would give it one. The guard is ``_run_capture``'s exactly, and
-    the return is deliberately left as bytes (no ``text=True``): nothing here reads
-    the output, so the locale decode that forced ``errors="replace"`` on that
-    function never happens and cannot raise the ``UnicodeDecodeError`` the guard
-    does not name.
+    that raised would give it one. The guard names ``_run_capture``'s families
+    plus ``ProcessHostError``, the one fault the tree kill adds (a bogus
+    ``BMAD_LOOP_PROCESS_HOST`` override surfaces there). The output is never read;
+    :func:`childrun.run_argv` decodes it with ``errors="replace"``, so no
+    ``UnicodeDecodeError`` can escape either.
 
-    None (could not launch, or timed out) and a nonzero code are separate answers
-    to the caller, not one sentinel: the first has no return code to report.
+    None (could not launch, timed out, or interrupted before spawning) and a
+    nonzero code are separate answers to the caller, not one sentinel: the first
+    has no return code to report.
 
-    ``stdin=DEVNULL`` is required, not cosmetic. With the caller's tty inherited, a
-    shim that prompts blocks on the read for the whole timeout — measured 4.00s
-    against 0.00s — inside an interactive command.
+    Bounded by :func:`childrun.run_argv`, not ``subprocess.run``: on timeout the
+    latter killed only the root and then waited on the pipes with no bound, so a
+    Windows ``.cmd`` shim — rooted at ``cmd.exe``, the real program its child —
+    returned only when that child exited by itself (a 0.5 s timeout measured at
+    120 s). ``run_argv`` kills the whole tree and bounds the drain. It is also
+    stop-aware, but no hard-stop probe is installed here: ``cmd_validate`` never
+    runs inside ``Engine.run``, and the probe only reads the stop channel.
+
+    ``stdin=DEVNULL`` (``run_argv``'s spawn) is required, not cosmetic. With the
+    caller's tty inherited, a shim that prompts blocks on the read for the whole
+    timeout — measured 4.00s against 0.00s — inside an interactive command.
 
     Not folded into :func:`run_version_help`, which discards the return code by
     design and spawns TWO children (``--version`` then ``--help``) at ``timeout_s``
     each: reusing it would cost up to 20s per profile here.
     """
     try:
-        proc = subprocess.run(
-            [binary, "--version"],
-            capture_output=True,
-            check=False,
-            stdin=subprocess.DEVNULL,
-            timeout=timeout_s,
-        )
-    except (OSError, subprocess.SubprocessError):
+        run = childrun.run_argv([binary, "--version"], cwd=None, timeout=timeout_s)
+    except (OSError, subprocess.SubprocessError, ProcessHostError):
         return None
-    return proc.returncode
+    if run.timed_out or run.interrupted:
+        return None
+    return run.returncode
 
 
 def run_version_help(binary: str, timeout_s: float = 10) -> FlagFinding:
@@ -504,6 +511,34 @@ def _check_hook_trust(
             )
         else:
             finding.next_steps.append("Resolve the Codex hook trust diagnostic and re-run the scan")
+
+
+def check_workspace_trust(finding: ProfileFinding, profile: CLIProfile, workspace: Path) -> None:
+    """Read-only: is ``workspace`` in the profile's declared workspace-trust list
+    (DW-390)? Sets ``finding.workspace_trust``; a non-trusted verdict adds a
+    warning and a next step. The workspace path itself is never rendered — the
+    reasons from :func:`workspace_trust.trust_status` are path-free, and the
+    settings file is named by its ``~/`` spelling only."""
+    from . import workspace_trust
+
+    spec = profile.workspace_trust
+    if spec is None:
+        return
+    status, reason = workspace_trust.trust_status(spec, workspace)
+    finding.workspace_trust = status
+    if status == "trusted":
+        return
+    finding.warnings.append(f"workspace trust {status} for the requested workspace: {reason}")
+    if status == "unverifiable":
+        finding.next_steps.append(
+            f"Repair {spec.settings_path}: it must be a JSON object whose "
+            f"{spec.key!r} is a list of path strings"
+        )
+    else:
+        finding.next_steps.append(
+            f"Run `{profile.binary}` in the project root and trust it; bmad-loop seeds "
+            "each worktree from that grant (or trust this workspace directly)"
+        )
 
 
 # ----------------------------------------------------------------- SCAN mode
@@ -895,6 +930,8 @@ def render_markdown(
         out.append(_fmt_kv("hooks registered", "yes" if f.registered else "no"))
     if f.hook_trust is not None:
         out.append(_fmt_kv("Codex hook trust", f.hook_trust))
+    if f.workspace_trust is not None:
+        out.append(_fmt_kv("workspace trust", f.workspace_trust))
     out.append(_fmt_kv("warnings", str(len(f.warnings))))
     out.append("")
 
@@ -1046,6 +1083,7 @@ def render_json(
         "usage_parser": f.parser,
         "hooks_registered": f.registered,
         "hook_trust": f.hook_trust,
+        "workspace_trust": f.workspace_trust,
         "declared_events": f.declared_events,
         "version": f.flags.version if f.flags else None,
         "help": f.flags.help if f.flags else None,

@@ -9,105 +9,377 @@ breaking changes may land in a minor release.
 
 ### Added
 
-- Add a free-form `effort` key to `[adapter]` and every `[adapter.<stage>]` table,
-  inherited like `model`; `opencode-http` sends it as the per-prompt `variant` on
-  every turn, and `validate` warns (`policy.effort-unsupported`) when a tmux stage
-  sets it (#643).
-- Journal a session's idle stretches (#680). The tmux adapter stats the live transcript
-  on the heartbeat cadence, stamps `transcript_idle_s` on `heartbeat.json`, and — with
-  the engine's journal attached (`CodingCLIAdapter.journal`) — writes one `session-idle`
-  when the age crosses `limits.dev_stall_grace_s` and one `session-active` when the
-  transcript moves again; `0` disables the pair. The TUI agent line shows the open
-  stretch as `· idle <age>`. Observability only: nothing bounds the stretch.
+- Add `[environment] probes` (+ `probe_timeout_s`): operator health checks run
+  before `[verify]` commands, before each dev and review session launch, and
+  before a failed attempt is charged; a failing, hanging or unrunnable probe
+  pauses the run as an environment fault and charges nothing (DW-523).
+- Add `[verify] env_fault_rc` (0 = disabled, 75 suggested): a verify command
+  exiting with it declares an environment fault, not a code failure (DW-523).
+- Add the `environment` pause stage: a probe failing before a session launch
+  pauses there, and a plain `bmad-loop resume` re-probes and launches the same
+  session with no rollback (DW-523).
+- Treat an `Environment fault: <text>` line in a session's Auto Run Result as a
+  probe trigger: the run pauses only when a probe confirms it (DW-523).
+- Add `bmad-loop resolve <run> --reverify`: replay `[verify]` on a DEFERRED
+  story's kept work, or an environment-fault escalated one's when the fault left
+  finished work to verify — HEAD in place, or the kept
+  worktree unit — then review per policy and commit or merge, with no dev
+  session and no resolve agent; a worktree unit is accepted under any pause
+  when `--story` names it, and sweep runs are refused (DW-522).
 
 ### Changed
 
-- Register hooks through the installed `bmad-loop relay <Event>` command. Upgrading
-  invalidates Codex hook trust: Codex re-prompts at the next launch, and hooks silently
-  do not fire until the new commands are accepted. Re-run `bmad-loop init` to migrate
-  managed registrations. `validate` warns when a hook still points to another installation.
-- Name an earlier attempt's parked work in the retry dev prompt (sprint, stories, sweep)
-  once Git confirms the ref still resolves on this task's baseline and a dev session
-  produced it; commits-only preservation is labelled, and nothing is replayed (#777).
-- Document the live-session removal guard's measured ceiling (#732): `delete`, `archive` and `clean` still remove a run directory when a listing omits a live session. Behavior unchanged; the psmux half is reported upstream (psmux/psmux#622), its retirement tracked in #754.
+- Reword the rc 126/127 environment-fault pause to name the shell convention
+  instead of asserting "command not found / not executable" (DW-523).
+- Point deferred-story and environment-fault pause notices, and the TUI `R`/`p`
+  gestures on a deferred story, at `bmad-loop resolve <run> --reverify` (DW-522).
 
 ### Fixed
 
-- Explain that unpinned result-artifact scans search only the configured artifact\n  directories themselves, so a nested story spec no longer produces an opaque\n  `no-artifact` breadcrumb (#780).
+- Escalate an environment fault at the review-budget rescue gate instead of
+  deferring the story as unconverged (DW-523).
+- Explain that unpinned result-artifact scans search only the configured artifact
+  directories themselves, so a nested story spec no longer produces an opaque
+  `no-artifact` breadcrumb (#780).
 
-- Read untracked paths verbatim so rollback snapshots and cleanup handle non-ASCII
-  and space-edged filenames; a resumed run's pre-fix baseline still protects the
-  files it listed; failed-unit diff capture includes them too (#783).
+## [0.13.1] — 2026-10-01
 
-- Run a declarative `post_story` hook from the repo root once the unit's worktree
-  is torn down, instead of failing on the removed cwd (#779).
+### Added
 
-- Count `plugin-hook-error` entries in `diagnose`'s plugin-errors total (#779).
+- Tag hook events with relay-side process lineage; once the launched session's first
+  `SessionStart` reads `match`, a nested CLI's `mismatch` events (id-less included) are
+  dropped. Untrusted lineage writes one `hook-lineage-untrusted` crumb (DW-507).
+- Write one `pinned-session-id-mismatch` crumb when a pinned session's first non-rebind
+  `SessionStart` reports an id other than the pin, so the drop of its own events as
+  foreign is no longer silent; a nested CLI's `mismatch`-tagged start is skipped (DW-509).
+- Record opt-in per-worker test metrics with `pytest --test-metrics-dir=PATH`, keeping
+  wall-clock apart from summed worker-seconds; bound a run with a tree-stopping deadline
+  via `scripts/run_test_benchmark.py`. Upload metrics and JUnit from every CI test job,
+  failed or timed out included.
+- Shard tests by digest with `pytest --ci-shard=I/N` (whole functions and xdist groups, no
+  hand-kept list); prove a sharded run complete and disjoint with
+  `tests/perf_report.py verify-shards`.
 
-- Register Windows hook commands with forward-slash paths so Git Bash no longer strips
-  their separators and stalls every session (#773); re-run `bmad-loop init` to migrate.
-  `validate` warns (`hooks.relay-stale`) while a backslash registration remains. Paths
-  with spaces remain unsupported under the PowerShell fallback.
+### Changed
 
-- Resolve artifact paths from BMAD's four-layer central `_bmad/config.toml`, falling
-  back to `_bmad/bmm/config.yaml` only for keys the TOML lacks, so a project whose paths
-  live only in the central TOML resolves them; refuse ambiguous, blank, non-string or
-  malformed TOML values instead of falling back; sweep triage reads the ledger the
-  orchestrator resolved (`BMAD_LOOP_LEDGER`) rather than re-deriving it from the YAML
-  (#154, #769).
+- A tmux coding-CLI pane's start command now shows the
+  `/bin/sh -c 'BMAD_LOOP_LAUNCH_PID=$$; …'` prelude; the command itself runs under
+  `default-shell` exactly as before (DW-507).
+- Run each Windows CI leg as two shards plus a serial psmux-gate job; fail the
+  `test (windows, py3.x)` aggregator on a missing or red shard or gate, a test run in no
+  shard or two, a skipped live-gate test, or a shard or gate job whose latest attempt
+  failed (so a re-run cannot pass on an earlier attempt's records).
+- Cut test-suite runtime without dropping assertions: allocate state roots in constant time,
+  give render-only tests a Git-free `project_tree`, observe TUI lifecycle events instead of
+  polling, and copy submodule origins from per-worker templates.
 
-- Refuse `init` when `.bmad-loop`, its `policy.toml` or `.gitignore` resolves outside the
-  project, before any setup write (#771).
+### Fixed
 
-- Parse plugin manifests in `validate` (`plugins.manifests`) without importing
-  plugin code; a malformed `plugin.toml` fails validate instead of engine start (#765).
+- Ignore hook events from nested coding-CLI sessions that inherit the relay environment,
+  so a child's `Stop`/`SessionEnd` no longer completes or crashes the launched session:
+  an id that announces its own `SessionStart` after the launched session's first is
+  foreign, and its events are dropped, crumbed once per id as
+  `foreign-hook-event-ignored`, counted as `foreign_hook_events` in `heartbeat.json` and
+  `timeout-fired`, and excluded from the sweep diagnostic (`hook_foreign_ids`). Forward
+  SessionStart `source` so a `clear`/`compact` start rebinds; re-run `bmad-loop init` to
+  re-vendor the relay (#767). Contributed by [@Pinstack](https://github.com/Pinstack).
+- Pin the launched session's id at launch for hook-event attribution: a new profile key
+  `session_id_flag` (claude: `--session-id`) makes the generic adapter pass a minted UUID4
+  and treat an identified `SessionStart`/`SessionEnd` from any id the session never had
+  as foreign (a `clear`/`compact` rebind still counts as its own), so a nested child's
+  `SessionEnd` without a prior `SessionStart` no longer crashes the parent (DW-505/508).
+  A same-name `.bmad-loop/profiles/claude.toml` overlay replaces the packaged profile and
+  stays unpinned until it adds `session_id_flag = "--session-id"`. A claude run paused
+  before upgrading reports the host-exec config changed on resume: its launched argv
+  gained `--session-id`. Dry-run previews show the flag as `--session-id <auto>`.
+- Advance a sprint-status row whose status is folded onto an indented continuation line,
+  as a width-80 YAML dump writes a long story key, instead of leaving the old status and
+  rolling the finished story back; the row collapses to one `key: status` line. Edit only
+  the row the YAML parser reads, never look-alike text in a block scalar or another
+  mapping, and leave a multi-line value the writer cannot read whole untouched (#842).
+  Contributed by [@mswanson](https://github.com/mswanson).
+- Raise `SprintStatusWriteRefused` when an existing sprint-status row below its target is
+  in a shape the writer cannot rewrite, instead of returning the unchanged status: a
+  finished dev or review-demotion pass escalates with board, row, statuses and reason and
+  keeps its work (no rollback, no retry); the board carry journals
+  `board-advance-carry-failed` with `refuse_cause`; `bmad-loop confirm` exits 1 naming
+  the repair and keeps the park entry (follow-up to #842).
+- Replace only a sprint-status value's own text when advancing a row, keeping the
+  gap, inline comment, trailing whitespace and line ending as authored. A null row with a
+  comment (`key:  # note`) keeps its comment, and a bare `key:` row can now be advanced.
+  Refuse rows in a flow-style `{...}` mapping (`mapping-is-flow`) instead of publishing
+  invalid YAML, and any anchored value (`value-is-anchored`), aliased or not. A quoted value
+  with a glued comment (`'backlog'#c`) is now refused (`unreadable-value`) rather than
+  rewritten (DW-514, DW-516).
+- Advance the sprint-status row the reader reads, matched by its parsed key rather than
+  its text (`advance`'s epic lift now lifts a lone `epic-01` row as epic 1). Refuse two
+  distinct keys that read as one (`"2001-01-04"` and the date `2001-01-04`; `epic-1` and
+  `epic-01`) as `key-ambiguous`, publishing nothing, instead of rewriting a row the reader
+  ignores or regressing a `done` epic (DW-515).
+- Retry the transient Windows errors `delete`/`archive` (CLI and TUI) hit while removing a
+  run dir — a sharing violation from a concurrent reader's handle, and the WinError 145 a
+  parent `rmdir` hits while a child is still delete-pending — instead of failing on the
+  first one (DW-519, DW-520).
+- Return `bmad-loop validate`'s coding-CLI probe at its timeout on a Windows `.cmd` launcher
+  and kill the launcher's descendants, instead of waiting for the launched program to exit
+  (120 s observed in CI).
+- Keep a Windows release cut byte-stable: the release scripts read and write CHANGELOG and
+  version files as UTF-8 with LF line endings, and exchange `git`/`gh` text — release
+  notes included — as UTF-8 rather than the ANSI code page. A portability guard now
+  refuses file `open` / `read_text` / `write_text` without an explicit encoding in
+  `src/bmad_loop` (DW-513, DW-517, DW-518).
 
-- Scope the sweep skill's `open_ids` and partition validation rules to the session's
-  triage universe, so a `--only` or `--min-severity` triage no longer lists every open
-  entry and burns a retry (#824).
+## [0.13.0] — 2026-09-28
 
-- Show a sweep run's effective `max_bundles`, `repeat` and `max_cycles` in text `status`,
-  labelled launch override or policy snapshot, plus its selector; unreadable or
-  tampered `sweep.json` reports `unverifiable` (#815).
+### Added
 
-- Diagnose non-completed sweep triage and migration sessions: journal and escalate
-  whether `result.json` is missing, malformed or valid, and which of the attempt's
-  hook events arrived on either channel (not applicable for a hookless adapter
-  such as opencode-http); routing is unchanged (#752).
+- Implement `[gates] retrospective = "auto"`: at each epic boundary, and at run end for
+  the last epic once every story is `done`, run one headless
+  `/bmad-retrospective -H <epic>` session on the new `retro` adapter role
+  (`[adapter.retro]`, inheriting from `[adapter]`), before the auto-sweep. Success needs a
+  completed session, `result.json` `done`, the board at `epic-N-retrospective: done` and
+  an `epic-N-retro-*.md` doc; only the doc and board are committed, and leftover dirt
+  pauses. The verdict rides `retro-auto-finished` and the done notice (a `rejected` epic
+  adds an `ATTENTION` line). `validate` and `status --json` name the retro role, and
+  `config_digest` covers it (DW-389, DW-487, DW-488).
+- Ingest sprint-status retro `action_items` into the deferred-work ledger: a fresh
+  `bmad-loop sweep` files each not-`done` item as a `DW-<n>` entry
+  (`origin: retro action item <id>`) before triage, never re-filing a twin (DW-388).
+- Document the `_bmad/custom/bmad-retrospective.toml` override that points the retro at
+  run-dir journals and session logs (setup guide) (DW-387).
+- Add `bmad-loop resolve <run> --adopt-branch`: finish an escalated worktree story from
+  its kept branch (spec set `done`, board mirrored, branch squashed and merged) with no
+  new session. Review, `[verify]` and `pre_commit_gate` are not re-run. A resume that
+  drains the queue past an ESCALATED story now pauses instead of recording the run
+  `finished` (DW-386).
+- Add `bmad-loop resume <run> --accept-baseline`: restarted in-place stories adopt the
+  current HEAD as their baseline, so commits above the old one are kept rather than
+  parked and reset (`baseline-accepted`). Restart resets that do park work now notify
+  (`ATTENTION`) naming the `attempt-preserve/*` / `attempt-preserve-dirty/*` refs with
+  recovery hints, and a failed preserve leg journals `attempt-preserve-fallthrough`
+  (DW-371, DW-480, DW-481, DW-482).
+- Add `[operator] on_review_demotion = "escalate" | "park"` (default `escalate`): under
+  `park`, a review that finalizes a `done` story at `awaiting-operator` moves the board
+  back, commits and parks (DW-383).
+- Seed antigravity workspace trust per unit worktree via a profile's `[workspace_trust]`
+  table, so `isolation = "worktree"` works with antigravity (journals
+  `worktree-trust-seeded` / `-unseeded`); add `probe-adapter --workspace PATH` for a
+  read-only trust verdict (DW-390).
+- Add parked-session detection: a canonical `Notification` event with
+  `PermissionPrompt`/`IdlePrompt`/`QuotaPrompt` kinds, a
+  `[hooks.notification_types]` profile table, and `parked_prompt_patterns` matched
+  against the pane at every stall-grace expiry. A parked session ends `stalled` +
+  `parked` and pauses instead of being nudged. The claude profile maps its permission,
+  idle, quota and MCP elicitation dialogs; re-run `bmad-loop init` to register the
+  relay (DW-348, DW-350, DW-433, DW-434).
+- Add a `post_review_verify` plugin hook stage publishing every review verify gate's
+  `[verify] commands` results (DW-357).
+- Expose `ctx.delivery_id` on `post_migrate` and `ctx.rollback_outcome` on
+  `post_rollback` (declarative: `BMAD_LOOP_DELIVERY_ID`, `BMAD_LOOP_ROLLBACK_OUTCOME`);
+  `post_rollback` now fires once for every `pre_rollback`, also on a paused or failed
+  rollback (DW-317, DW-322).
+- Add a free-form `effort` key to `[adapter]` and `[adapter.<stage>]`; `opencode-http`
+  sends it as the per-prompt `variant` (shown on the `run --dry-run` launch line), and
+  `validate` warns (`policy.effort-unsupported`) for tmux stages (#643).
+- Journal a session's idle stretches as `session-idle` / `session-active` (threshold
+  `limits.dev_stall_grace_s`), with `transcript_idle_s` on `heartbeat.json` and the TUI
+  agent line (#680).
+- Add opt-in `bmad-loop validate --render-probe`: runs each renderer stub's render
+  command in a throwaway copy and fails on a render `HALT:` (DW-381).
+- Add `validate` warnings: `policy.bypass-dropped` when `adapter.extra_args` drops the
+  profile's `bypass_args` (also warned and journaled at real launches);
+  `policy.isolation-shared-artifact-dir` for artifact dirs shared with the main checkout
+  under worktree isolation; `deferred.ledger-untracked` and
+  `deferred.ledger-ignored-isolated` for a ledger that bmad-loop's commits would sweep in
+  or lose; `hooks.relay-path-unsafe` for a relay path with shell metacharacters on
+  Windows; `policy.extra-args-unservable` for `opencode-http` `extra_args` repeating an
+  adapter-owned serve flag (DW-349, DW-410, DW-485, DW-361, DW-375, DW-346, DW-483).
+- Show auto-sweep outcomes (refused with reason, or ran) in the TUI run header (DW-366).
 
-- Replace stale installed relay hooks when a project moves between Windows and POSIX.
+### Changed
 
-- Report stale or unverifiable Codex hook trust in `validate` and `probe-adapter`
-  before a live probe launches; check both relay events against Codex's read-only
-  hook discovery for the operation's directory and executable (#461).
+- **Hooks now register through the installed `bmad-loop relay <Event>` command.
+  Re-run `bmad-loop init` after upgrading.** Codex treats the new commands as untrusted
+  and silently skips them until you accept them at the next launch. `validate` warns
+  when a hook still points to another installation, and (`hooks.relay-stale`) while a
+  Windows backslash registration remains (#773; Windows paths are now forward-slash);
+  `init` replaces a relay installed for the other OS.
+- Support `isolation = "worktree"` when the project sits inside a `repo_root:` override
+  (a monorepo's `<repo>/app`): unit worktrees provision at the project's offset. The
+  `policy.isolation-repo-root` refusal now fires only when the project is outside
+  `repo_root`, and `validate`/the TUI launch guard now require a clean `repo_root`, as
+  `run` and `sweep` do (DW-379).
+- For the claude profile, an idle dev/review/workflow session now pauses as parked at
+  stall-grace expiry instead of receiving the stall wake nudge; opt out by dropping
+  `idle_prompt` from `[hooks.notification_types]` in a project overlay (DW-348).
+- Commit hooks in the ledger-publication candidate worktree now see only the target
+  file: a hook that reads other tracked files may fail the publication (DW-401).
+- Name an earlier attempt's parked work in the retry dev prompt once Git confirms the
+  ref still resolves on this task's baseline (#777).
+- Name every mux session's window 0 `shell` on tmux and psmux (DW-351).
+- Document the live-session removal guard's ceiling: `delete`, `archive` and `clean` can
+  still remove a run whose live session a listing omits (#732).
 
-- Distinguish confirmed missing tmux-family sessions from failed window listings;
-  raise on unproven liveness failures and warn when metadata uses a sentinel (#525).
+### Fixed
 
-- Prove ownership of an untagged control window before targeting it (#531). `ctl_window_id`
-  admitted an untagged row whenever this project merely held a run dir for the run id, and
-  `--run-id` is caller-supplied, so two projects scripting the same id each admitted the
-  _other's_ window — `a` attached to it, the return stamp landed on it, and `x` killed a live
-  orchestrator next door. An untagged row now needs the record this project's own launch
-  wrote for that exact window; with no record the lookup answers nothing rather than guessing
-  by listing order. A window minted before its record exists (a fresh `run`/`sweep`) is
-  unreachable by `a`/`x` until a relaunch records one.
+- Pause a dev session with no confirmed work (a permission dialog, a login, a
+  dead-on-arrival window) instead of retrying into the same wall; `dev-decision` and
+  `session-end` carry `produced_work` (#727).
+- Stop charging an attempt for a session that times out having consumed zero tokens (a
+  provider quota stall): it is now an environment fault that pauses, and usage with no
+  signal is journaled as untracked (`null`), not 0 (DW-364).
+- Count Copilot shutdown metrics, increased Codex output-token totals and new or changed
+  Gemini model messages as work when a dev session exits before the next transcript
+  heartbeat (#822).
+- Honor a hard `bmad-loop stop` inside verify commands and declarative plugin hooks, and
+  kill the whole process tree (including descendants that outlive their shell) on stop or
+  timeout; on Windows the post-kill drain no longer blocks on a held pipe (DW-353,
+  DW-477, DW-478).
+- Escalate an isolated unit before a Codex session starts in a worktree Codex does not
+  trust, instead of starting a session whose Stop hook is silently skipped; trust the
+  worktree, then `resolve --no-interactive` and `resume` (DW-340, DW-341).
+- Report stale or unverifiable Codex hook trust in `validate` and `probe-adapter` before
+  a live probe launches (#461).
+- Tighten hook-registration checks: `validate`/`probe-adapter` report hooks registered
+  only when every Stop-mapped event runs an executed relay naming `Stop`, and refuse a
+  managed relay reporting `Stop` (or a wrongly mapped event) under another native event
+  or any antigravity hook group; `init` strips or warns about them (DW-342, DW-343,
+  DW-344, DW-345, DW-391, DW-392, DW-409, DW-490).
+- Preflight the complete bundled `bmad-loop-sweep` skill before `sweep`, a sweep resume
+  or an auto-sweep, naming `bmad-loop init --force-skills`, instead of every triage
+  session stalling at `Unknown command`; `validate` reports `skills.sweep*` (DW-367).
+- Re-merge on resume a worktree story saved DONE before its merge started, instead of
+  letting GC discard the unit branch (DW-385).
+- Stop worktree teardown and the run-end GC from silently discarding a story's edit to a
+  `skip-worktree`-pinned hook config: success paths pause with the worktree kept
+  (`pinned-config-edit-refused`), and DEFERRED or merge-escalated units carry the edit in
+  `changes.patch`. A GC pause now leaves the run resumable (DW-368, DW-479, DW-501,
+  DW-502).
+- Protect the tracked ledger and board at the merge pre-flight only when the task writes
+  them, and park an operator's uncommitted edit to a path the branch changes under
+  `refs/merge-preflight-preserve/<sha>` before restoring it (DW-354, DW-356).
+- Prove ledger ownership on every harvested-deferral carry retry, pausing
+  (`harvest-carry-foreign-dirt`) rather than committing an operator's ledger edit
+  (DW-355, DW-413).
+- Seed a leaf-symlinked ledger or board at its configured path, ending the #426 defer
+  loop, and name a link to outside the project in `worktree-seed-dropped` (DW-377,
+  DW-432).
+- Keep deferred-work ledger ids and dedupe keys stable: mint ids from `### DW-<n>`
+  headings only, refuse a migration that edits an entry's `origin:`/`source_spec:`,
+  ignore fenced examples when checking for a field, and restore severity when reopening
+  an old archive stub (DW-334, DW-363, DW-384, DW-394, DW-408).
+- Harden sweep-migration recovery: resume a migration interrupted mid-retry, mid-triage
+  or after escalating from `committing` by restoring its durable snapshot (or replaying
+  its idempotent commit tail) instead of escalating or triaging over unaccepted text;
+  replay `sweep-migrated` / `post_migrate` after a host death past `DONE`; re-raise a
+  ledger publish whose `git status` fails (DW-313, DW-314, DW-315, DW-317, DW-336,
+  DW-405, DW-407, DW-426, DW-436, DW-439).
+- Never rewind a sweep migration over a HEAD that moved past the task baseline or over
+  unrelated dirt: recovery resets pause instead, dirt is parked under
+  `refs/attempt-preserve-dirty/*`, and an escalated restart that finds a newer ledger
+  re-pauses (`sweep-migration-restore-diverged`) (DW-427, DW-428, DW-429, DW-430,
+  DW-435).
+- Pause a sweep migration before dispatch when its tracked ledger differs from the
+  committed one (`migrate-ledger-dirty`: commit it, then resume), and finish one with
+  nothing to convert as DONE with no session (DW-437, DW-440).
+- Make the exact-path ledger publication robust: hold `index.lock` across the target
+  compare and reset, read past `git replace` refs, refuse a live exec-bit mismatch
+  (chmod the ledger to match), bind attempt-owned spec normalization to one inode, and
+  prune or name leftover candidate worktrees on failure (DW-319, DW-323, DW-324,
+  DW-325, DW-326, DW-327, DW-328, DW-329, DW-330, DW-331, DW-398, DW-399, DW-400,
+  DW-402, DW-403, DW-404).
+- Skip the candidate cleanup's `git worktree remove --force` / `prune` when
+  `<git-common-dir>/worktrees/` holds a symlinked or junction entry, which git would
+  empty the target of; remove the link, then prune (DW-494).
+- Report undelivered nudges as failed (`nudge-send-failed`) instead of sent, in the
+  generic and `opencode-http` adapters; heartbeat `stall_nudges_sent` counts delivered
+  nudges only (DW-449, DW-503).
+- Stop recording a failed session probe as a vanished session: only a window listing
+  that proves the session gone writes `session-vanished`; otherwise
+  `session-probe-failed` (DW-459).
+- Distinguish confirmed missing tmux-family sessions from failed window listings (#525).
+- Journal observation faults instead of folding them into a healthy-looking empty
+  answer. Generic adapter: `liveness-probe-failed`, `parked-probe-failed`,
+  `log-evidence-failed`, `result-json-refused`, `usage-sample-failed`,
+  `transcript-scan-failed`, `spec-readback-failed`, `env-fault-scan-failed`,
+  `spec-reconcile-skipped-status`, and a `liveness_unknown` flag on over-budget and kill
+  verdicts. `opencode-http`: `usage-sample-failed`, `usage-capture-failed`,
+  `sse-stream-failed`, `sse-frame-dropped`. Verdicts are unchanged (DW-382, DW-447,
+  DW-448, DW-450, DW-451, DW-452, DW-453, DW-454, DW-455, DW-456, DW-457, DW-460,
+  DW-461, DW-462).
+- Warn instead of reading as "nothing there" when a mux session listing, pane or option
+  read, or backend probe fails (`mux` and `validate` report `mux.backend-probe`), and
+  when the removal guard cannot list sessions (DW-458, DW-463, DW-464, DW-466).
+- Report an unreadable runs dir, run dir, legacy registry or orphan sweep instead of "no
+  runs" / "nothing orphaned": `list`, `status`, `clean`, `cleanup` and the TUI say so,
+  with additive `--json` keys `listing_fault`, `sessions.legacy_unverified`,
+  `worktree_faults` and `state_dir_fault`. An unreadable `engine.pid` reads as liveness
+  `unknown`, and `resume` warns about an unreadable config baseline (DW-465, DW-467,
+  DW-468, DW-469, DW-470, DW-471).
+- Surface TUI read faults: a stale run header (`⚠ state stale`),
+  `decisions unreadable`, `agent unreadable`, and notes for unreadable `ATTENTION` or
+  journal files (DW-472, DW-473, DW-474, DW-475).
+- Shape every notice through `gates.notify`/`gates.notice_line`: control characters
+  become visible escapes, multi-line faults and pause reasons fold onto one line, a
+  4000-character cap applies, and lone surrogates never raise. `state.json`, `--json`
+  and the journal keep the raw text (DW-13, DW-332, DW-417, DW-419, DW-491, DW-492).
+- Resolve artifact paths from BMAD's central `_bmad/config.toml`, falling back to
+  `_bmad/bmm/config.yaml` only for missing keys, and refuse malformed values; sweep
+  triage reads the orchestrator's resolved ledger (#154, #769).
+- Read untracked paths verbatim so rollback snapshots, cleanup and failed-unit diffs
+  handle non-ASCII and space-edged filenames (#783).
+- Run a declarative `post_story` hook from the repo root after worktree teardown, and
+  count `plugin-hook-error` in `diagnose` (#779).
+- Refuse `init` when `.bmad-loop`, its `policy.toml` or `.gitignore` resolves outside
+  the project (#771).
+- Parse plugin manifests in `validate` (`plugins.manifests`) without importing plugin
+  code (#765).
+- Scope the sweep skill's `open_ids` to the session's triage universe, so `--only` /
+  `--min-severity` no longer burns a retry (#824).
+- Show a sweep run's effective `max_bundles`, `repeat`, `max_cycles` and selector in
+  text `status` (#815).
+- Diagnose non-completed sweep triage and migration sessions: which of `result.json`
+  and the hook events arrived (#752).
+- Prove ownership of an untagged control window before the TUI attaches to or kills it,
+  so two projects using the same `--run-id` no longer target each other's
+  orchestrator (#531).
+- Preserve inherited `model`, `effort` and `extra_args` when a stage names an alias of
+  the base client; key the `run --dry-run` preview on adapter kind.
+- Honour `launch_args` before `serve` for `opencode-http` wrapper profiles
+  (`npx -y opencode-ai`), with `adapter.launch-args-unservable` in `validate`; report a
+  deeply nested pattern entry as a `ProfileError` (DW-373, DW-374).
+- Fit TUI dialogs to narrow and short terminals (down to 39×9): long titles and paths
+  truncate with `…`, and button rows wrap or scroll instead of going off-screen (DW-358,
+  DW-359, DW-414, DW-415).
+- Decode unity plugin child output as UTF-8 with replacement, so a cp932 Windows
+  codepage no longer raises `UnicodeDecodeError` (DW-365).
+- On Windows, stop a DW bundle pausing at baseline capture when the artifacts root
+  reports no inode (`artifact-observation-unpinned`) (DW-444).
+- Alias commit and snapshot refs in `diagnose` dumps (DW-318, DW-337, DW-435).
+- Correct docs: why `resume` tolerates a dirty tree while `run`/`sweep` refuse one, and
+  `gates.on_escalation` is reserved (only `pause`, no effect) (DW-360, DW-376).
 
-- Count Copilot shutdown metrics and increased Codex output-token totals as work
-  when a dev session exits before the next transcript heartbeat (#822).
+### Security
 
-- Pause a dev session with no confirmed work instead of retrying into the same wall
-  (#727). `SessionResult.produced_work` is `false` when no turn ended and no
-  qualifying pane, transcript, or usage activity was observed (a permission
-  dialog, a login, a dead-on-arrival window); `decide_dev` pauses ahead of the budget as an
-  environment fault does, `dev-decision` and `session-end` carry the flag, and re-arm
-  resets the attempt.
-- Preserve inherited `model`, `effort` and `extra_args` when a stage names an alias
-  of the base client (`opencode` / `opencode-http`, `claude-code-tmux` / `claude`)
-  instead of treating it as a client switch.
-- Key the `run --dry-run` launch preview on the adapter kind, not `profile.hookless`:
-  an `opencode-http` profile with a hook dialect shows the server/prompt_async line,
-  a hookless profile of another kind shows the argv line.
+- Pin the run dir, each worktree mount, and every writer below them to the identity
+  recorded when the orchestrator minted them (`run_dir_identity`,
+  `worktree_identity` in `state.json`): verify-stream and integration-snapshot writes,
+  spec repair/reset/reconcile/adoption, park records and their rollback, re-arm/replan
+  writes and ledger restores now refuse a root, mount or `.bmad-loop/` subdirectory
+  swapped for a link instead of writing outside the repository. Older state records its
+  roots at the first `resume` (`root-identity-recorded`). Parent directories above the
+  worktree, and operator-chosen roots, may still be links (DW-338, DW-423, DW-445,
+  DW-446, DW-486, DW-497, DW-498, DW-500).
+- Harden the exact-path candidate worktree: check it out without running smudge filters
+  or fsmonitor, and pin its root, `.git` gitfile, admin dir and `commondir` so a swap
+  before a later git call is refused instead of steering it into another repository;
+  on Windows, refuse junctions when creating its parents (DW-401, DW-420, DW-425,
+  DW-442, DW-493, DW-495).
+- Create missing artifact directories through no-follow opens pinned to the accepted
+  root, and on Windows refuse a junction at or below the artifacts directory (DW-421,
+  DW-422).
+- Pass `--` before notify-send positionals and shape the Unity dialog probe's line, so
+  an untrusted window title cannot forge `ATTENTION` lines (DW-418).
 
 ## [0.12.0] — 2026-09-20
 
@@ -6225,7 +6497,9 @@ enforced in CI.
   implementation phase, driven by a Python control loop with hook-based session transport and
   resumable on-disk run state.
 
-[Unreleased]: https://github.com/bmad-code-org/bmad-loop/compare/v0.12.0...HEAD
+[Unreleased]: https://github.com/bmad-code-org/bmad-loop/compare/v0.13.1...HEAD
+[0.13.1]: https://github.com/bmad-code-org/bmad-loop/releases/tag/v0.13.1
+[0.13.0]: https://github.com/bmad-code-org/bmad-loop/releases/tag/v0.13.0
 [0.12.0]: https://github.com/bmad-code-org/bmad-loop/releases/tag/v0.12.0
 [0.11.1]: https://github.com/bmad-code-org/bmad-loop/releases/tag/v0.11.1
 [0.11.0]: https://github.com/bmad-code-org/bmad-loop/releases/tag/v0.11.0

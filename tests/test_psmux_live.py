@@ -37,12 +37,12 @@ import time
 import uuid
 from pathlib import Path
 
+import psmux_teardown
 import pytest
 
 from bmad_loop import runs
 from bmad_loop.adapters import tmux_base
 from bmad_loop.adapters.psmux_backend import PsmuxMultiplexer
-from bmad_loop.adapters.tmux_base import TmuxError
 from bmad_loop.tui import launch
 
 HAVE_PSMUX = sys.platform == "win32" and shutil.which("psmux") is not None
@@ -164,10 +164,7 @@ def _new_session_env() -> dict[str, str]:
     return env
 
 
-def _plain_has_session(
-    mux: PsmuxMultiplexer, session: str, *, env: dict[str, str] | None = None
-) -> bool:
-    return mux._run(["has-session", "-t", session], check=False, env=env).returncode == 0
+_plain_has_session = psmux_teardown.plain_has_session
 
 
 def _raw_new_session(mux: PsmuxMultiplexer, session: str, cwd: Path) -> None:
@@ -216,19 +213,6 @@ def _active_window(mux: PsmuxMultiplexer, session: str) -> str:
     active = [line.split()[0] for line in proc.stdout.splitlines() if line.endswith(" 1")]
     assert len(active) == 1, f"probe setup: expected one active window, got {active!r}"
     return f"{session}:{active[0]}"
-
-
-# psmux's own client-side readiness deadline: `src/main.rs`, source-read at
-# v3.3.8 — `ready_deadline = Instant::now() + Duration::from_secs(15)`, after which
-# the client prints `psmux: failed to create session` and exits 1 WITHOUT killing
-# the server it spawned. So it is also the longest a server may take to register
-# while psmux still considers that a normal start.
-_PSMUX_READY_DEADLINE_S = 15.0
-
-
-def _seen_anywhere(mux: PsmuxMultiplexer, session: str, env: dict[str, str]) -> bool:
-    """True if the session answers in the isolated registry or in the default one."""
-    return _plain_has_session(mux, session, env=env) or _plain_has_session(mux, session)
 
 
 _CMDLINE_TOKEN = re.compile(r'"([^"]*)"|(\S+)')
@@ -295,14 +279,18 @@ def _kill_unregistered_servers(session: str) -> list[str]:
         _powershell(
             "; ".join(
                 f"Stop-Process -Id {pid} -Force -ErrorAction SilentlyContinue" for pid in doomed
-            )
+            ),
+            check=False,
         )
     return doomed
 
 
-def _powershell(script: str) -> str:
-    """Run one PowerShell command, returning stdout (empty on any failure — the
-    caller's own report still stands without this witness)."""
+def _powershell(script: str, *, check: bool = True) -> str:
+    """Run one PowerShell command and return its stdout; raise if it could not
+    run, or (``check``) exited nonzero. An empty listing is the teardown's proof
+    that no invisible server is left, so a failed probe must never read as one.
+    The kill passes ``check=False``: `-Command` exits 1 when a pid is already
+    gone, and the teardown re-confirms after every kill anyway."""
     try:
         proc = subprocess.run(
             ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
@@ -312,100 +300,32 @@ def _powershell(script: str) -> str:
             errors="backslashreplace",
             timeout=tmux_base.TMUX_TIMEOUT_S,
         )
-    except (OSError, subprocess.TimeoutExpired):
-        return ""
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise AssertionError(
+            f"probe setup: process-table witness failed ({type(exc).__name__}: {exc})"
+        ) from exc
+    if check and proc.returncode != 0:
+        raise AssertionError(
+            f"probe setup: process-table witness exited {proc.returncode}: "
+            f"{proc.stderr.strip()[:500]}"
+        )
     return proc.stdout
 
 
-def _teardown_probe_session(mux: PsmuxMultiplexer, session: str, env: dict[str, str]) -> None:
-    """Kill a probe session and its server, and refuse to return until it is
-    provably gone in BOTH the isolated and the default registry.
-
-    RETRIED, and aimed at the REGISTRY rather than only at the name.
-
-    `psmux: failed to create session` is the CLIENT's readiness poll timing out,
-    not a creation failure (`src/main.rs`, source-read at v3.3.8: the message is
-    printed once `ready_deadline` passes), so under load the server routinely
-    comes up a moment after the mint reported failure. A single-shot
-    `kill-session` fires while that server is still starting, misses, and both
-    reads then answer "not there" — a clean-looking teardown over a real leak.
-    Every leak makes the NEXT run's mint slower and its own timeout likelier,
-    which is how one instrument failure cascades across a box (observed: a full
-    suite going from 0 to 13 fixture errors as leaked servers accumulated).
-
-    `kill-server` is what makes this decisive: it force-kills every server whose
-    port file is under `psmux_dir()` (`src/main.rs`, source-read — it `read_dir`s
-    that root), and every root here is a private temp directory holding nothing
-    but the probe session. So it does not depend on the session having registered
-    under its NAME yet, which is exactly what a mid-start server has not done.
-    Both verbs are issued each pass because they fail in opposite directions: the
-    name-scoped one works before the port file settles, the registry-scoped one
-    after.
-
-    The default-registry read is checked too: a build ignoring `PSMUX_DATA_DIR`
-    would have created the session in the developer's real registry, and that is
-    the one leak nothing here would otherwise catch.
-
-    HOW LONG ABSENCE HAS TO HOLD depends on whether the session was ever THERE,
-    and that asymmetry is the whole of the timing here.
-
-    - Seen present: the server registered, so both verbs can address it and a
-      short confirmation is honest — the port file is gone and stays gone.
-    - Never seen: the server may simply not have registered YET, and a mid-start
-      server is indistinguishable from no server at all. Both `has-session` and
-      `kill-server` work off the port files under the root, so neither can reach
-      one that has not written its own. Two absent reads a beat apart mean nothing
-      here — measured: a delayed registration let an earlier revision return after
-      0.50s with the server visible immediately afterwards.
-
-    So the unseen case holds its vigil for `_PSMUX_READY_DEADLINE_S`, which is not
-    a guessed number: it is the CLIENT's own readiness deadline (`src/main.rs`,
-    source-read at v3.3.8 — `ready_deadline = Instant::now() + 15s`, then
-    `psmux: failed to create session` and `exit(1)`). A client that gave up there
-    does NOT take the server down with it, so 15s is exactly how long psmux itself
-    is prepared to wait for a registration, and the kills keep firing throughout —
-    the moment a port file appears, `kill-server` reaches it.
-
-    Only the pathological path pays that. Every fixture here tears down a session
-    it minted successfully, so the first read sees it and teardown costs a beat.
-    """
-    seen = _seen_anywhere(mux, session, env)
-    deadline = time.monotonic() + _PSMUX_READY_DEADLINE_S + 45
-    quiet_since: float | None = None
-    while time.monotonic() < deadline:
-        try:
-            mux._run(["kill-session", "-t", session], check=False, env=env)
-            mux._run(["kill-server"], check=False, env=env)
-            present = _seen_anywhere(mux, session, env)
-        except (OSError, TmuxError, subprocess.TimeoutExpired):
-            present = True
-        if present:
-            seen = True  # it registered after all; the kills can address it now
-            quiet_since = None
-        else:
-            needed = 1.0 if seen else _PSMUX_READY_DEADLINE_S
-            now = time.monotonic()
-            if quiet_since is None:
-                quiet_since = now
-            elif now - quiet_since >= needed:
-                if seen:
-                    return  # it was addressable, the kill landed, it is gone
-                # Never seen, and no psmux verb can see it now — which is also
-                # true of a server running under a root it could not write. Ask
-                # the process table before calling this death.
-                killed = _kill_unregistered_servers(session)
-                if not killed:
-                    return
-                print(
-                    f"warning: probe session {session} was running with an "
-                    f"unwritable registry — no psmux verb could reach it; killed "
-                    f"pid(s) {', '.join(killed)} directly",
-                    file=sys.stderr,
-                )
-                quiet_since = None  # re-confirm now that something was killed
-        time.sleep(0.5)
-    raise AssertionError(
-        f"probe setup: probe session {session} survived teardown; kill it manually"
+def _teardown_probe_session(
+    mux: PsmuxMultiplexer, session: str, env: dict[str, str], *, known_created: bool = False
+) -> None:
+    """Kill a probe session and its server; refuse to return until it is provably
+    gone in both registries. The policy — why it is retried, registry-scoped and
+    how long absence must hold — is `psmux_teardown.teardown_probe_session`'s
+    docstring. ``known_created`` is the caller's positive post-mint observation
+    and nothing weaker; the process-table witness is this module's own."""
+    psmux_teardown.teardown_probe_session(
+        mux,
+        session,
+        env,
+        known_created=known_created,
+        kill_unregistered=_kill_unregistered_servers,
     )
 
 
@@ -440,6 +360,7 @@ def psmux_data_root(tmp_path_factory):
     session = f"bmad-loop-data-probe-{uuid.uuid4().hex[:8]}"
     env = _new_session_env()
     env["PSMUX_DATA_DIR"] = str(root)
+    isolated = False
     try:
         created = mux._run(
             ["new-session", "-d", "-s", session, "-c", str(root)], check=False, env=env
@@ -476,7 +397,8 @@ def psmux_data_root(tmp_path_factory):
         # session is most likely still standing, so it must reach the report
         # below rather than escape with a bare TimeoutExpired.
         #
-        _teardown_probe_session(mux, session, env)
+        # `isolated` is the positive read above; a failed mint never set it.
+        _teardown_probe_session(mux, session, env, known_created=isolated)
 
 
 @pytest.fixture
@@ -489,29 +411,40 @@ def probe(tmp_path, monkeypatch, psmux_data_root):
     session = f"bmad-loop-test-{uuid.uuid4().hex[:8]}"
     env = _new_session_env()
     env["PSMUX_DATA_DIR"] = str(psmux_data_root)
-    try:
-        _raw_new_session(mux, session, tmp_path)
+    # The SAME teardown the data-root fixture uses, and it has to be: a
+    # single-shot kill plus one read is a clean-looking teardown over a real
+    # leak whenever the server is mid-start, and every leaked server slows the
+    # next mint and makes its own timeout likelier. This is the fixture that
+    # runs fifteen times, so it is the one that compounds. See
+    # `psmux_teardown.teardown_probe_session` for why absence has to hold, and
+    # for how long.
+    #
+    # `minted_session` hands the teardown `known_created=True` only once
+    # `_raw_new_session` has RETURNED, and that returns only after a plain
+    # `has-session` answered — the positive observation the teardown may carry.
+    # A test that kills the session itself
+    # (`test_adopted_kill_session_honors_the_exact_match_target`) otherwise
+    # reached teardown with nothing left to see and held the full never-seen
+    # vigil; a mint that raised hands over False and keeps that vigil.
+    #
+    # `kill-server` is registry-wide, and this root is shared with the module
+    # fixture — which is safe by construction: that fixture's own probe session
+    # is torn down inside its setup, so this session is the only one in the
+    # root while a test runs.
+    #
+    # The teardown's second read passes no env, but this fixture has
+    # PSMUX_DATA_DIR monkeypatched into the process for the duration, so that
+    # read lands in the isolated registry too rather than in the default one.
+    # It is a duplicate here, not a default-registry check; the module fixture
+    # is where that check has teeth.
+    with psmux_teardown.minted_session(
+        lambda: _raw_new_session(mux, session, tmp_path),
+        lambda known_created: _teardown_probe_session(
+            mux, session, env, known_created=known_created
+        ),
+    ):
         windows = [_mint_probe_window(mux, session, f"probe-{n}", tmp_path) for n in (1, 2)]
         yield mux, session, windows
-    finally:
-        # The SAME teardown the data-root fixture uses, and it has to be: a
-        # single-shot kill plus one read is a clean-looking teardown over a real
-        # leak whenever the server is mid-start, and every leaked server slows the
-        # next mint and makes its own timeout likelier. This is the fixture that
-        # runs fifteen times, so it is the one that compounds. See
-        # `_teardown_probe_session` for why absence has to hold, and for how long.
-        #
-        # `kill-server` is registry-wide, and this root is shared with the module
-        # fixture — which is safe by construction: that fixture's own probe session
-        # is torn down inside its setup, so this session is the only one in the
-        # root while a test runs.
-        #
-        # The teardown's second read passes no env, but this fixture has
-        # PSMUX_DATA_DIR monkeypatched into the process for the duration, so that
-        # read lands in the isolated registry too rather than in the default one.
-        # It is a duplicate here, not a default-registry check; the module fixture
-        # is where that check has teeth.
-        _teardown_probe_session(mux, session, env)
 
 
 def test_premise_version_leads_with_a_tmux_triple():

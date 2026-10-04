@@ -125,10 +125,14 @@ class StoriesEngine(Engine):
         return stories.relativize_spec_folder(self.paths.project, spec_folder)
 
     def _stories_folder(self) -> Path:
-        """The spec folder resolved against the current workspace root (project
-        root at pick time, the unit worktree during a driven story)."""
+        """The spec folder resolved against the current workspace's PROJECT (the
+        project at pick time, the unit's mount project during a driven story).
+
+        The folder is stored project-relative (:meth:`_relativize`), so it joins on
+        ``workspace.paths.project`` — not ``workspace.root``, the code root, which a
+        ``repo_root:`` override moves away from the project (DW-379)."""
         rel = Path(self._spec_folder_rel)
-        return rel if rel.is_absolute() else self.workspace.root / rel
+        return rel if rel.is_absolute() else self.workspace.paths.project / rel
 
     def _load_stories(self) -> stories.Stories:
         return stories.load_stories(self._stories_folder())
@@ -225,6 +229,27 @@ class StoriesEngine(Engine):
                 self.journal.append("stories-escalation-unresolved", story_key=key)
                 gates.notify(self.policy, self.run_dir, f"unresolved escalation: {key}", reason)
                 raise RunPaused(reason, PAUSE_ESCALATION, key)
+
+    def _run_end_retrospective(self) -> None:
+        """Inert: stories mode has no epics (every ``_StoryRef.epic`` is the 0
+        sentinel), so there is no finished epic to run a retrospective for — the
+        run-end twin of the epic boundary that never fires here (DW-488)."""
+
+    def _unresolved_escalation_key(self) -> str | None:
+        """Only an in-run escalation (``attempt > 0``) blocks ``finished``. A
+        pick-time wedge / unknown-selector task (``attempt == 0``) is re-classified
+        from disk every pick (see ``_repause_inrun_escalation``), so reaching run end
+        means the human fixed it by hand; its stale ESCALATED record must not
+        re-pause the run, whose only way past would be a re-arm that re-drives the
+        fixed story."""
+        return next(
+            (
+                k
+                for k, t in self.state.tasks.items()
+                if t.phase == Phase.ESCALATED and t.attempt > 0
+            ),
+            None,
+        )
 
     def _pause_unknown_selector(self, selector: str) -> None:
         """The ``--story`` selector resolves to no manifest entry: pause for
@@ -365,8 +390,10 @@ class StoriesEngine(Engine):
         if label is not None:
             return {}
         # Let the dev/review adapter resolve the story spec deterministically by
-        # id (skip the mtime scan). Project-relative — the adapter rebases it
-        # against spec.cwd, so it is correct in place and under worktree isolation.
+        # id (skip the mtime scan). Project-relative — the adapter anchors it on the
+        # project's place in spec.cwd (`mountpaths.rebased_project`, the offset a
+        # nested `repo_root:` adds, DW-379), matching `_stories_folder`, so it is
+        # correct in place and under worktree isolation.
         env = {"BMAD_LOOP_SPEC_FOLDER": self._spec_folder_rel}
         # On a plan-halt leg tell the adapter to synthesize the ready-for-dev spec
         # as a *successful* terminal (plan done), not died-mid-flight. Keyed off the
@@ -394,6 +421,11 @@ class StoriesEngine(Engine):
         The folder is always project-relative (kills the absolute-path concern;
         the contract allows an absolute one but we never emit it). ``invoke_dev_with``
         is appended verbatim — the single planner→dev channel, never interpreted."""
+        # The environment-claim clause (DW-523) ends the invocation line on both
+        # legs — "" without probes, so the default prompt is unchanged. This
+        # engine has no park clause to keep last.
+        env_claim = self._environment_claim_instruction()
+        env_sentence = f" {env_claim}" if env_claim else ""
         if feedback is not None:
             # Deterministic-verify repair: re-open the id-keyed story spec and
             # resume on it in place. Identical to the base generic repair leg (an
@@ -407,7 +439,7 @@ class StoriesEngine(Engine):
                 f"verification; repair the working tree so verification passes without "
                 f"changing the spec's frozen intent contract. Verification evidence is "
                 f"in `{feedback}`."
-            )
+            ) + env_sentence
         entry = self._entry_for(task)
         prompt = (
             f"/{self._dev_skill()} Spec folder: {self._spec_folder_rel}. "
@@ -415,6 +447,7 @@ class StoriesEngine(Engine):
         )
         if self._plan_halt_leg(task, entry):
             prompt += " Halt after planning."
+        prompt += env_sentence
         if entry is not None and entry.invoke_dev_with:
             prompt += "\n" + entry.invoke_dev_with
         # A retry after a rolled-back attempt names its verified parked work (#777),
@@ -578,6 +611,7 @@ class StoriesEngine(Engine):
             self.workspace.paths,
             self.policy,
             on_results=self._review_command_sink(task),
+            on_probes=self._review_probe_sink(task),
         )
 
     def _sprint_board_instruction(self) -> str:
@@ -608,6 +642,11 @@ class StoriesEngine(Engine):
         # `Halt after planning.` prompt + BMAD_LOOP_PLAN_HALT env are emitted by
         # _dev_prompt / _extra_session_env, both keyed off the same on-disk state).
         # dev_resume None means a fresh drive, not a mid-session crash replay.
+        if dev_resume is None:
+            # DW-523: the dispatch gate `_dev_phase` runs, asked before the plan-halt
+            # latch and journal below so an `environment` pause writes neither (a
+            # passing probe is fresh, so `_dev_phase` does not probe twice).
+            self._gate_dispatch(task, "dev")
         if dev_resume is None and self._plan_halt_leg(task, self._entry_for(task)):
             # Latch the plan-review obligation BEFORE the session runs, so it
             # survives a crash in the post-session window, a non-fixable retry that

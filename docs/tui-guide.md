@@ -23,36 +23,38 @@ Linux, so tmux works there unchanged; native Windows awaits a Windows-capable ba
 `mux.backend` (or the `BMAD_LOOP_MUX_BACKEND` env var) forces the choice per machine.
 
 **Terminal sizes, as measured.** The modal dialogs — confirmations, the
-start/sweep option forms, the escalation and checkpoint viewers — are the
-tightest thing the TUI draws. The figures below describe those **dialogs**, not
-the dashboard behind them, which simply shows fewer rows as the window shrinks.
-**39 columns × 9 rows** is the size at which a dialog's own chrome was measured
-to fit: its border, padding, title line and margins, a row of body, and the
-whole docked button row. `EscalationModal` is what sets it, and its height is
-width-dependent because its docked warning wraps — 9 rows at 39 columns but only
-6 at 80 — so a roomier window buys height as well as width.
+start/sweep option forms, the escalation, checkpoint, spec and validate viewers
+— are the tightest thing the TUI draws. The figures below describe those
+**dialogs**, not the dashboard behind them, which simply shows fewer rows as the
+window shrinks. **39 columns × 9 rows** is the size at which a dialog shows its
+title, a row of body and all of its docked buttons, fully visible — every
+dialog included: the spec and validate viewers, the escalation viewer with any
+of its hints, and the resume confirmation with its double-drive warning.
 
-That is a measurement of the chrome, not of the text a dialog is handed, and it
-is not a size you can rely on. Titles, headers, warnings and file paths are
-docked _outside_ the scrolling body, so each line they wrap to costs a row the
-body cannot give back, the body having floored at one row. That text comes from
-the caller and **nothing bounds its length** — a deferred-work ledger title, a
-`spec:` folder, a spec path. A long enough value therefore consumes the frame
-and clips the docked controls at **any** fixed size, so no figure here — 39 × 9,
-80 × 24, or larger — is a minimum these dialogs will always meet. Bounding that
-text is tracked in #629, and the spec viewer's over-wide action row in #628.
+Caller-supplied text cannot move that size. Titles, headers, subtitles and file
+paths are docked _outside_ the scrolling body, and their length comes from the
+caller — a deferred-work ledger heading, a story title, a `spec:` folder, a
+spec path. Each of their lines is held to **one row**, ending in `…` when it is
+too long, so a dialog's height depends on how many lines it docks, never on how
+long they are. Docked warnings and hints are the TUI's own text and are not
+held this way; they are written short enough to fit that size whole. On a
+short terminal the resume confirmation's body scrolls rather than push its
+warning out.
 
-What the figures do say is that these sizes were sufficient for the dialogs as
-measured, at the content lengths the test suite exercises. Measured at 39
-columns: a deferred-work heading of about 150 characters still fits, while about
-300 characters wraps to nine rows of title and pushes the close button off; the
-validate-findings viewer needs one extra row for a plain result and three when
-the document carries a long spec folder; and the spec viewer's `copy path`
-button alongside its action verbs is wider than a 39-column dialog can hold
-whatever the button metrics do, over and above a spec path that wraps. A
-standard **80 × 24** terminal was sufficient for every one of those measured
-examples, which is why it is the size quoted wherever the content is unbounded —
-as one that worked for what was measured, not as one that cannot be overrun.
+What the `…` cuts is not always shown anywhere else. Some of it is: the spec
+path is cut from the front so it keeps its file name, and `copy path` copies the
+whole path; the deferred-work viewer's scrolling body repeats the full heading,
+and its done and legacy markers sit on lines of their own. At narrow widths,
+though, a long story title, the end of the validate header's lines — including
+its severity tallies and the note that the gates are chained — and the end of a
+long dialog title can be cut with no other copy on screen; widen the terminal
+to read them.
+
+Below **80 columns** the spec viewer's action row — `copy path`, the action
+verbs and `close` — wraps into two columns instead of clipping its right-most
+buttons, and the viewer takes the terminal's full height to fit the second
+row. Below about 43 columns the longest label (`Approve & resume`) may lose
+its tail to `…`; the button stays whole and still works.
 
 Below **60 columns or 20 rows** the dialogs degrade to a compact layout rather
 than clipping: the dialog clamps to the screen width, the action buttons shrink
@@ -217,13 +219,18 @@ session is open it falls back to the run's configured adapters, rebuilt from the
 run's policy snapshot — `agents <name·model>` when dev and review resolve alike,
 else `agents dev <name·model> review <name·model>`, plus a `triage <name·model>`
 on sweep runs. A run that predates adapter stamping (no rebuildable snapshot)
-shows no agent line at all rather than a fabricated default. Below that,
-situational banners:
+shows no agent line at all rather than a fabricated default. An open session whose
+identity cannot be derived from a malformed journal entry reads a yellow
+`agent unreadable — <fault>` rather than no line, which would look like no session
+at all (DW-474). Below that, situational banners:
 
 - `⏸ paused (<stage>) — <reason> · press e to resume` — gate or escalation
   pause; stages are `spec-approval`, `epic-boundary`, `escalation`,
-  `story-gate`. At the `escalation` stage, `e` only skips the escalated story —
-  press `R` instead to resolve it (see "Resolving an escalation" below).
+  `story-gate`, `environment`. At the `escalation` stage, `e` only skips the
+  escalated story — press `R` instead to resolve it (see "Resolving an
+  escalation" below). At the `environment` stage (badge `env`: an
+  `[environment]` probe failed before a session launch) fix the environment and
+  press `e` — the resume re-probes, then launches the same session.
 - `⏹ graceful stop pending — will stop after the current item` — a graceful
   stop was requested (`S`, or `bmad-loop stop --graceful`); the run finishes the
   in-flight story/bundle through commit (or, mid-sweep-triage, lets triage
@@ -239,6 +246,17 @@ situational banners:
 - `⧗ starting… waiting for the engine to write state.json` — just launched;
   if nothing appears within 10 seconds the TUI raises a "launch may have
   failed" error toast.
+- `⚠ state stale — state.json unreadable (<fault>); showing the last good read`
+  (DW-472) — the header keeps the last `state.json` that parsed, and this line says
+  it is no longer current: the file stopped parsing, went away, or cannot be
+  stat'd. It appears only once the same unchanged file has failed on two
+  consecutive polls, so a read torn by a write in progress never flashes it, and it
+  clears on the next good parse. A run whose `state.json` never parsed reads
+  `state unavailable — <fault>`.
+- `⚠ journal.jsonl …` / `⚠ ATTENTION …` (dim, DW-475) — the poll could not stat or
+  read that file this tick; the Journal / Attention tab holds what was read before.
+  The journal tail keeps its position across the fault, so nothing is re-listed or
+  skipped when it clears.
 
 ### Task table (middle right)
 
@@ -270,14 +288,42 @@ One row per story (or sweep bundle/triage task) in the selected run:
   end-of-session total, distinct from a tripped session's `budget_weighted`
   (the guard's mid-session sample at trip time). The
   matching `tasks/<id>/` dir holds the forensic breadcrumbs the adapter wrote
-  while the session ran: `session-lifecycle.jsonl` (timeout-fire,
-  budget-guard `budget-tripped` / `over-budget-fired`, kill-escalation,
-  `session-vanished` (the mux no longer reported the session during the run, #489), and the
+  while the session ran: `session-lifecycle.jsonl` (timeout-fire — its
+  `probe_failures` counts a liveness-probe failure streak open at the deadline and
+  its `foreign_hook_events` the hook events dropped as a nested CLI's —,
+  budget-guard `budget-tripped` / `over-budget-fired`, kill-escalation — both
+  of these carry `liveness_unknown`, true when the verdict's probe raised —,
+  `session-vanished` (the mux no longer reported the session during the run, #489),
+  `foreign-hook-event-ignored` (a nested coding CLI's hook events dropped by session
+  attribution, #767 — written once per foreign id, with `hook_event`,
+  `foreign_session_id`, and `dropped_so_far`, the running count of dropped events;
+  id-less drops, which only a trusted relay-side lineage `mismatch` makes, share
+  one crumb with `foreign_session_id: null`, DW-507),
+  `hook-lineage-untrusted` (once per session when the first `SessionStart` could
+  not calibrate relay-side lineage, so only the #767 rules apply — `reason` is
+  `miscalibrated` or `unavailable`, `lineage` the first start's tag, DW-507),
+  `pinned-session-id-mismatch` (once per session when the first identified
+  non-`clear`/`compact` `SessionStart` of a pinned launch reports an id other than
+  the pin — a rejected `mismatch`-tagged nested start is skipped —
+  `pinned_session_id`, `reported_session_id`, `source`, DW-509),
+  mux transport faults `liveness-probe-failed` / `liveness-probe-recovered` /
+  `nudge-send-failed`, observation faults `parked-probe-failed` /
+  `log-evidence-failed` / `result-json-refused` / `usage-sample-failed` /
+  `usage-sample-recovered` / `transcript-scan-failed` / `transcript-scan-recovered` /
+  `spec-identity-unreadable` / `spec-digest-unreadable` / `spec-readback-failed`,
+  an abandoned post-kill rescue
+  `post-kill-rescue-abandoned` (liveness unknown or an unreadable artifact), and the
   #276 missing-marker forensics `spec-status-transition-observed` /
   `frontmatter-unmodified-refused` / `contract-nudge-sent`),
   `heartbeat.json` (the wait loop's proof-of-life —
-  stale under a live session means the orchestrator itself was frozen), and
-  `resultless-stops.jsonl` (each give-up Stop with its verdict: `no-artifact`,
+  stale under a live session means the orchestrator itself was frozen; on the
+  generic adapter it also carries `probe_failures`, the running liveness-probe
+  failure streak, `stall_nudges_failed`, `usage_sample_failures`, the running
+  budget usage-sample failure streak, and `foreign_hook_events`, the running count
+  of hook events dropped as a nested CLI's, #767), and
+  `resultless-stops.jsonl` (each give-up Stop with its verdict: `no-result-json` /
+  `malformed-result-json`, `no-artifact`, `stat-failed` / `unreadable-spec` (a spec
+  read fault, with the error),
   `ambiguous-frontmatter`, `unmodified-since-launch` — the spec's bytes were
   unchanged since review launch, so it is a prior `done` re-opened, not this
   session's output (#276) — or `terminal-frontmatter-pending`).
@@ -286,7 +332,10 @@ One row per story (or sweep bundle/triage task) in the selected run:
   active task is the last `session-start` without a matching `session-end`
   (falling back to the newest log file); the tab switches automatically when
   the engine moves to the next session. Only the last 64 KB of a large log is
-  read on first open.
+  read on first open. If the scan of the skipped head for a fullscreen
+  (alt-screen) switch cannot read the file, a yellow `⚠ could not scan this log's
+head for a fullscreen switch` note says the pane may show only the final frame
+  (DW-475).
 - **Attention** — the run's `ATTENTION` file (escalations, gate
   notifications). New lines after the first poll also fire a warning toast.
 
@@ -421,7 +470,7 @@ whose state is unreadable. The confirmation modal shows what you are resuming:
 
 - paused runs: `paused at <stage> — <reason>` in yellow;
 - non-paused runs: `run is not paused — it looks interrupted` (dim);
-- and, in bold red, `engine.pid is still alive — resuming would double-drive
+- and, in bold red, `engine.pid may still be live — resuming could double-drive
 this run` when the original engine still appears to be running. Heed this
   one: two engines driving one run dir corrupt each other's state. It can also
   mean the pid was recycled by another process — verify before resuming.
@@ -481,6 +530,16 @@ herdr's is `ctrl+b q`) to return to the dashboard, which observes the
 resumed run like any other. Exiting the agent without recording a resolution
 leaves the story escalated and the run paused — the safe default.
 
+`R` does not apply to two pauses that can look like one. A run paused at the
+`environment` stage needs no resolve: `R` says so and points at resume (fix the
+environment, then `e`). A pause whose story was **deferred** rather than
+escalated (a manual-recovery pause after a defer) is not re-armed either: `R`
+and `p` notify `run bmad-loop resolve <run> --reverify (re-verify kept work) or
+bmad-loop resume <run> (move on)` and stop there — the TUI does not drive
+`--reverify`, so run it from a shell. The notice keys on the paused story only;
+a deferred worktree unit under another story's pause is reached with
+`bmad-loop resolve <run> --reverify --story <key>`.
+
 ## Reviewing a paused run (`p`)
 
 `p` opens the **stage-appropriate HITL viewer** for the selected paused run,
@@ -528,7 +587,9 @@ artifacts the engine already wrote.
   whose intent regeneration the ledger refused (its task may carry a spec file, but the
   gate is about the ledger, not the spec), an epic boundary has no story at all — so
   they open a compact pause-reason viewer instead: the reason names
-  the blocking entries and the remedy. **Resume** re-picks a gated sprint story;
+  the blocking entries and the remedy. An `environment` pause opens the same
+  spec-less viewer, whose reason names the failed probe; **Resume** re-runs
+  the probes first and re-pauses unchanged while one still fails. **Resume** re-picks a gated sprint story;
   for a bundle-regeneration pause, it recovers the same persisted bundle and regenerates
   its intent document. Both re-ask the ledger, so an unresolved refusal re-pauses.
 
@@ -584,7 +645,10 @@ attended sweeps.
 The flow above is for a decision a _live_ attended sweep is blocked on. For
 decisions an **unattended** sweep skipped — or an attended one you walked away
 from — press `d`. The Deferred Work pane title shows the outstanding count
-(`Deferred Work — N to answer (d)`), and `d` walks them one modal at a time
+(`Deferred Work — N to answer (d)`), or `Deferred Work — decisions unreadable (d)`
+when they could not be read (no loadable BMAD config, an unreadable ledger, a read
+that raised — DW-473); `d` then toasts the fault as an error instead of claiming
+nothing is pending. Otherwise `d` walks them one modal at a time
 (question, context, and each option with its effect and the triage
 recommendation). Each answer is durable: a `close` is applied immediately, and
 a `build`/`keep-open` is saved to `.bmad-loop/decisions.json`, so the next sweep
@@ -690,7 +754,7 @@ behavior.
 | `scm.delete_branch`                   | switch                 | on                 | worktree mode: delete the unit branch after a successful merge                                                                                                                                                                                                                                                                     |
 | `scm.keep_failed`                     | switch                 | on                 | keep a failed unit's worktree + branch mounted for inspection                                                                                                                                                                                                                                                                      |
 | `scm.rollback_on_failure`             | switch                 | off                | in-place mode (`isolation = none`) only: on = auto-revert a failed attempt's tracked changes + delete the untracked files this run created (its uncommitted work is lost); off = never touch the tree, pause with manual recovery. A resolved escalation's re-drive always auto-recovers regardless. Prefer `isolation = worktree` |
-| `scm.preserve_keep`                   | int ≥ 0                | 20                 | `attempt-preserve/*` recovery branches + `attempt-preserve-dirty/*` snapshots kept per family at each run start, newest by committer date; the tail is deleted (0 = never prune)                                                                                                                                                   |
+| `scm.preserve_keep`                   | int ≥ 0                | 20                 | `attempt-preserve/*` recovery branches + `attempt-preserve-dirty/*` rollback snapshots + `merge-preflight-preserve/*` merge pre-flight snapshots kept per family at each run start, newest by committer date; the tail is deleted (0 = never prune)                                                                                |
 | `scm.seed_adapter_defaults`           | switch                 | on                 | worktree mode: seed each loaded adapter's gitignored MCP/CLI configs (`.mcp.json`, `.claude/settings.json`, `.codex/config.toml`…) into the worktree                                                                                                                                                                               |
 | `scm.worktree_seed`                   | one per line           | (none)             | worktree mode: extra project-relative gitignored files to seed, on top of the adapter defaults                                                                                                                                                                                                                                     |
 | `scm.commit_message_template`         | text                   | (built-in)         | story/bundle commit message; `{story_key}` / `{run_id}` / `{story_title}` substituted                                                                                                                                                                                                                                              |
@@ -730,7 +794,11 @@ coupling is validated on save, so an invalid combo (e.g. `per_worktree` with
 `extra_args` fields are special: the switch distinguishes "use the profile's
 default flags" (off — the key stays absent) from "replace them with exactly
 this list" (on — the input is parsed shell-style; an empty list is a valid
-override and is not the same as unset).
+override and is not the same as unset). Because an override replaces the
+profile's `bypass_args`, it must repeat the permission-bypass flags;
+`bmad-loop validate` warns (`policy.bypass-dropped`) when it does not. Under an
+`opencode-http` profile the list lands after the adapter-owned `--port`/`--hostname`/
+`--print-logs`, so repeating one is warned too (`policy.extra-args-unservable`).
 
 `ctrl+s` validates the whole document through the engine's own parser
 (`policy.loads()`) before writing; errors land in a red strip above the
@@ -748,11 +816,12 @@ if the operator has marked `policy.toml` read-only (#593, #597).
 | `another run is live: <ids>`                                                        | a second engine on the same project may conflict — confirm only if you know they won't touch the same stories                        |
 | `launch may have failed — attach to control session <name>`                         | no `state.json` within 10 s of launch; attach to the named ctl session to read the error (the window stays open with the exit code)  |
 | `no run selected`                                                                   | `e` / `a` need a selected run — the project has no runs yet                                                                          |
+| `could not read past sweeps' decisions: <fault>`                                    | `d` could not read the missed decisions (DW-473) — fix the named config or ledger fault; `bmad-loop decisions` reports the same      |
 | `state for run <id> is unreadable`                                                  | corrupt/missing `state.json`; inspect the run dir                                                                                    |
 | `run <id> already finished`                                                         | finished runs can't be resumed                                                                                                       |
 | `nothing to attach: no live agent session … runs started outside the TUI have none` | between sessions there is no agent window, and shell-started runs have no ctl window; wait for the next session or attach manually   |
 | `cannot suspend here — run manually: tmux attach …`                                 | the terminal can't suspend the TUI; run the printed command in another terminal                                                      |
-| `engine.pid is still alive — resuming would double-drive this run`                  | the original engine still runs (or its pid was recycled); attach and check before resuming                                           |
+| `engine.pid may still be live — resuming could double-drive this run`               | the original engine still runs (or its pid was recycled); attach and check before resuming                                           |
 | `policy.toml is not valid TOML: …`                                                  | hand-edited file is syntactically broken; fix it in an editor — the settings screen needs a parseable document to start from         |
 | sprint tree shows `sprint status unavailable`                                       | missing/invalid `_bmad/bmm/config.yaml` or sprint-status.yaml; run `bmad-loop init` / `bmad-sprint-planning`                         |
 | deferred pane shows `deferred ledger unavailable`                                   | missing/unreadable `deferred-work.md`; normal until the first session defers something                                               |

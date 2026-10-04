@@ -15,12 +15,13 @@ cluster) see an unchanged surface.
 
 from __future__ import annotations
 
+import contextlib
 import errno
 import os
 import re
 import stat
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, NoReturn
+from typing import TYPE_CHECKING, Callable, NamedTuple, NoReturn
 
 from . import gates, verify
 from .model import Phase
@@ -31,9 +32,11 @@ from .platform_util import (
     atomic_write_bytes_at,
     open_at,
     open_dir_confined,
+    require_root_pinned,
     safe_ref_segment,
     stat_at,
 )
+from .runs import mount_root_identity
 from .statemachine import advance
 
 if TYPE_CHECKING:
@@ -52,6 +55,18 @@ if TYPE_CHECKING:
 # upstream is wrong. The cost of the bound is one git spawn per candidate on a
 # path that only runs while a crashed attempt is being rolled back.
 PRESERVE_REF_PROBE_LIMIT = 100
+
+
+def deferred_reverify_hint(run_id: str) -> str:
+    """The pointer every pause on a DEFERRED story appends (DW-522): when only the
+    environment failed, `resolve --reverify` keeps the attempt's work and replays
+    verification on it instead of the steps that discard it."""
+    return (
+        "If the attempt's work is good and only the environment was broken (a service, "
+        f"container or database was down), fix the environment and run `bmad-loop resolve "
+        f"{run_id} --reverify` instead of resetting: it replays verification on the kept "
+        "work and, when it passes, reviews and commits it without a new dev session."
+    )
 
 
 def attempt_preserve_ref_name(run_id: str, tip: str) -> str:
@@ -138,6 +153,17 @@ def retry_preserve_paragraph(repo: Path, task: StoryTask, run_id: str) -> str:
     )
 
 
+class _FailedPark(NamedTuple):
+    """A preserve leg that failed and fell through to the reset (DW-481).
+
+    ``leg`` is ``commits-enumerate``, ``commits-park`` or ``worktree-snapshot``;
+    ``head`` is the attempt HEAD observed at the failure, ``""`` when it could not
+    be read (the fault is journaled beside it)."""
+
+    leg: str
+    head: str
+
+
 class _OwnedSpecAuthorityError(RuntimeError):
     """A previously canonical owned spec lost trustworthy restore authority."""
 
@@ -201,8 +227,22 @@ class RecoveryFlow:
         self._emit = emit
         self._save = save
         self._escalate = escalate
-        self._pause = escalation_pause
+        self._escalation_pause = escalation_pause
+        # Tally of pauses raised through `_pause`. `rollback_or_pause` compares it
+        # across its reset arm to tell a propagating pause ("paused") from any
+        # other escaping error ("failed") for `post_rollback` without importing
+        # the engine's `RunPaused` (DW-322).
+        self._pauses_raised = 0
         self._dev_attempt_dispatched = dev_attempt_dispatched
+
+    def _pause(self, reason: str, story_key: str = "", **kwargs: object) -> NoReturn:
+        """Raise the injected escalation pause, marking that this flow paused.
+
+        Every pause raised inside ``rollback_or_pause``'s reset arm routes through
+        here, so it can label the paired ``post_rollback`` emit. (``restore_patch``
+        escalates through ``self._escalate`` instead, outside any rollback.)"""
+        self._pauses_raised += 1
+        self._escalation_pause(reason, story_key, **kwargs)
 
     def protected_relpaths(self) -> tuple[str, ...]:
         """Repo-relative posix paths of the BMAD artifact folders. These are
@@ -296,7 +336,12 @@ class RecoveryFlow:
 
     @staticmethod
     def _normalize_attempt_owned_spec(
-        spec_path: Path, target_status: str, *, confine_root: Path
+        spec_path: Path,
+        target_status: str,
+        *,
+        confine_root: Path,
+        expected: verify.FileIdentity | None = None,
+        root_identity: os.stat_result | None = None,
     ) -> None:
         """Write and verify the lifecycle route recovery promises to dispatch.
 
@@ -305,14 +350,39 @@ class RecoveryFlow:
         resolves candidates under), threaded down rather than re-derived here:
         this is a staticmethod on purpose, and `_workspace_get` is a live getter
         precisely because a unit worktree swaps the root mid-run (``rebased``
-        makes ``paths.project`` the worktree root there). It must NOT be
+        makes ``paths.project`` the mount project there — the worktree root, or
+        ``<worktree>/<offset>`` for a project nested in ``repo_root``). It must NOT be
         ``workspace.root``: under the `repo_root` override that is the separate
         code repo, an in-project spec fails its `is_relative_to` test, and the
         chokepoint silently takes the plain arm — dropping the parent walk the
-        confinement exists for. It reaches the spec-writer chokepoint rule
-        stated in `frontmatter.set_frontmatter_status` — an artifacts folder
-        configured outside the project is a trusted repair target here
-        (`_attempt_owned_spec`) when handle-anchored writes are available."""
+        confinement exists for. An artifacts folder configured outside the
+        project is a trusted repair target here (`_attempt_owned_spec`) when
+        handle-anchored writes are available.
+
+        ``root_identity`` pins ``confine_root`` (DW-445): the callers pass
+        `_mount_root_identity` of it — `runs.mount_root_identity` when the
+        workspace is a unit mount, ``None`` for the operator's project — so a
+        mount swapped for a link, before or after the spec path was bound,
+        refuses with `platform_util.UnconfinedWriteError` (an ``OSError``, raised
+        as any unreachable parent is) and nothing lands outside the repository.
+        The pin compares the unit worktree against its mint-time record
+        (``task.worktree_identity``, DW-446) and walks ``O_NOFOLLOW`` down to
+        ``confine_root``, so an ancestor swapped for a link refuses too.
+
+        The write is `frontmatter.set_frontmatter_status_anchored` (DW-323), the
+        fifth spec writer: the confinement rule stated in
+        `frontmatter.set_frontmatter_status` in-project, a canonical
+        filesystem-root walk (not the plain path write) for an external target,
+        and one bound target identity checked at the read, before staging and
+        immediately before the replace. ``expected`` is the identity
+        `_restore_attempt_owned_spec_bytes` just published (DW-319); when the
+        file no longer matches it — an operator edit or swap landed between
+        restoration and this normalization — nothing is written and the refusal
+        becomes `_OwnedSpecAuthorityError`, so the ``*_or_pause`` wrappers clear
+        the authority pair and pause with the operator's bytes untouched. The
+        final check is not a compare-and-swap: an in-place edit of the old inode
+        in the instant between it and the replace is not detected. Acceptance
+        reads the returned identity's bytes, never the path again."""
         # A path-based fallback cannot retain publication authority across the
         # final replace. Refuse before any repair write so a substituted parent
         # or target cannot redirect staging, publication, or cleanup. Both the
@@ -326,18 +396,55 @@ class RecoveryFlow:
                 f"{spec_path}",
                 safe_restoration_unavailable=True,
             )
-        verify.set_frontmatter_status(spec_path, target_status, confine_root=confine_root)
-        if verify.status_of(verify.read_frontmatter(spec_path)) != target_status:
+        try:
+            published = verify.set_frontmatter_status_anchored(
+                spec_path,
+                target_status,
+                confine_root=confine_root,
+                expected=expected,
+                root_identity=root_identity,
+            )
+        except verify.FrontmatterTargetChangedError as exc:
+            raise _OwnedSpecAuthorityError(
+                f"attempt-owned spec target changed during normalization ({exc}): {spec_path}"
+            ) from exc
+        text = published.data.decode("utf-8")  # the writer already decoded it
+        if verify.status_of(verify.parse_frontmatter(text)) != target_status:
             raise verify.FrontmatterWriteError(
-                f"could not normalize attempt-owned spec {spec_path} "
-                f"to status {target_status!r}"
+                f"could not normalize attempt-owned spec {spec_path} to status {target_status!r}"
             )
 
     @staticmethod
-    def _restore_attempt_owned_spec_bytes(spec_path: Path, snapshot: bytes) -> None:
-        """Restore and verify the byte-exact pre-attempt input."""
+    def _restore_attempt_owned_spec_bytes(
+        spec_path: Path,
+        snapshot: bytes,
+        *,
+        confine_root: Path | None = None,
+        root_identity: os.stat_result | None = None,
+    ) -> verify.FileIdentity:
+        """Restore and verify the byte-exact pre-attempt input.
+
+        Returns the published inode's identity — a stable anchored read taken
+        after the writer released it, required to be that same inode holding
+        exactly ``snapshot`` — so a following normalization can require the
+        file it rewrites to be the one restored here (DW-319).
+
+        ``root_identity`` pins ``confine_root`` (DW-445) by a pre-check before
+        anything is probed, created or written (`platform_util.require_root_pinned`).
+        The canonical filesystem-root walk below already refuses a link anywhere on
+        the path it is handed, but a path bound through a unit mount swapped BEFORE
+        binding is canonical outside the mount — only the mount no longer being the
+        pinned directory tells it apart. The pre-check's refusal surfaces like every
+        other unsafe target here, as `_OwnedSpecAuthorityError` (so the
+        ``*_or_pause`` wrappers pause), never as a raw `UnconfinedWriteError`.
+        ``None`` (the default) skips the pre-check."""
+        if root_identity is not None and confine_root is None:
+            raise ValueError("root_identity pins confine_root; pass both")
         parent = spec_path.parent
         try:
+            if root_identity is not None:
+                assert confine_root is not None
+                require_root_pinned(confine_root, root_identity)
             # Validate the full spelling before creating any missing component.
             # The nearest-existing-parent walk proves the live prefix separately;
             # this non-strict probe catches an invalid unresolved suffix first.
@@ -584,6 +691,7 @@ class RecoveryFlow:
             raise _OwnedSpecAuthorityError(
                 f"attempt-owned spec target could not be revalidated: {spec_path}"
             )
+        published: list[os.stat_result] = []
         try:
             expected = read_target_at(parent_fd)
 
@@ -592,6 +700,7 @@ class RecoveryFlow:
 
             def verify_published(published_fd: int) -> None:
                 verify_published_inode(parent_fd, published_fd)
+                published.append(os.fstat(published_fd))
 
             atomic_write_bytes_at(
                 parent_fd,
@@ -602,8 +711,22 @@ class RecoveryFlow:
                 _before_replace=validate_target,
                 _after_replace=verify_published,
             )
+            # The identity handed to normalization is read back only now, after
+            # the writer released the published inode, through the same
+            # anchored read normalization will bind with — so it compares like
+            # with like even if a host settles timestamps when the writing
+            # handle closes. It must still be the published inode holding
+            # exactly the snapshot.
+            settled = read_target_at(parent_fd)
+            if (
+                settled is None
+                or not os.path.samestat(settled[0], published[0])
+                or settled[1] != snapshot
+            ):
+                raise _OwnedSpecAuthorityError(authority_message)
         finally:
             os.close(parent_fd)
+        return verify.FileIdentity(*settled)
 
     @classmethod
     def _restore_attempt_owned_spec(
@@ -613,13 +736,28 @@ class RecoveryFlow:
         target_status: str,
         *,
         confine_root: Path,
+        root_identity: os.stat_result | None = None,
     ) -> None:
-        """Restore exact pre-attempt bytes, then verify the promised route."""
-        cls._restore_attempt_owned_spec_bytes(spec_path, snapshot)
+        """Restore exact pre-attempt bytes, then verify the promised route.
+
+        ``root_identity`` pins ``confine_root`` for both transactions (DW-445):
+        the byte restore's pre-check and the normalization's anchored write."""
+        restored = cls._restore_attempt_owned_spec_bytes(
+            spec_path, snapshot, confine_root=confine_root, root_identity=root_identity
+        )
         # The durable snapshot should already carry this route. Keep the status
         # repair as a fail-safe for a legacy or externally edited state record;
-        # it is the only permitted difference from the exact snapshot.
-        cls._normalize_attempt_owned_spec(spec_path, target_status, confine_root=confine_root)
+        # it is the only permitted difference from the exact snapshot. The
+        # restored identity rides along (DW-319): an edit landing between the
+        # two transactions is the operator's, and it pauses rather than being
+        # overwritten by a normalization that never saw it.
+        cls._normalize_attempt_owned_spec(
+            spec_path,
+            target_status,
+            confine_root=confine_root,
+            expected=restored,
+            root_identity=root_identity,
+        )
 
     @staticmethod
     def _owned_spec_restore_problem(
@@ -648,9 +786,13 @@ class RecoveryFlow:
         snapshot: bytes,
         *,
         unsafe_context: str,
+        confine_root: Path | None = None,
+        root_identity: os.stat_result | None = None,
     ) -> None:
         try:
-            self._restore_attempt_owned_spec_bytes(spec_path, snapshot)
+            self._restore_attempt_owned_spec_bytes(
+                spec_path, snapshot, confine_root=confine_root, root_identity=root_identity
+            )
         except _OwnedSpecAuthorityError as exc:
             self.pause_for_owned_spec_recovery(
                 task,
@@ -667,6 +809,7 @@ class RecoveryFlow:
         *,
         confine_root: Path,
         unsafe_context: str,
+        root_identity: os.stat_result | None = None,
     ) -> None:
         try:
             self._restore_attempt_owned_spec(
@@ -674,6 +817,7 @@ class RecoveryFlow:
                 snapshot,
                 target_status,
                 confine_root=confine_root,
+                root_identity=root_identity,
             )
         except _OwnedSpecAuthorityError as exc:
             self.pause_for_owned_spec_recovery(
@@ -686,6 +830,27 @@ class RecoveryFlow:
                 ),
             )
 
+    def _mount_root_identity(self, task: StoryTask, workspace: Workspace) -> os.stat_result | None:
+        """The ``root_identity`` pinning ``workspace.paths.project`` — the
+        ``confine_root`` every attempt-owned normalization passes — for one write
+        (DW-445). Take it at the call, beside that ``confine_root``.
+
+        ``None`` when ``workspace`` is not a unit mount (``workspace.root ==
+        self.paths.repo_root``, the ``in_unit_worktree`` idiom): the operator's
+        project stays unpinned. Otherwise `runs.mount_root_identity` against
+        ``task.worktree_identity``, the mount's MINT-TIME record (DW-446), which
+        answers a never-matching identity for a mount that cannot be pinned — a
+        missing record, a mount or ancestor (``worktrees/``, ``runs/<id>/``)
+        swapped for a link — so the refusal lands at the write. The live
+        ``workspace`` decides mountedness: it is the tree the write opens.
+        ``paths.project`` is reached from the recorded mount by an ``O_NOFOLLOW``
+        walk (``<worktree>/<offset>`` under a nested project, DW-486)."""
+        if workspace.root == self.paths.repo_root:
+            return None
+        return mount_root_identity(
+            workspace.paths.project, mount=workspace.root, recorded=task.worktree_identity
+        )
+
     def _normalize_attempt_owned_spec_or_pause(
         self,
         task: StoryTask,
@@ -694,12 +859,14 @@ class RecoveryFlow:
         *,
         confine_root: Path,
         unsafe_context: str,
+        root_identity: os.stat_result | None = None,
     ) -> None:
         try:
             self._normalize_attempt_owned_spec(
                 spec_path,
                 target_status,
                 confine_root=confine_root,
+                root_identity=root_identity,
             )
         except _OwnedSpecAuthorityError as exc:
             self.pause_for_owned_spec_recovery(
@@ -723,26 +890,98 @@ class RecoveryFlow:
         The current checkout may contain either operator intent, failed-child
         output, or a partially completed reset, so recovery cannot infer which
         paths are safe to mutate next. Clear the unusable authority pair before
-        saving: after the operator restores/verifies the intended spec, resume can
-        recover the remaining tree as an unbound redrive instead of repeating the
-        same impossible snapshot check forever.
+        saving so resume does not repeat the same impossible snapshot check
+        forever.
+
+        Clearing the pair does not move ``task.baseline_commit``: resume re-runs
+        ``rollback_or_pause`` against that same baseline with no binding left to
+        recognize the spec. On a plain attempt a Git-tracked spec differing from
+        its baseline blob — uncommitted, or committed on top of the baseline — is
+        then ordinary attempt residue (auto-rollback parks and resets it; with
+        rollback off the run pauses again), so the notice's convergent step is
+        returning the checkout to the recorded baseline, and approved edits that
+        differ from it cannot reach the next attempt (DW-321). A latched re-drive
+        (``task.resolved_redrive``) differs only when resume will auto-recover it
+        (the ``cause="resolved"`` unwind is still armed, or auto-rollback is on)
+        and the spec lies under the BMAD artifact folders: that reset preserves
+        those folders, so an approved spec kept there survives and only the other
+        residue needs resetting. Any other re-drive gets the plain-attempt step —
+        with rollback off, a dirty kept spec would only pause again, and a spec
+        outside the folders is reset like any other file.
         """
         task.dispatched_spec_file = None
         task.dispatched_spec_snapshot = None
         root = self._workspace_get().root
+        # The paths are folded to one segment of their line wherever the notice
+        # shows them (DW-492), like `problem` below (DW-417); the journal row keeps
+        # `spec` raw, and the recovery logic reads the raw values.
+        shown_spec = gates.notice_line(spec)
+        shown_root = gates.notice_line(str(root))
+        short = (task.baseline_commit or "")[:12]
+        if short:
+            baseline_name = f"the attempt baseline `{short}`"
+            reset_step = f'`git -C "{shown_root}" reset --hard {short}`'
+        else:
+            baseline_name = "the commit the attempt started from (not recorded)"
+            reset_step = "reset tracked files to that commit"
+        save_step = (
+            "  1. Save any failed-session work you may want to inspect — commits "
+            f'too, e.g. `git -C "{shown_root}" branch my-rescue HEAD`'
+        )
+        spec_rel = ""
+        if Path(spec).is_absolute():
+            with contextlib.suppress(ValueError):
+                spec_rel = Path(spec).relative_to(root).as_posix()
+        redrive_keeps_spec = (
+            task.resolved_redrive
+            and (task.rearmed or self.policy.scm.rollback_on_failure)
+            and any(spec_rel.startswith(f"{rel}/") for rel in self.protected_relpaths())
+        )
+        if redrive_keeps_spec:
+            contract = (
+                f"Resume re-checks this checkout against {baseline_name}, and the "
+                f"cleared binding no longer protects `{shown_spec}`. On this re-drive, "
+                "resume rolls the checkout back automatically, and an approved spec "
+                "kept under the BMAD artifact folders survives resume's reset.\n"
+            )
+            steps = (
+                f"{save_step}.\n"
+                f"  2. Keep the approved contents of `{shown_spec}` in place and return the "
+                f"other residue in `{shown_root}` to {baseline_name}, then review/remove "
+                "leftover untracked files.\n"
+                f"  3. Run `bmad-loop resume {self.state.run_id}`."
+            )
+        else:
+            contract = (
+                f"Resume re-checks this checkout against {baseline_name}, and the "
+                f"cleared binding no longer protects `{shown_spec}`: if it is Git-tracked, "
+                "edits that differ from its baseline version — uncommitted or "
+                "committed on top of the baseline — count as attempt residue "
+                "(automatic rollback parks and resets them; with it off the run "
+                "pauses again). **Resume will not adopt them.**\n"
+            )
+            steps = (
+                f"{save_step} — and keep a copy of any approved edits to `{shown_spec}` "
+                "that differ from its baseline version.\n"
+                f"  2. Return `{shown_root}` to {baseline_name}: {reset_step}, then "
+                "review/remove leftover untracked files.\n"
+                f"  3. Run `bmad-loop resume {self.state.run_id}`. If `{shown_spec}` is "
+                "Git-tracked, the next attempt starts from its baseline version: "
+                "resume cannot carry the kept edits into it; they can only be "
+                "re-applied afterwards (e.g. as a later correction)."
+            )
+        # `problem` is folded to one segment of its line (DW-417); the journal
+        # row below keeps it raw.
         notice = (
             "**ACTION REQUIRED — attempt-owned spec needs manual recovery**\n"
             f"Story **{task.story_key}** cannot safely restore its pre-attempt spec "
-            f"at `{spec}`: {problem}. The working tree at `{root}` now requires "
+            f"at `{shown_spec}`: {gates.notice_line(problem)}. The working tree at `{shown_root}` now requires "
             "inspection because bmad-loop cannot safely distinguish operator "
             "intent, failed-session output, and any rollback already completed.\n"
-            "  1. Save any failed-session work you may want to inspect.\n"
-            f"  2. Restore or verify the operator-approved contents of `{spec}` and "
-            "remove/reset any other rejected attempt residue.\n"
-            f"  3. Run `bmad-loop resume {self.state.run_id}`. The unusable binding "
-            "was cleared, so the corrected spec will be observed afresh before the "
-            "next child launches."
+            f"{contract}{steps}"
         )
+        if task.phase == Phase.DEFERRED:
+            notice += f"\n{deferred_reverify_hint(self.state.run_id)}"
         self.journal.append(
             "rollback-owned-spec-manual-required",
             story_key=task.story_key,
@@ -754,11 +993,14 @@ class RecoveryFlow:
             self.run_dir,
             f"ACTION REQUIRED: recover attempt-owned spec for {task.story_key}",
             notice,
+            multiline=True,
         )
         self._save()
         self._pause(notice, task.story_key)
 
-    def rollback_or_pause(self, task: StoryTask, *, cause: str = "stopped") -> None:
+    def rollback_or_pause(
+        self, task: StoryTask, *, cause: str = "stopped", restart: bool = False
+    ) -> None:
         """Recover from an attempt that won't proceed.
 
         No-op when the real tree is proven to be at the attempt's baseline:
@@ -809,7 +1051,26 @@ class RecoveryFlow:
         it, they refuse rather than reset (#340). That is a preservation failure
         rather than a policy decision, so it does not weaken #161 — the notice
         targets ``workspace.root``, which is the mounted worktree when there is
-        one."""
+        one.
+
+        Plugin hooks bracket only the auto-recover arm: it emits ``pre_rollback``
+        before parking/resetting and exactly one paired ``post_rollback`` on every
+        exit from it (DW-322), carrying ``rollback_outcome`` — ``"completed"``,
+        ``"paused"`` when one of the pauses above propagates, or ``"failed"`` when
+        any other exception escapes (it propagates unchanged after the emit). The
+        clean short-circuits, the early owned-spec pauses and the policy-OFF manual
+        pause emit neither stage.
+
+        ``restart`` marks the call as a resume restart arm (``Engine._finish_inflight``
+        or the sweep bundle restart leg) rather than an in-run retry/defer rollback.
+        Only then, and only once commits above the baseline or uncommitted changes
+        were parked AND ``safe_reset`` completed, does the rollback send a
+        parked-work notice naming every ref it parked (DW-371, DW-480, DW-482): on
+        resume those commits may have been made while the run was down, and a
+        file-only journal entry is too quiet for that. A re-drive's best-effort
+        preserve leg that fails still falls through to the reset, but the same
+        post-reset notice then names the failed leg and the attempt HEAD, on any
+        re-drive reset, restart or not (DW-481)."""
         workspace = self._workspace_get()
         resolved = cause == "resolved"
         # preserve the corrected spec for the whole re-drive, not just the first
@@ -1106,6 +1367,7 @@ class RecoveryFlow:
                                 task.dispatched_spec_snapshot,
                                 target_status,
                                 confine_root=workspace.paths.project,
+                                root_identity=self._mount_root_identity(task, workspace),
                                 unsafe_context="while restoring the pre-attempt retry input",
                             )
                             owned_snapshot_restored = True
@@ -1115,6 +1377,7 @@ class RecoveryFlow:
                                 spec_path,
                                 target_status,
                                 confine_root=workspace.paths.project,
+                                root_identity=self._mount_root_identity(task, workspace),
                                 unsafe_context=(
                                     "while restoring the attempt-owned lifecycle status"
                                 ),
@@ -1182,6 +1445,8 @@ class RecoveryFlow:
                                     unsafe_context=(
                                         "while restoring the pre-launch operator input"
                                     ),
+                                    confine_root=workspace.paths.project,
+                                    root_identity=self._mount_root_identity(task, workspace),
                                 )
                                 owned_snapshot_restored = True
                                 normalized_status = None
@@ -1215,6 +1480,8 @@ class RecoveryFlow:
                         spec_path,
                         original_spec,
                         unsafe_context="while undoing a tentative lifecycle repair",
+                        confine_root=workspace.paths.project,
+                        root_identity=self._mount_root_identity(task, workspace),
                     )
                     normalized_status = None
         if (
@@ -1307,158 +1574,199 @@ class RecoveryFlow:
             # the returned ctx is ignored and never routed through _vetoed — a failed
             # quiesce must never block a rollback.
             self._emit("pre_rollback", task)
-            force_owned_snapshot = (
-                owned_exclude
-                if restore_attempt_snapshot and (owned_snapshot_changed or owned_index_changed)
-                else ()
-            )
-            # A re-drive ordinarily preserves best-effort, but restoration of a
-            # changed bound spec is destructive unless both its committed and
-            # uncommitted child state can be parked first.
-            self.preserve_attempt_commits(
-                task,
-                allow_pause=not redrive or bool(force_owned_snapshot),
-            )
-            # Park the attempt's uncommitted diff too, so the reset below (and its
-            # untracked cleanup) can't silently destroy in-progress work. Runs only
-            # if preserve_attempt_commits did not pause (plain-rollback preserve
-            # failure), and refuses the reset on the same terms when a failed
-            # capture would cost unparked work (#340).
-            # After owned-spec normalization proved the checkout byte-equivalent
-            # to the baseline, only branch ancestry remains. Capturing the
-            # worktree here would park the normalization's inverse diff against
-            # the failed HEAD even though the target reset cannot discard any
-            # checkout content. The commits were parked above; reset them directly.
-            if restore_redrive_snapshot or not (normalized_attempt_commits and not dirty):
-                self.preserve_attempt_worktree(
+            # Pair every emitted pre_rollback with exactly one post_rollback (DW-322):
+            # any pause (owned-spec recovery, preserve failure, reset refusal) or error
+            # escaping the reset below still gives a quiescing plugin its release, with
+            # `rollback_outcome` saying how the rollback ended. While a pause/error is
+            # propagating, a failure of the emit itself (context build, journal
+            # write) is suppressed so it cannot replace the original exception.
+            pauses_before = self._pauses_raised
+            outcome = "failed"
+            try:
+                force_owned_snapshot = (
+                    owned_exclude
+                    if restore_attempt_snapshot and (owned_snapshot_changed or owned_index_changed)
+                    else ()
+                )
+                # A re-drive ordinarily preserves best-effort, but restoration of a
+                # changed bound spec is destructive unless both its committed and
+                # uncommitted child state can be parked first. The best-effort legs
+                # report what they could not park here, for the notice after the
+                # reset (DW-481).
+                failed_parks: list[_FailedPark] = []
+                parked = self.preserve_attempt_commits(
                     task,
                     allow_pause=not redrive or bool(force_owned_snapshot),
-                    force_include=force_owned_snapshot,
+                    failed_parks=failed_parks,
                 )
-            if (
-                restore_attempt_snapshot
-                and (owned_snapshot_changed or owned_index_changed)
-                and owned_spec
-            ):
-                # Both refs now contain the untouched failed attempt. Restore the
-                # pre-launch input before reset. Redrives also re-establish the
-                # route promised by the next prompt; plain attempts restore exact
-                # bytes and repeat that restoration after reset so pre-existing
-                # tracked operator dirt is not erased with the child.
-                assert task.dispatched_spec_snapshot is not None
-                if redrive:
-                    target_status = "in-review" if task.restore_patch else "ready-for-dev"
-                    self._restore_attempt_owned_spec_or_pause(
+                snapshot: str | None = None
+                # Park the attempt's uncommitted diff too, so the reset below (and its
+                # untracked cleanup) can't silently destroy in-progress work. Runs only
+                # if preserve_attempt_commits did not pause (plain-rollback preserve
+                # failure), and refuses the reset on the same terms when a failed
+                # capture would cost unparked work (#340).
+                # After owned-spec normalization proved the checkout byte-equivalent
+                # to the baseline, only branch ancestry remains. Capturing the
+                # worktree here would park the normalization's inverse diff against
+                # the failed HEAD even though the target reset cannot discard any
+                # checkout content. The commits were parked above; reset them directly.
+                if restore_redrive_snapshot or not (normalized_attempt_commits and not dirty):
+                    snapshot = self.preserve_attempt_worktree(
                         task,
-                        owned_spec[0],
-                        task.dispatched_spec_snapshot,
-                        target_status,
-                        confine_root=workspace.paths.project,
-                        unsafe_context="before the baseline reset",
+                        allow_pause=not redrive or bool(force_owned_snapshot),
+                        force_include=force_owned_snapshot,
+                        failed_parks=failed_parks,
                     )
-                else:
+                if (
+                    restore_attempt_snapshot
+                    and (owned_snapshot_changed or owned_index_changed)
+                    and owned_spec
+                ):
+                    # Both refs now contain the untouched failed attempt. Restore the
+                    # pre-launch input before reset. Redrives also re-establish the
+                    # route promised by the next prompt; plain attempts restore exact
+                    # bytes and repeat that restoration after reset so pre-existing
+                    # tracked operator dirt is not erased with the child.
+                    assert task.dispatched_spec_snapshot is not None
+                    if redrive:
+                        target_status = "in-review" if task.restore_patch else "ready-for-dev"
+                        self._restore_attempt_owned_spec_or_pause(
+                            task,
+                            owned_spec[0],
+                            task.dispatched_spec_snapshot,
+                            target_status,
+                            confine_root=workspace.paths.project,
+                            root_identity=self._mount_root_identity(task, workspace),
+                            unsafe_context="before the baseline reset",
+                        )
+                    else:
+                        self._restore_attempt_owned_spec_bytes_or_pause(
+                            task,
+                            owned_spec[0],
+                            task.dispatched_spec_snapshot,
+                            unsafe_context="before the baseline reset",
+                            confine_root=workspace.paths.project,
+                            root_identity=self._mount_root_identity(task, workspace),
+                        )
+                    owned_snapshot_restored = True
+                self.safe_reset(task, preserve=protected)
+                # After the reset, never inside the preserve steps: the notice must
+                # not claim a reset a later snapshot pause refused. One line per
+                # reset, naming every ref it parked and every leg that failed.
+                if failed_parks or (restart and (parked is not None or snapshot)):
+                    self._notify_reset_preservation(
+                        task,
+                        restart=restart,
+                        parked=parked,
+                        snapshot=snapshot,
+                        failed_parks=failed_parks,
+                    )
+                if restore_attempt_snapshot and owned_spec and owned_exclude and not redrive:
+                    assert task.dispatched_spec_snapshot is not None
                     self._restore_attempt_owned_spec_bytes_or_pause(
                         task,
                         owned_spec[0],
                         task.dispatched_spec_snapshot,
-                        unsafe_context="before the baseline reset",
-                    )
-                owned_snapshot_restored = True
-            self.safe_reset(task, preserve=protected)
-            if restore_attempt_snapshot and owned_spec and owned_exclude and not redrive:
-                assert task.dispatched_spec_snapshot is not None
-                self._restore_attempt_owned_spec_bytes_or_pause(
-                    task,
-                    owned_spec[0],
-                    task.dispatched_spec_snapshot,
-                    unsafe_context="after the baseline reset",
-                )
-                owned_snapshot_restored = True
-            if redrive and task.baseline_commit and owned_spec:
-                # A sibling source/artifact change bypasses the earlier spec-only
-                # normalization and reaches this reset. The protected artifact
-                # folders deliberately retain the corrected spec, so re-establish
-                # the route promised by the next prompt after resetting the
-                # sibling residue. Patch restores keep their review route.
-                target_status = "in-review" if task.restore_patch else "ready-for-dev"
-                if restore_redrive_snapshot and owned_index_changed and owned_spec[1]:
-                    # A whole-folder preserve checkout can stage a spec that the
-                    # failed child force-added or committed even though the
-                    # pre-launch binding was ignored/untracked. Restore baseline
-                    # index ownership before writing the operator snapshot back.
-                    verify.reset_index_path(
-                        workspace.root,
-                        task.baseline_commit,
-                        owned_spec[1],
-                    )
-                if restore_redrive_snapshot and task.dispatched_spec_snapshot is not None:
-                    self._restore_attempt_owned_spec_or_pause(
-                        task,
-                        owned_spec[0],
-                        task.dispatched_spec_snapshot,
-                        target_status,
-                        confine_root=workspace.paths.project,
                         unsafe_context="after the baseline reset",
-                    )
-                else:
-                    self._normalize_attempt_owned_spec_or_pause(
-                        task,
-                        owned_spec[0],
-                        target_status,
                         confine_root=workspace.paths.project,
-                        unsafe_context="after the baseline reset",
+                        root_identity=self._mount_root_identity(task, workspace),
                     )
-                try:
-                    checkout_dirty = verify.attempt_dirty(
-                        workspace.root,
-                        task.baseline_commit,
-                        task.baseline_untracked,
-                    )
-                except (verify.GitError, OSError) as exc:
-                    self.journal.append(
-                        "rollback-dirty-check-failed",
-                        story_key=task.story_key,
-                        error=str(exc),
-                    )
-                else:
-                    if checkout_dirty:
-                        self.journal.append(
-                            "rollback-owned-spec-normalized",
-                            story_key=task.story_key,
-                            spec=str(owned_spec[0]),
-                            status=target_status,
-                            checkout_dirty=True,
+                    owned_snapshot_restored = True
+                if redrive and task.baseline_commit and owned_spec:
+                    # A sibling source/artifact change bypasses the earlier spec-only
+                    # normalization and reaches this reset. The protected artifact
+                    # folders deliberately retain the corrected spec, so re-establish
+                    # the route promised by the next prompt after resetting the
+                    # sibling residue. Patch restores keep their review route.
+                    target_status = "in-review" if task.restore_patch else "ready-for-dev"
+                    if restore_redrive_snapshot and owned_index_changed and owned_spec[1]:
+                        # A whole-folder preserve checkout can stage a spec that the
+                        # failed child force-added or committed even though the
+                        # pre-launch binding was ignored/untracked. Restore baseline
+                        # index ownership before writing the operator snapshot back.
+                        verify.reset_index_path(
+                            workspace.root,
+                            task.baseline_commit,
+                            owned_spec[1],
                         )
-                    elif owned_snapshot_restored:
+                    if restore_redrive_snapshot and task.dispatched_spec_snapshot is not None:
+                        self._restore_attempt_owned_spec_or_pause(
+                            task,
+                            owned_spec[0],
+                            task.dispatched_spec_snapshot,
+                            target_status,
+                            confine_root=workspace.paths.project,
+                            root_identity=self._mount_root_identity(task, workspace),
+                            unsafe_context="after the baseline reset",
+                        )
+                    else:
+                        self._normalize_attempt_owned_spec_or_pause(
+                            task,
+                            owned_spec[0],
+                            target_status,
+                            confine_root=workspace.paths.project,
+                            root_identity=self._mount_root_identity(task, workspace),
+                            unsafe_context="after the baseline reset",
+                        )
+                    try:
+                        checkout_dirty = verify.attempt_dirty(
+                            workspace.root,
+                            task.baseline_commit,
+                            task.baseline_untracked,
+                        )
+                    except (verify.GitError, OSError) as exc:
+                        self.journal.append(
+                            "rollback-dirty-check-failed",
+                            story_key=task.story_key,
+                            error=str(exc),
+                        )
+                    else:
+                        if checkout_dirty:
+                            self.journal.append(
+                                "rollback-owned-spec-normalized",
+                                story_key=task.story_key,
+                                spec=str(owned_spec[0]),
+                                status=target_status,
+                                checkout_dirty=True,
+                            )
+                        elif owned_snapshot_restored:
+                            self.journal.append(
+                                "rollback-owned-spec-restored",
+                                story_key=task.story_key,
+                                spec=str(owned_spec[0]),
+                                checkout_dirty=False,
+                            )
+                elif owned_snapshot_restored and owned_spec and task.baseline_commit:
+                    try:
+                        checkout_dirty = verify.attempt_dirty(
+                            workspace.root,
+                            task.baseline_commit,
+                            task.baseline_untracked,
+                        )
+                    except (verify.GitError, OSError) as exc:
+                        self.journal.append(
+                            "rollback-dirty-check-failed",
+                            story_key=task.story_key,
+                            error=str(exc),
+                        )
+                    else:
                         self.journal.append(
                             "rollback-owned-spec-restored",
                             story_key=task.story_key,
                             spec=str(owned_spec[0]),
-                            checkout_dirty=False,
+                            checkout_dirty=checkout_dirty,
                         )
-            elif owned_snapshot_restored and owned_spec and task.baseline_commit:
-                try:
-                    checkout_dirty = verify.attempt_dirty(
-                        workspace.root,
-                        task.baseline_commit,
-                        task.baseline_untracked,
-                    )
-                except (verify.GitError, OSError) as exc:
-                    self.journal.append(
-                        "rollback-dirty-check-failed",
-                        story_key=task.story_key,
-                        error=str(exc),
-                    )
+                outcome = "completed"
+            finally:
+                if outcome != "completed" and self._pauses_raised != pauses_before:
+                    outcome = "paused"
+                # Refresh the plugin's view of the (possibly partially) reset tree (the
+                # Unity engine re-imports assets). Observe-only, like pre_rollback.
+                if outcome == "completed":
+                    self._emit("post_rollback", task, rollback_outcome=outcome)
                 else:
-                    self.journal.append(
-                        "rollback-owned-spec-restored",
-                        story_key=task.story_key,
-                        spec=str(owned_spec[0]),
-                        checkout_dirty=checkout_dirty,
-                    )
-            # Refresh the plugin's view of the now-reset tree (the Unity engine
-            # re-imports assets). Observe-only for the same reason as pre_rollback.
-            self._emit("post_rollback", task)
+                    with contextlib.suppress(Exception):
+                        self._emit("post_rollback", task, rollback_outcome=outcome)
             return
         restored_before_pause: str | None = None
         if (
@@ -1479,6 +1787,8 @@ class RecoveryFlow:
                 owned_spec[0],
                 task.dispatched_spec_snapshot,
                 unsafe_context="before the ordinary manual-recovery pause",
+                confine_root=workspace.paths.project,
+                root_identity=self._mount_root_identity(task, workspace),
             )
             restored_before_pause = str(owned_spec[0])
             self.journal.append(
@@ -1574,14 +1884,17 @@ class RecoveryFlow:
         return retry_preserve_paragraph(self._workspace_get().root, task, self.state.run_id)
 
     def prune_preserve_refs(self) -> None:
-        """Bounded retention for both recovery-ref families at run start — the
-        attempt-preserve/* branches and the refs/attempt-preserve-dirty/*
-        worktree snapshots: keep the newest scm.preserve_keep of each by
-        committer date, delete the tail (mirrors the runs/cleanup retention
-        knobs — without it the refs grow unbounded on a long-lived project).
+        """Bounded retention for the three recovery-ref families at run start —
+        the attempt-preserve/* branches, the refs/attempt-preserve-dirty/*
+        rollback worktree snapshots, and the refs/merge-preflight-preserve/*
+        snapshots of operator edits the merge pre-flight restored (DW-356): keep
+        the newest scm.preserve_keep of each by committer date, delete the tail
+        (mirrors the runs/cleanup retention knobs — without it the refs grow
+        unbounded on a long-lived project). Per family, so per-merge pre-flight
+        refs never crowd rollback evidence out of its budget.
         Best-effort: a git failure is journalled per family and never blocks or
         pauses the run — the refs are a safety net, not run state — and a
-        failure in one family never skips the other. preserve_keep = 0 disables
+        failure in one family never skips the others. preserve_keep = 0 disables
         pruning entirely."""
         keep = self.policy.scm.preserve_keep
         if keep <= 0:
@@ -1590,6 +1903,7 @@ class RecoveryFlow:
         for family, prune in (
             ("attempt-preserve", verify.prune_preserve_refs),
             ("attempt-preserve-dirty", verify.prune_preserve_dirty_refs),
+            ("merge-preflight-preserve", verify.prune_merge_preflight_preserve_refs),
         ):
             try:
                 deleted = prune(workspace.root, keep)
@@ -1611,7 +1925,13 @@ class RecoveryFlow:
             if deleted:
                 self.journal.append(f"{family}-pruned", count=len(deleted), refs=deleted)
 
-    def preserve_attempt_commits(self, task: StoryTask, *, allow_pause: bool) -> None:
+    def preserve_attempt_commits(
+        self,
+        task: StoryTask,
+        *,
+        allow_pause: bool,
+        failed_parks: list[_FailedPark] | None = None,
+    ) -> tuple[str, int] | None:
         """Before an auto-rollback's hard reset, park any commits the attempt made
         above its baseline under a named recovery ref, so `reset --hard baseline`
         can't silently orphan committed work (it survives `git gc` and is
@@ -1627,10 +1947,19 @@ class RecoveryFlow:
         write is unsafe until the child commit is parked. The two failures journal under distinct events
         (``attempt-preserve-enumerate-failed`` vs ``attempt-preserve-failed``) so a
         post-mortem can tell "could not count the work" from "counted it but could
-        not park it" — only the latter can report a HEAD."""
+        not park it" — only the latter can report a HEAD.
+
+        A failure that does not pause journals ``attempt-preserve-fallthrough``
+        (``leg``, ``head``) and is appended to ``failed_parks``, so the caller's
+        post-reset notice can name the HEAD a reflog rescue needs (DW-481).
+
+        Returns ``(ref, count)`` — the commits branch and how many commits it
+        parked — on a successful park, else None (nothing above baseline, or a
+        non-pausing preservation failure). ``task.preserve_ref`` may later be
+        overwritten by the worktree snapshot; the returned branch still exists."""
         baseline = task.baseline_commit
         if not baseline:
-            return
+            return None
         workspace = self._workspace_get()
         # Enumerating the range is what decides whether the reset is safe, so a
         # fault here is not a no-op: an un-determinable range must read as "there
@@ -1642,11 +1971,12 @@ class RecoveryFlow:
         # joins it because the translation stops at timeouts. Pin HEAD before
         # enumerating so the range and the recovery ref describe the same observed
         # tip even if the checkout moves between those operations.
+        head = ""
         try:
             head = verify.rev_parse_head(workspace.root)
             commits = verify.commits_above(workspace.root, baseline, head)
             if not commits:
-                return
+                return None
         except (verify.GitError, OSError) as exc:
             self.journal.append(
                 "attempt-preserve-enumerate-failed", story_key=task.story_key, error=str(exc)
@@ -1655,7 +1985,10 @@ class RecoveryFlow:
                 # Same refusal as an un-parked ref: the notice must not tell the
                 # operator to `reset --hard` past work we could not even count.
                 self.pause_for_manual_recovery(task, baseline, preserve_failed=True)
-            return  # re-drive: never pause — proceed to the (human-directed) reset
+            # re-drive: never pause — proceed to the (human-directed) reset. `head`
+            # stays "" when rev-parse itself was the fault journaled just above.
+            self._record_fallthrough(task, "commits-enumerate", head, failed_parks)
+            return None
         # run_id can be an arbitrary user `--run-id`; ref-sanitize it (same
         # identity-for-clean-ids / digest-for-dirty contract as the unit branches) so
         # an exotic/overlong id can't blow the ref-name limit, fail `git branch`, and
@@ -1678,10 +2011,198 @@ class RecoveryFlow:
                 # the commits at HEAD could not be parked — the notice must NOT tell
                 # the operator to blindly `reset --hard` (that would discard them).
                 self.pause_for_manual_recovery(task, baseline, preserve_failed=True)
-            return  # re-drive: never pause — proceed to the (human-directed) reset
+            # re-drive: never pause — proceed to the (human-directed) reset
+            self._record_fallthrough(task, "commits-park", head, failed_parks)
+            return None
         task.preserve_ref = ref
         self.journal.append(
             "attempt-commits-preserved", story_key=task.story_key, ref=ref, count=len(commits)
+        )
+        return ref, len(commits)
+
+    def _record_fallthrough(
+        self,
+        task: StoryTask,
+        leg: str,
+        head: str,
+        failed_parks: list[_FailedPark] | None,
+        *,
+        error: str | None = None,
+    ) -> None:
+        """Journal a best-effort preserve leg that failed and falls through to the
+        re-drive reset (``attempt-preserve-fallthrough``, DW-481), and hand it to
+        the caller's post-reset notice. ``error`` is set only when reading HEAD
+        for this very row failed; the preserve fault itself is already journaled
+        by the leg's own ``*-failed`` row."""
+        if error is None:
+            self.journal.append(
+                "attempt-preserve-fallthrough", story_key=task.story_key, leg=leg, head=head
+            )
+        else:
+            self.journal.append(
+                "attempt-preserve-fallthrough",
+                story_key=task.story_key,
+                leg=leg,
+                head=head,
+                error=error,
+            )
+        if failed_parks is not None:
+            failed_parks.append(_FailedPark(leg, head))
+
+    def _notify_reset_preservation(
+        self,
+        task: StoryTask,
+        *,
+        restart: bool,
+        parked: tuple[str, int] | None,
+        snapshot: str | None,
+        failed_parks: list[_FailedPark],
+    ) -> None:
+        """One ATTENTION line for a completed rollback reset, naming every ref it
+        parked and every best-effort preserve leg that failed — so one reset never
+        yields two lines for the same ref.
+
+        Sent for a resume restart that parked commits (DW-371), uncommitted
+        changes (``preserve_attempt_worktree``'s snapshot, DW-480) or both
+        (DW-482); and for any re-drive reset whose preserve leg fell through
+        (DW-481), naming the leg and the attempt HEAD a reflog rescue needs.
+        Attribution-neutral on purpose: ``commits_above`` is a pure range park, so
+        the commits may be the interrupted attempt's or ones a human made while
+        the run was down. Best-effort (``gates.notify`` never raises); the
+        ``attempt-*`` journal rows are the durable record. Nothing here
+        interpolates error text: the message is one line, and ``notify`` shapes
+        it through ``gates.notice_line`` (DW-417/419)."""
+        root = self._workspace_get().root
+        short = (task.baseline_commit or "")[:12]
+        key = task.story_key
+        lead = "resume" if restart else "rollback"
+        sentences = [f"{lead} reset {key} to its baseline {short}"]
+        if parked is not None:
+            ref, count = parked
+            plural, verb = ("commit", "was") if count == 1 else ("commits", "were")
+            whose = (
+                " (the interrupted attempt's, or commits made while the run was down)"
+                if restart
+                else ""
+            )
+            sentences.append(
+                f"{count} {plural} above it{whose} {verb} parked on `{ref}` first. Inspect: "
+                f'`git -C "{root}" log --oneline {short}..refs/heads/{ref}`'
+            )
+        if snapshot:
+            sentences.append(
+                f"its uncommitted changes were parked on `{snapshot}` first, a snapshot "
+                "commit on top of the attempt's HEAD. Inspect: "
+                f'`git -C "{root}" diff {snapshot}~1 {snapshot}`'
+            )
+        head = next((f.head for f in failed_parks if f.head), "")
+        commit_leg = next((f.leg for f in failed_parks if f.leg != "worktree-snapshot"), "")
+        if commit_leg:
+            failed = "counted" if commit_leg == "commits-enumerate" else "parked"
+            rescue = (
+                f"recover them from the attempt HEAD {head} with "
+                f'`git -C "{root}" branch <name> {head}` before `git gc` prunes them'
+                if head
+                else f'the attempt HEAD could not be read; find it in `git -C "{root}" reflog`'
+            )
+            carried = " (the snapshot above sits on that HEAD and carries them)" if snapshot else ""
+            sentences.append(
+                f"the commits above the baseline could not be {failed} (leg {commit_leg}), "
+                f"and the reset ran anyway{carried}: {rescue}"
+            )
+        if any(f.leg == "worktree-snapshot" for f in failed_parks):
+            where = (
+                f"the attempt HEAD was {head}"
+                if head
+                else f'the attempt HEAD could not be read; see `git -C "{root}" reflog`'
+            )
+            sentences.append(
+                "its uncommitted changes could not be snapshotted (leg worktree-snapshot), "
+                f"so uncommitted work was NOT preserved and the reset discarded it; {where}"
+            )
+        if failed_parks:
+            sentences.append("see `attempt-preserve-fallthrough` in the run journal")
+        if parked is not None or snapshot:
+            restore = []
+            if parked is not None:
+                restore.append(f'`git -C "{root}" cherry-pick <sha>`')
+            if snapshot:
+                restore.append(f'`git -C "{root}" restore --source={snapshot} -- <path>`')
+            busy = (
+                "it is re-running the story in this checkout now"
+                if restart
+                else "it keeps working in this checkout"
+            )
+            sentences.append(
+                "To restore what you want to keep once this run has stopped or finished "
+                f"({busy}): " + " or ".join(restore)
+            )
+        if restart and parked is not None:
+            sentences.append(
+                f"Next time, `bmad-loop resume {self.state.run_id} --accept-baseline` keeps "
+                "everything at HEAD as the new baseline instead (check the log first)"
+            )
+        if failed_parks:
+            title = f"reset of {key} ran without full preservation"
+        else:
+            what = " and ".join(
+                w
+                for w, present in (
+                    ("commits", parked is not None),
+                    ("uncommitted changes", bool(snapshot)),
+                )
+                if present
+            )
+            title = f"{what} parked on resume for {key}"
+        gates.notify(self.policy, self.run_dir, title, "; ".join(sentences) + ".")
+
+    def accept_current_baseline(self, task: StoryTask) -> None:
+        """Adopt the current checkout as ``task``'s baseline (``bmad-loop resume
+        --accept-baseline``, DW-371): the restart arm calls this right before its
+        rollback, so the reset targets HEAD instead of rewinding past commits the
+        operator made while the run was down.
+
+        Both fields are re-stamped together, from values measured before either is
+        assigned (the `_dev_phase` / `runs.rearm_escalation` pattern), and journaled
+        ``baseline-accepted``. A git fault fails loud: ``baseline-accept-failed`` is
+        journaled and the run pauses with a notice, the baseline unchanged — never
+        a fall-through to the reset the operator explicitly asked to avoid."""
+        root = self._workspace_get().root
+        previous_baseline = task.baseline_commit or ""
+        try:
+            head = verify.rev_parse_head(root)
+            untracked = sorted(verify.untracked_files(root))
+        except (verify.GitError, OSError) as exc:
+            self.journal.append("baseline-accept-failed", story_key=task.story_key, error=str(exc))
+            # The fault text is folded to one segment of its line (DW-417); the
+            # row above keeps it raw.
+            notice = (
+                "**ACTION REQUIRED — could not accept the current baseline**\n"
+                f"`--accept-baseline` was requested for story **{task.story_key}**, but "
+                f"reading the current HEAD / untracked files of `{root}` failed "
+                f"({gates.notice_line(str(exc))}). The baseline was left unchanged and no rollback ran, so "
+                "nothing was reset.\n"
+                "Fix the git fault, then run "
+                f"`bmad-loop resume {self.state.run_id} --accept-baseline` again. A "
+                f"plain `bmad-loop resume {self.state.run_id}` (without the flag) "
+                "rolls the story back to the old baseline instead."
+            )
+            gates.notify(
+                self.policy,
+                self.run_dir,
+                f"ACTION REQUIRED: baseline accept failed for {task.story_key}",
+                notice,
+                multiline=True,
+            )
+            self._save()
+            self._pause(notice, task.story_key)
+        task.baseline_commit = head
+        task.baseline_untracked = untracked
+        self.journal.append(
+            "baseline-accepted",
+            story_key=task.story_key,
+            previous_baseline=previous_baseline,
+            baseline=head,
         )
 
     def preserve_attempt_worktree(
@@ -1690,7 +2211,8 @@ class RecoveryFlow:
         *,
         allow_pause: bool,
         force_include: tuple[str, ...] = (),
-    ) -> None:
+        failed_parks: list[_FailedPark] | None = None,
+    ) -> str | None:
         """Before an auto-rollback's hard reset, park the attempt's *uncommitted*
         working-tree changes (tracked edits + run-created untracked files) under a
         named recovery ref, so `reset --hard baseline` and its untracked cleanup
@@ -1721,10 +2243,18 @@ class RecoveryFlow:
         uncommitted) still resets instead of halting an unattended run. The failure
         is journaled either way, and ``preserve_partial`` is latched either way —
         on the best-effort re-drive path the reset still runs, so the defer notice
-        must still downgrade its claim to the committed half (#338)."""
+        must still downgrade its claim to the committed half (#338). That
+        best-effort fall-through also journals ``attempt-preserve-fallthrough``
+        with the attempt HEAD and appends to ``failed_parks``, so the caller's
+        post-reset notice says uncommitted work was not preserved (DW-481).
+
+        Returns the snapshot ref this call parked, or ``None`` when it parked
+        nothing — a clean tree, no baseline, or a capture failure that did not
+        pause. Rollback callers ignore it; the sweep's kept-rival migration reset
+        reads the ledger back from it to detect a third writer (DW-435)."""
         baseline = task.baseline_commit
         if not baseline:
-            return
+            return None
         workspace = self._workspace_get()
         # Same ref-sanitized slug as preserve_attempt_commits so an exotic/overlong
         # --run-id can't blow the ref-name limit and drop the ref.
@@ -1812,13 +2342,23 @@ class RecoveryFlow:
             # short-circuits on the ref first.
             task.preserve_partial = True
             if not allow_pause:
-                return  # re-drive: never pause — proceed to the (human-directed) reset
+                # re-drive: never pause — proceed to the (human-directed) reset, but
+                # name the HEAD the discarded work sat on for a reflog rescue.
+                try:
+                    head = verify.rev_parse_head(workspace.root)
+                except (verify.GitError, OSError) as head_exc:
+                    self._record_fallthrough(
+                        task, "worktree-snapshot", "", failed_parks, error=str(head_exc)
+                    )
+                else:
+                    self._record_fallthrough(task, "worktree-snapshot", head, failed_parks)
+                return None
             # Refuse the reset rather than destroy what the snapshot failed to save
             # (#340) — but only when something unparked is actually at stake, so a
             # git fault over a harmless reset can't halt an unattended run.
             if force_include or self._reset_would_destroy(task):
                 self.pause_for_manual_recovery(task, baseline, snapshot_failed=True)
-            return
+            return None
         if parked:
             # Last writer wins over preserve_attempt_commits' branch on purpose:
             # the snapshot is commit-tree'd parented at the attempt's HEAD
@@ -1828,6 +2368,7 @@ class RecoveryFlow:
             # snapshot failed and the commits branch is all that survived.
             task.preserve_ref = parked
             self.journal.append("attempt-worktree-preserved", story_key=task.story_key, ref=parked)
+        return parked
 
     def _reset_would_destroy(self, task: StoryTask) -> bool:
         """True when the pending `safe_reset` would still erase uncommitted work —
@@ -1977,7 +2518,13 @@ class RecoveryFlow:
                 "  3. Only if you decide to discard the attempt: "
                 f'`git -C "{root}" reset --hard {short}`, then review/remove leftover '
                 "untracked files.\n"
-                f"Then run `bmad-loop resume {self.state.run_id}`."
+                f"Then run `bmad-loop resume {self.state.run_id}`. Alternatively, "
+                f"`bmad-loop resume {self.state.run_id} --accept-baseline` (no reset "
+                "needed) adopts EVERYTHING at HEAD as the new baseline — any commits "
+                "the attempt made included — and every current untracked file as "
+                "pre-existing (never cleaned); uncommitted tracked changes still "
+                "follow the normal rollback. Check "
+                f'`git -C "{root}" log --oneline {short}..HEAD` first.'
             )
         else:
             why = (
@@ -1999,6 +2546,8 @@ class RecoveryFlow:
                 "`[scm] rollback_on_failure` (it discards the attempt's uncommitted "
                 "work but never deletes pre-existing untracked files)."
             )
+        if task.phase == Phase.DEFERRED:
+            notice += f"\n{deferred_reverify_hint(self.state.run_id)}"
         self.journal.append(
             "rollback-manual-required",
             story_key=task.story_key,
@@ -2010,6 +2559,7 @@ class RecoveryFlow:
             self.run_dir,
             f"ACTION REQUIRED: manual rollback for {task.story_key}",
             notice,
+            multiline=True,
         )
         self._save()
         self._pause(notice, task.story_key)

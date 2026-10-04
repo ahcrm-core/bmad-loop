@@ -222,6 +222,10 @@ def test_workflow_injects_a_session_at_post_dev_phase(project):
     assert "workflow-start" in kinds and "workflow-end" in kinds
     starts = [e for e in engine.journal.entries() if e["kind"] == "workflow-start"]
     assert starts[0]["plugin"] == "wf" and starts[0]["workflow"] == "doc"
+    # the record names its workflow, so attempt-result lookups (DW-522) skip it;
+    # the primary sessions stay unlabeled
+    labels = {s.task_id: s.label for s in engine.state.tasks["1-1-a"].sessions}
+    assert labels == {"1-1-a-dev-1": "", "1-1-a-wf.doc-1": "wf.doc", "1-1-a-review-1": ""}
 
 
 def test_dev_and_review_sessions_carry_no_workflow_contract(project):
@@ -290,6 +294,36 @@ def test_blocking_workflow_env_fault_escalates_instead_of_deferring(project):
     end = [e for e in engine.journal.entries() if e["kind"] == "workflow-end"][-1]
     assert end["env_fault"] is True
     assert end["env_fault_evidence"] == evidence
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    assert "story-deferred" not in kinds  # escalated, not deferred
+
+
+def test_blocking_workflow_parked_escalates_instead_of_deferring(project):
+    """DW-348/DW-350: a blocking workflow session the adapter ended parked (the CLI
+    was waiting on a human, so the stall nudge was withheld) escalates the run
+    (re-arm restores the budget) instead of deferring the story; the workflow-end
+    entry carries parked + evidence.
+
+    ABLATION: delete the blocking-workflow `parked` escalate arm in
+    `Engine._run_workflows` and the story is deferred instead — `summary.paused`
+    is False and a `story-deferred` entry lands."""
+    setup_story(project)
+    reg = PluginRegistry([LoadedPlugin(manifest=wf_manifest("wf", blocking=True))])
+    evidence = "Notification(permission_prompt) -> PermissionPrompt"
+    script = [
+        dev_effect(project, "1-1-a"),
+        SessionResult(status="stalled", parked=True, parked_evidence=evidence),
+    ]
+    engine, _ = make_engine(project, script, reg)
+    summary = engine.run()
+
+    assert summary.paused and summary.escalated == 1 and summary.deferred == 0
+    assert engine.state.tasks["1-1-a"].phase == Phase.ESCALATED
+    assert engine.state.paused_reason.startswith("parked: blocking workflow")
+    assert evidence in engine.state.paused_reason
+    end = [e for e in engine.journal.entries() if e["kind"] == "workflow-end"][-1]
+    assert end["parked"] is True
+    assert end["parked_evidence"] == evidence
     kinds = [e["kind"] for e in engine.journal.entries()]
     assert "story-deferred" not in kinds  # escalated, not deferred
 

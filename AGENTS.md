@@ -51,7 +51,7 @@ Two orthogonal seams: **which CLI** (adapter axis: `adapters/base.py` `CodingCLI
 | `tui/`                                     | Textual dashboard (`tui` extra); observer/launcher only — never runs engines in-process     |
 | `plugins/`                                 | manifest-driven extension layer (`plugin.toml`, trust tiers, hook bus)                      |
 
-28 further leaf modules — read the module docstring before assuming. Deeper maps: [docs/FEATURES.md](docs/FEATURES.md), [docs/adapter-authoring-guide.md](docs/adapter-authoring-guide.md), [docs/multiplexer-backends.md](docs/multiplexer-backends.md).
+29 further leaf modules — read the module docstring before assuming. Deeper maps: [docs/FEATURES.md](docs/FEATURES.md), [docs/adapter-authoring-guide.md](docs/adapter-authoring-guide.md), [docs/multiplexer-backends.md](docs/multiplexer-backends.md).
 
 ## Testing
 
@@ -61,6 +61,7 @@ Two orthogonal seams: **which CLI** (adapter axis: `adapters/base.py` `CodingCLI
 - E2E gates: `tests/test_stories_e2e.py` (real tmux on Linux + a scripted fake-claude profile, zero LLM tokens), `tests/test_opencode_live.py` (zero-token invariant — never sends a prompt), and `tests/test_psmux_live.py` (real psmux on Windows, parked windows only, zero tokens). Never "fix" these to call real CLIs.
 - Ablation rule: for any test asserting "X is refused/absent", delete the gating code and confirm the test FAILS before trusting it — negative assertions pass for every reason a value could be absent.
 - New behavior lands with a test at the lowest layer that can catch its regression: pure-core unit > seam > sandbox E2E.
+- Windows CI shards each leg with `--ci-shard I/N` (digest-assigned function families and xdist groups; `tests/perf_report.py`) and its `test (windows, …)` aggregator fails on any test run in no shard or two. Never select CI tests by hand-kept lists; the psmux gate stays a separate serial job.
 - Full strategy — layer taxonomy, fixture/ablation doctrine, guard inventory, flake policy: [docs/testing.md](docs/testing.md).
 
 ## Repo hygiene
@@ -79,6 +80,7 @@ These rules apply to code you are already touching — do not initiate refactors
 - Split by responsibility, never by line count: a cohesive state machine stays whole (`statemachine.py`); size thresholds are review heuristics, not lint gates.
 - Strict typing lives in the pure core, not the I/O edges (the staged pyright config in pyproject.toml is deliberate). Do NOT ratchet ruff stricter than CI — the `[tool.ruff.lint]` comment documents why.
 - Fail loud at boundaries: typed escalation over bare except; observation may degrade, repair writes must raise.
+  A degrade must be visible: journal it, or count it where an operator or durable record can see it (journal, `heartbeat.json`, a `SessionResult` field the engine journals, CLI/TUI output), and never fold a fault silently into a healthy-looking empty value (`None`, `[]`, `False`, `""`) that a caller cannot tell from a real answer.
 
 ## Docs index
 

@@ -383,7 +383,7 @@ def build_context(
         "project_root": current_project_root.as_posix(),
         "code_root": current_code_root.as_posix(),
         # Absolute, matching the shape `bmad-loop-resolve/SKILL.md` documents: an
-        # isolated unit's `spec_file` is persisted RELATIVE to the mounted worktree
+        # isolated unit's `spec_file` is persisted RELATIVE to the mount project
         # (`model.StoryTask._serialized_worktree_path`) and the agent session runs
         # from the project root, where the main checkout carries the same
         # implementation-artifacts-relative path — the raw value would name the wrong
@@ -400,6 +400,10 @@ def build_context(
         "spec_file": context_spec_path.as_posix() if context_spec_path is not None else None,
         "baseline_commit": task.baseline_commit if task else None,
         "paused_reason": state.paused_reason,
+        # Where the escalation's environment fault was detected (DW-523), a closed
+        # `model.ENV_FAULT_SITES` slug; None when the escalation is not one. Set,
+        # it tells the session the spec needs no change: the environment does.
+        "env_fault_site": task.env_fault_site if task else None,
         "escalations": escalations,
         # as_posix so the context contract is the same string on every OS (the
         # path is consumed by the agent, and Python/tools accept '/' on Windows).

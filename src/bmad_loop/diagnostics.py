@@ -161,6 +161,24 @@ _JOURNAL_ALIAS_FIELDS = {
     # benign inventory follows from that inventory's own rule: a name carrying a sha
     # belongs in a `diagnostics` table.
     "old_baseline": "commit",
+    # The baseline `resume --accept-baseline` replaced (`baseline-accepted`, DW-371),
+    # journaled beside the adopted `baseline` — both shas aliased so the comparison
+    # the record exists for survives a dump.
+    "previous_baseline": "commit",
+    # The attempt HEAD a rollback could not park (`attempt-preserve-failed`) or
+    # fell through past (`attempt-preserve-fallthrough`, DW-481) — the sha a
+    # reflog rescue starts from, so one HEAD gets one alias across both kinds.
+    "head": "commit",
+    # The worktree snapshot `sweep._migration_reset` parked before a reset it then
+    # refused (DW-435), on `ledger-snapshot-probe-failed` and
+    # `sweep-migration-restore-diverged`. A REF NAME, not a sha —
+    # `refs/attempt-preserve-dirty/<story slug>-<baseline[:8]>-<attempt>` — so it
+    # embeds the story slug and a baseline prefix, and gets its own `ref` namespace
+    # rather than `commit`: one parked snapshot, one alias across both kinds.
+    # Routed rather than left to `scrub_json`, which redacts it today only because
+    # the `/` fails `_IDENTIFIER_RE` — the accident of shape `repo` and `spec`
+    # above refuse to rest on.
+    "snapshot_ref": "ref",
     # A spec name IS the customer's feature name — `Pseudonymizer`'s own docstring
     # has always listed "spec filenames" among what it exists to alias, so the
     # omission here was a routing gap, not a policy. A producer that journals a
@@ -244,17 +262,26 @@ _JOURNAL_ALIAS_FIELDS = {
 # row here. `sentinel` is scoped for a different reason: its sole producer carries a
 # spec basename, so that known shape is aliased without making the same claim about a
 # future kind that reuses the generic name.
+#
+# `source` on the three merge kinds is the unit's commit SHA (DW-318). Left to
+# `scrub_json`, an identifier-shaped 40-hex value shipped verbatim; it now shares the
+# `commit` namespace with `pre_target_revision`, so one revision gets one alias across
+# both fields. Scoped rather than by-name for the same reason as `target`: `source` is
+# a generic name (`state.source` is a run mode). The producers keep the name for the
+# same correlation reason too — `_replay_unlatched_ledger_carries` keys on it.
 _JOURNAL_KIND_ALIAS_FIELDS: dict[str, dict[str, str]] = {
     "unit-merge-started": {
         "target": "branch",
         "operation_id": "operation",
+        "source": "commit",
         "pre_target_revision": "commit",
     },
     "unit-merged": {
         "target": "branch",
         "operation_id": "operation",
+        "source": "commit",
     },
-    "resume-unit-merge": {"target": "branch", "operation_id": "operation"},
+    "resume-unit-merge": {"target": "branch", "operation_id": "operation", "source": "commit"},
     "sentinel-cleared": {"sentinel": "spec"},
 }
 # Namespaces whose journalled value arrives in more than one shape and must be
@@ -386,6 +413,21 @@ _JOURNAL_DROP_FIELDS = frozenset(
         # correlation beyond the record's story key, so every kind gets the same
         # presence-only treatment.
         "path",
+        # `pinned-config-edit-refused`'s (DW-368) per-file descriptions of a story's
+        # edit to a pinned hook config: each quotes the worktree-relative config
+        # path, the changed top-level keys of the operator's settings, and an
+        # OSError/JSON error text. Free text under this set's rule; `story_key`
+        # already correlates the record, so presence-only.
+        "edits",
+        # `artifact-observation-unpinned` (DW-444): the absolute artifacts root
+        # whose fallback observation ran on a degraded pin, and the full
+        # filesystem label (`platform_util.filesystem_name`: `"<fs> at <volume>"`,
+        # or `"unknown (<reason>)"`, whose reason may quote a path). Both are host
+        # paths for `repo`'s reason; `story_key` already correlates the record, so
+        # presence-only. The filesystem TYPE stays visible through the record's
+        # separate `fs_type` field, routed as a value in `_scrub_entry`.
+        "root",
+        "filesystem",
     }
 )
 # Journal fields whose value is a LIST of identifiers, aliased element-wise rather
@@ -417,7 +459,12 @@ _JOURNAL_KIND_KEYLIST_FIELDS: dict[str, dict[str, str]] = {
 _JOURNAL_KIND_COUNTLIST_FIELDS: dict[str, frozenset[str]] = {
     "merge-preflight-refused": frozenset({"tolerated"}),
     "merge-target-cleaned": frozenset({"paths"}),
+    "merge-target-preserved": frozenset({"paths"}),
     "merge-target-tolerated": frozenset({"paths"}),
+    # The auto retrospective (DW-389): the worktree paths it left dirty (whatever
+    # the session touched, customer source included) and its retro doc filenames.
+    "retro-auto-dirty": frozenset({"paths"}),
+    "retro-auto-finished": frozenset({"docs"}),
     "stale-restore-excluded": frozenset({"files"}),
 }
 
@@ -483,8 +530,8 @@ _JOURNAL_KIND_COUNTLIST_FIELDS: dict[str, frozenset[str]] = {
 # field because some other table happened to cover it would mislead the next reader.
 _JOURNAL_KIND_SCHEMAS: dict[str, frozenset[str]] = {
     "preference-escalation": frozenset({"type", "severity", "detail"}),
-    # The six kinds `render_markdown` lifts out of the scrubbed collection and
-    # prints as a JSON block in the DEFAULT dump (DW-191/192/201/246). Their names ARE
+    # The seven kinds `render_markdown` lifts out of the scrubbed collection and
+    # prints as a JSON block in the DEFAULT dump (DW-191/192/201/246/337). Their names ARE
     # authored here, so the premise above does not hold for them — an unclaimed
     # key on one of these is a field a future producer added without routing.
     # Declared anyway, because Markdown is the render an operator pastes into an
@@ -503,6 +550,10 @@ _JOURNAL_KIND_SCHEMAS: dict[str, frozenset[str]] = {
     # this table is consulted; named for the same completeness as `commit` above.
     "sweep-ledger-commit-withheld": frozenset({"message", "file", "reason", "dw_ids"}),
     "sweep-repeat-done": frozenset({"cycles", "reason", "stop_cause"}),
+    # DW-337. Both producers (`_cycle`'s dispatch gate and `_loop`'s in-flight
+    # recovery withhold) write `cycle` and `bundles_not_run`; `reason` is a DROP
+    # field and `story_keys` a `_JOURNAL_KEYLIST_FIELDS` name, both reached first.
+    "sweep-bundles-withheld": frozenset({"cycle", "bundles_not_run", "reason", "story_keys"}),
 }
 
 # Policy keys whose values can carry secrets/paths/free text. Dropped or reduced
@@ -1057,6 +1108,12 @@ def _scrub_entry(
             out[k] = v if type(v) is int and v >= 0 else None
         elif kind == "artifact-publication-refused" and k == "measurement_is_lower_bound":
             out[k] = v if type(v) is bool else None
+        elif kind == "artifact-observation-unpinned" and k == "fs_type":
+            # DW-444: the filesystem type alone (`NTFS`, `ReFS`, `unknown`) —
+            # `platform_util.filesystem_type` already stripped the volume path.
+            # Kept only while identifier-shaped, so a label that somehow still
+            # carries a path or prose never ships.
+            out[k] = v if isinstance(v, str) and sanitize.looks_like_identifier(v) else None
         elif declared is not None and k not in declared and k not in SELF_MINTED_FIELDS:
             # A kind with a declared schema (`_JOURNAL_KIND_SCHEMAS`) replaces the
             # `scrub_json` fallback with a fail-closed one, because on such a kind an

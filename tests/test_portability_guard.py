@@ -35,6 +35,10 @@ prose alone (or by nothing):
   isolation-refusal call site is enumerated —
   ``test_refusal_helper_inventory_is_complete`` and
   ``test_isolation_conflict_refusal_sites_are_enumerated``.
+* every text-mode ``open`` / ``io.open`` / ``Path.open`` / ``read_text`` /
+  ``write_text`` names an explicit, non-``None`` encoding (Windows decodes with the locale codepage until Python 3.15,
+  PEP 686) — ``test_text_io_pins_an_encoding``, and over the two release scripts
+  ``test_release_scripts_pin_text_encoding``.
 
 If this test flags something unexpected, fix the source (route it through the
 seam / a platform helper) rather than widening an allowlist.
@@ -256,6 +260,8 @@ SAVE_STATE_CALLERS = {
     ("cli.py", "_prepare_resume_locked"),
     ("engine.py", "_save"),
     ("runs.py", "_rearm_escalation_locked"),
+    ("runs.py", "_rearm_for_reverify_locked"),
+    ("runs.py", "adopt_escalated_branch"),
     ("runs.py", "restamp_code_root"),
     ("runs.py", "_stop_run_once"),
     ("runsetup.py", "compose_run"),
@@ -264,8 +270,12 @@ SAVE_STATE_CALLERS = {
 RUN_STATE_TRANSACTIONS = {
     ("cli.py", "_resume_paused_run"),
     ("cli.py", "cmd_resolve"),
+    ("cli.py", "_resolve_adopt"),
+    ("cli.py", "_resolve_reverify"),
     ("journal.py", "save_state"),
     ("runs.py", "rearm_escalation"),
+    ("runs.py", "rearm_for_reverify"),
+    ("runs.py", "adopt_escalated_branch"),
     ("runs.py", "restamp_code_root"),
     ("runs.py", "_stop_run_once"),
     ("runs.py", "archive_run"),
@@ -287,6 +297,8 @@ RUN_STATE_TRANSACTIONS = {
 # refusals, and deliberately adds no runtime abstraction (no RefusalError, no
 # registry): the inventory is the test file's, not the product's.
 REFUSAL_HELPER_DEFS = {
+    # DW-444: publish into a zero-inode artifacts root; test_artifact_publication.py
+    ("artifact_publication.py", "_refuse_zero_inode_root"),
     ("cli.py", "_reject_bad_run_id"),
     ("cli.py", "_reject_isolation_conflict"),
     ("cli.py", "_reject_under_floor_git"),
@@ -296,9 +308,13 @@ REFUSAL_HELPER_DEFS = {
     ("resolve.py", "_reject_json_constant"),
     ("runs.py", "_refuse_live_session"),
     ("runs.py", "_refuse_uncontained_run_dir"),
+    ("sweep.py", "_refuse_advanced_migration_head"),  # DW-427/428, test_sweep.py
+    ("sweep.py", "_refuse_dirty_migration_input"),  # DW-437, test_sweep.py
     ("win32_at.py", "_refuse_link"),  # ELOOP for a symlink/junction under O_NOFOLLOW
     ("workspace.py", "_refuse_foreign_checkout"),
     ("worktree_flow.py", "_refuse_integrated_artifacts"),
+    # DW-368: a story's edit to a pinned tracked hook config; test_worktree_flow.py
+    ("worktree_flow.py", "_refuse_pinned_config_edits"),
     ("worktree_flow.py", "_refuse_refused_residue"),
 }
 
@@ -419,6 +435,29 @@ JOURNAL_KIND_BENIGN_FIELDS = {
     # The stale-restore record carries SHA strings under this name and is routed;
     # this recovery notice carries only the already-derived integer count.
     "rollback-manual-required": frozenset({"commits"}),
+    # `source` is a commit SHA on the three merge kinds and aliased there (DW-318);
+    # here it is the run mode and the literal manifest name `stories.yaml`.
+    "run-start": frozenset({"source"}),
+    "deferred-close-declaration-unreadable": frozenset({"source"}),
+    # DW-439: a closed slug (`restored` | `no-dir-fd` | `no-snapshot`), never
+    # authored text; declared on this kind alone because `outcome` is generic.
+    "sweep-migration-snapshot-restore": frozenset({"outcome"}),
+    # DW-444: the filesystem TYPE (`platform_util.filesystem_type` — `NTFS`,
+    # `ReFS`, `unknown`), the volume path already stripped; `_scrub_entry` keeps
+    # it only while identifier-shaped. Kind-scoped because `fs_type` is generic.
+    "artifact-observation-unpinned": frozenset({"fs_type"}),
+    # DW-446: the recorded root's `(st_dev, st_ino)` — two integers naming no story,
+    # branch, commit or path; left as-is so a maintainer can compare the record with
+    # a later refusal. Kind-scoped because `dev` is generic.
+    "root-identity-recorded": frozenset({"dev", "ino"}),
+    # DW-446: the `st_dev` a locked resume/re-arm re-bound (`old_dev` -> `dev`) under
+    # a still-matching `ino` — integers only, kept for the same comparison.
+    "root-identity-rebound": frozenset({"old_dev", "dev", "ino"}),
+    # DW-487: the retro doc's acceptance verdict, normalized by
+    # `Engine._retro_verdict` into a closed four-value token (`accepted` /
+    # `accepted-with-open-items` / `rejected` / `unknown`) — never the doc's raw
+    # text. Kind-scoped because `verdict` is generic.
+    "retro-auto-finished": frozenset({"verdict"}),
 }
 
 # Every OTHER field name journalled today: a declared inventory, not a per-name
@@ -480,6 +519,10 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         # `diagnostics._JOURNAL_DROP_FIELDS` and would ship as a presence marker.
         "compared",
         "condition",
+        # `sentinel-cleared`'s read-fault flag (DW-471): the sentinel's text could
+        # not be read, so its empty `condition` is not "none recorded". A bare
+        # boolean; the fault text rides in `error`, which diagnostics drops.
+        "condition_unreadable",
         "contradiction",
         "converted",
         "count",
@@ -488,6 +531,12 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         "decision",
         "decisions",
         "deduped",
+        # `sweep-migrated`'s completion identity (DW-317): a fresh `uuid4().hex`
+        # minted per migration completion, and the dedup key a `post_migrate` hook
+        # sees as `ctx.delivery_id`. Random, so it names no story, branch, commit,
+        # path or run; left as-is so a maintainer can match the row to a hook's
+        # at-least-once deliveries.
+        "delivery_id",
         # Written by `runs.restamp_code_root`'s TRAILING append alone — one of the
         # three producers of `rearm-code-root-restamped`, not a predicate over the
         # kind (the two discharge rows omit it, asserting `code_root_changed=true`
@@ -534,6 +583,10 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         "entries_now",
         "env_fault",
         "env_fault_evidence",
+        # DW-523: where an environment fault was detected — a closed
+        # `model.ENV_FAULT_SITES` slug (`verify:dev`, `probe:decision:review`, ...),
+        # never authored text, on `story-escalated` and `dev-decision`.
+        "env_fault_site",
         "epic",
         "errors",
         "expired_clock",
@@ -562,11 +615,24 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         "generation",
         "graceful",
         "harvest_attempt",
-        "head",
+        # `head` is NOT here any more: a HEAD sha (`attempt-preserve-failed`,
+        # `attempt-preserve-fallthrough`) moved to `_JOURNAL_ALIAS_FIELDS` (DW-481).
         "id_collisions",
         # `session-idle` / `session-active` (#680): seconds the live transcript has
         # sat still — a float the adapter measured from two stats, no identifier.
         "idle_s",
+        # `sweep-retro-ingest-unavailable`'s discriminator (DW-388): WHICH input the
+        # retro action-item ingest could not use, as a closed three-value enum
+        # (`sprint-status-unreadable` | `action-items-malformed` |
+        # `ledger-unavailable`) chosen by the except arm, never read from either
+        # file. A closed slug deliberately — `error`, the natural spelling, is in
+        # `diagnostics._JOURNAL_DROP_FIELDS` and ships as a presence marker, which
+        # could not tell the operator whether to repair the board or the ledger.
+        # Item ids and action text are operator free text and are never journaled.
+        "ingest_cause",
+        # `verify-command-result` (DW-353): a bare `True`, present only on a pass a
+        # hard stop request cut short. No identifier.
+        "interrupted",
         "items",
         "kept",
         "key",
@@ -579,6 +645,10 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         # (`False` label, `True` effect-only) and names nothing.
         "label_matched",
         "ledger",
+        # `attempt-preserve-fallthrough` (DW-481): WHICH best-effort preserve leg
+        # failed, a closed three-value token (`commits-enumerate` / `commits-park`
+        # / `worktree-snapshot`) — names nothing.
+        "leg",
         # `accepted-spec-delivery-unreachable`'s discriminator: whether the locator
         # RESOLVED a project-local rel, or only reported a swallowed filesystem
         # fault. A bare boolean deliberately, exactly like `compared` above —
@@ -599,6 +669,12 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         "limit_bytes",
         "measured_bytes",
         "measurement_is_lower_bound",
+        # `bypass-dropped` (DW-410): the profile bypass tokens an explicit
+        # `[adapter] extra_args` drops — CLI flags copied from the resolved
+        # profile's `bypass_args` (e.g. `--permission-mode bypassPermissions`). A
+        # project overlay profile may hold any string there; a path-shaped value
+        # still falls to `scrub_json`.
+        "missing",
         "mode",
         "model",
         "name",
@@ -628,8 +704,24 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         # discriminated nothing; since DW-123 two lanes share the site, and since
         # DW-167 the re-apply walk is a third.
         "option_effect",
+        # DW-522: the phase a `story-reverify-armed` story was re-armed FROM — the
+        # closed pair `deferred` / `escalated`, never authored text.
+        "origin",
         "original",
         "owed_after_implement",
+        # DW-523: what the orchestrator's probe made of a session's environment-
+        # fault claim on `env-fault-claim` — the closed set passed / failed /
+        # not-configured, never authored text.
+        "probe_outcome",
+        # Parked-session diagnosis (DW-348/DW-350) on `dev-decision`, `session-end`,
+        # `workflow-end`, `migrate-decision` and `triage-decision`: whether the
+        # adapter withheld the stall nudge because the CLI was waiting on a human
+        # (a bare boolean), and the evidence that said so — a hook signal label
+        # (`Notification(permission_prompt) -> PermissionPrompt`) or the matched
+        # profile pattern plus the quoted pane line, the same class of excerpt
+        # `env_fault_evidence` carries.
+        "parked",
+        "parked_evidence",
         "phase",
         "pid",
         "platform",
@@ -638,6 +730,11 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         "policy_changed",
         "preserve_ref",
         "problem",
+        # `bypass-dropped` (DW-410): the launched role's CLI profile name (`claude`,
+        # `codex`, …) copied from the resolved profile — the same config name
+        # `adapter_dev`/`adapter_review` carry. A project overlay profile may name
+        # itself anything; a path-shaped value still falls to `scrub_json`.
+        "profile",
         # `dev-decision` and `session-end` (#727): whether the session changed its
         # pane after the first frame or ended a turn. A bare boolean about the
         # verdict — it names no story, no path and no text, and `False` is what
@@ -711,8 +808,10 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         "since_ts",
         "site",
         "skip",
-        "source",
         "spec_folder",
+        # DW-522: whether `story-reverify-armed` copied the stashed spec back (a
+        # bare boolean).
+        "spec_restored",
         "stage",
         "state_kind",
         "status",
@@ -916,6 +1015,8 @@ JOURNAL_SPLAT_FIELDS = {
             "env_fault",
             "env_fault_evidence",
             "session_vanished",
+            "parked",
+            "parked_evidence",
         }
     ),
     # The plugin bus's `_log` forwards its OWN `**fields` parameter, so the keys
@@ -1017,6 +1118,8 @@ JOURNAL_DYNAMIC_KIND_SPELLINGS = {
             "attempt-preserve-prune-failed",
             "attempt-preserve-dirty-pruned",
             "attempt-preserve-dirty-prune-failed",
+            "merge-preflight-preserve-pruned",
+            "merge-preflight-preserve-prune-failed",
         }
     ),
 }
@@ -1064,9 +1167,25 @@ JOURNAL_KINDS = frozenset(
         "session-active",
         "session-idle",
         # cli.py
+        # DW-410: a real launch whose resolved `[adapter] extra_args` drops the
+        # profile's bypass tokens — one per affected launched role. `role`,
+        # `profile` and `missing` are config names/flags from the resolved profile.
+        "bypass-dropped",
         "run-resume",
         # cli.py + runs.py
         "rearm-code-root-restamped",
+        # cli.py + runs.py (resume and re-arm, `runs.reconcile_root_identities`).
+        # DW-446: a state.json written before the mint-time root identities records
+        # one at the first locked load; one row per record. `root` (`run-dir` |
+        # `worktree`) and `path` are presence-only in `diagnostics._JOURNAL_DROP_FIELDS`,
+        # `story_key` is aliased, `dev`/`ino` are kind-scoped benign.
+        "root-identity-recorded",
+        # cli.py + runs.py (same helper). DW-446: a recorded root whose `st_dev` a
+        # reboot/remount renumbered (same `st_ino`, still a real directory) is
+        # re-bound at the locked resume/re-arm; one row per re-bound root. Fields
+        # routed as on `root-identity-recorded`; `old_dev`/`dev`/`ino` kind-scoped
+        # benign.
+        "root-identity-rebound",
         # engine.py
         "board-advance-carried",
         "board-advance-carry-failed",
@@ -1096,6 +1215,32 @@ JOURNAL_KINDS = frozenset(
         "deferred-close-skipped-out-of-tree",
         "deferred-close-unmatched",
         "dev-decision",
+        # DW-523. A failed `[environment]` probe pass, from
+        # `Engine._observe_environment_probes` (dev/fix verify, and the review
+        # gates through `_review_probe_sink`): `site` names the asking seam.
+        "env-probe-failed",
+        # DW-523. A charging failure decision (retry / defer / budget-exhausted)
+        # replaced by a PAUSE because a re-probe failed, from
+        # `Engine._env_gate_decision`: `site` is the `env_fault_site` recorded.
+        "env-fault-reclassified",
+        # DW-522. A DEFERRED or environment-fault ESCALATED story re-armed for a
+        # verify replay of its kept tree, from `runs._rearm_for_reverify_locked`.
+        "story-reverify-armed",
+        # DW-522. The engine's `_finish_inflight` reverify arm entering the replay
+        # (`resume-reverify`), and the replay's `decide_reverify` routing
+        # (`reverify-decision`), from `Engine._resume_reverify`.
+        "resume-reverify",
+        "reverify-decision",
+        # DW-523. A dispatch-site `environment` pause whose resume re-probe passed
+        # (`env-fault-cleared`, from `Engine._take_env_dispatch_pause`), and the
+        # no-rollback dev re-dispatch that follows (`resume-env-dispatch`, from
+        # `Engine._finish_inflight` and `SweepEngine._recover_inflight_bundle`).
+        "env-fault-cleared",
+        "resume-env-dispatch",
+        # DW-523. A session's "Environment fault:" claim and what the
+        # orchestrator's own probe made of it (`probe_outcome`), from
+        # `Engine._env_gate_claim` — journaled for every claim, confirmed or not.
+        "env-fault-claim",
         "epic-boundary",
         "fix-decision",
         "fix-harvest-failed",
@@ -1112,6 +1257,13 @@ JOURNAL_KINDS = frozenset(
         # `story_key`, `dw_ids`, `refuse_cause` and the optional `error` are all
         # already routed or declared.
         "harvest-carry-refused",
+        # DW-355/DW-413. The ownership-proof pause of a LATCH-ONLY harvested carry,
+        # or of any replay whose latch predates the pass (DW-413): the
+        # working tree or index holds ledger changes beyond HEAD plus this task's
+        # rows, so the commit would sweep an operator's edit in — or the proof
+        # itself faulted, named in the optional `error`. `story_key`, `ledger` and
+        # `error` are already routed or declared.
+        "harvest-carry-foreign-dirt",
         "harvest-carry-uncommitted",
         "isolation-flip-orphaned-worktree",
         "ledger-baseline-probe-failed",
@@ -1142,11 +1294,29 @@ JOURNAL_KINDS = frozenset(
         "plugin-veto",
         "plugins-active",
         "preference-escalation",
+        # DW-386: the resume leg of `resolve --adopt-branch` — the COMMITTING arm
+        # finishing an adopted kept branch. `story_key` and `branch` are routed.
+        "resume-adopt",
         "resume-defer",
         "resume-ledger-carry",
         "resume-review",
         "resume-unit-merge",
         "resume-verify",
+        # DW-389: the headless epic-boundary retrospective
+        # (`gates.retrospective = "auto"`). `epic`, `count` and the closed `reason`
+        # / check-`errors` lines are benign or dropped; `paths` / `docs` are
+        # reduced to counts by `diagnostics._JOURNAL_KIND_COUNTLIST_FIELDS`.
+        "retro-auto-dirty",
+        "retro-auto-failed",
+        "retro-auto-finished",
+        "retro-auto-skipped",
+        "retro-auto-start",
+        "retro-auto-uncommitted",
+        # DW-488: the retrospective gate fired (or refused) for the run's last
+        # epic at run end. `epic` is benign; the closed `reason` and an unreadable
+        # board's `error` are dropped like every other `reason` / `error`.
+        "retro-run-end",
+        "retro-run-end-skipped",
         "review-budget-committed",
         "review-budget-ledger-unreadable",
         "review-followup-damped",
@@ -1175,6 +1345,7 @@ JOURNAL_KINDS = frozenset(
         "spec-marker-repaired",
         "spec-read-failed",
         "spec-reconcile-skipped-out-of-tree",
+        "spec-reconcile-skipped-status",
         "spec-status-reconciled",
         "sprint-status-unknown-keys",
         "stop-request-discarded",
@@ -1214,6 +1385,9 @@ JOURNAL_KINDS = frozenset(
         # plugins/bus.py
         "plugin-hook",
         "plugin-hook-error",
+        # DW-353: a declarative hook whose tree a hard stop request killed — neither
+        # an error nor a veto; carries only `plugin` and `stage`.
+        "plugin-hook-interrupted",
         # plugins/bus.py + plugins/registry.py
         "plugin-error",
         # plugins/loader.py
@@ -1223,8 +1397,15 @@ JOURNAL_KINDS = frozenset(
         "plugin-untrusted",
         # recovery_flow.py
         "attempt-commits-preserved",
+        # DW-371: `resume --accept-baseline` adoption on the restart arm.
+        "baseline-accept-failed",
+        "baseline-accepted",
         "attempt-preserve-enumerate-failed",
         "attempt-preserve-failed",
+        # DW-481: a re-drive's best-effort preserve leg failed and fell through to
+        # the reset. `story_key` aliased, `leg` benign, `head` aliased as a commit,
+        # `error` (a HEAD read fault) dropped.
+        "attempt-preserve-fallthrough",
         "attempt-restore-failed",
         "attempt-restored",
         "attempt-worktree-preserve-failed",
@@ -1244,6 +1425,11 @@ JOURNAL_KINDS = frozenset(
         "rollback-reset-failed",
         "rollback-skipped-clean",
         # runs.py
+        # DW-386: `resolve --adopt-branch` moved an ESCALATED task to COMMITTING to
+        # finish its kept branch without review. `story_key` and `branch` are routed;
+        # `worktree` is the declared-benign mount path `pinned-config-edit-refused`
+        # and `isolation-flip-orphan-preserved` also carry.
+        "escalation-adopted",
         "rearm-aborted",
         "rearm-baseline-advance-failed",
         "rearm-baseline-restamp-skipped",
@@ -1297,8 +1483,22 @@ JOURNAL_KINDS = frozenset(
         "decision-preanswered",
         "decision-preanswers-pruned",
         "decision-skipped-unattended",
+        # DW-435. `_migration_reset` could not read the kept rival migration input
+        # back out of the worktree snapshot it just parked, so no reset ran and the
+        # task re-paused (fail closed). `story_key` and `snapshot_ref` are aliased
+        # (`diagnostics._JOURNAL_ALIAS_FIELDS`); `error` is dropped.
+        "ledger-snapshot-probe-failed",
         "migrate-decision",
         "migrate-duplicate-ids",
+        # DW-440: `_ensure_migration`'s input held no legacy entries, so the
+        # migrate task went PENDING -> DONE with no session. `story_key` routed.
+        "migrate-empty-manifest",
+        # DW-437: the migration input is a tracked ledger that differs from its
+        # committed blob (or the probe faulted), so the run paused at the story
+        # gate before dispatch. `story_key` routed, `ledger` and `refuse_cause`
+        # (`dirty` | `probe-fault`) benign, `error` (the probe fault, when there
+        # is one) dropped.
+        "migrate-ledger-dirty",
         "sweep-bundle-close-carried",
         # DW-237. The REFUSAL arm of the bundle-close carry — the sweep's own copy of
         # `story-deferred-close-carry-refused`, on `SweepEngine`'s override. Last of
@@ -1340,8 +1540,9 @@ JOURNAL_KINDS = frozenset(
         "sweep-bundle-skipped",
         "sweep-bundles-truncated",
         # DW-194/202/210: decision-effect doubt withheld this cycle's bundles.
-        # No new diagnostics routing: cycle/bundles_not_run are already benign;
-        # reason is already a drop field and carries fixed token ledger-unreadable.
+        # cycle/bundles_not_run are benign; reason is a drop field (fixed token
+        # ledger-unreadable); story_keys is a keylist field. Declared in
+        # `_JOURNAL_KIND_SCHEMAS` (DW-337) so a future unrouted field fails closed.
         "sweep-bundles-withheld",
         "sweep-cycle",
         # DW-197. `_loop`'s own repair/write ledger read refused at the top of a
@@ -1565,10 +1766,17 @@ JOURNAL_KINDS = frozenset(
         "sweep-ledger-commit-withheld",
         "sweep-migrated",
         # DW-296/DW-297. Current-format migration recovery evidence was absent,
-        # nonregular, unreadable, malformed, or mutually inconsistent. `detail`
-        # is already routed through diagnostics._JOURNAL_DROP_FIELDS.
+        # nonregular, unreadable, malformed, or mutually inconsistent — or, since
+        # DW-315, unavailable because a host without dir-fd anchoring refuses to
+        # read any recovery record (`<label> record cannot be read without dir-fd
+        # anchoring`). `detail` is already routed through
+        # diagnostics._JOURNAL_DROP_FIELDS.
         "sweep-migration-recovery-invalid",
         "sweep-migration-restore-diverged",
+        # DW-439: the format-1 ESCALATED restart's snapshot restore. `outcome` is a
+        # closed slug (`restored` | `no-dir-fd` | `no-snapshot`, DW-201 convention);
+        # `ledger` is the same path the diverged sibling above carries.
+        "sweep-migration-snapshot-restore",
         "sweep-nothing-open",
         # DW-176/DW-182/DW-197. `_prune_pre_answers` refusing to prune because the
         # deferred-work ledger could not be read for a write — ABSENT (DW-176),
@@ -1622,6 +1830,15 @@ JOURNAL_KINDS = frozenset(
         # `dw_ids` carries the ids the plan named and is routed by name in
         # `diagnostics._JOURNAL_KEYLIST_FIELDS`; `error` is already a drop field.
         "sweep-resolved-close-unavailable",
+        # DW-388. `_ingest_retro_action_items` filed sprint-status retro action
+        # items into the ledger on a fresh sweep; `dw_ids` names the minted
+        # entries and is routed by name (`diagnostics._JOURNAL_KEYLIST_FIELDS`).
+        "sweep-retro-items-ingested",
+        # ...and its degrade: the board could not be read, its `action_items` is
+        # not a list, or the ledger append faulted before writing. The sweep
+        # carries on without ingesting. `ingest_cause` is the closed slug that
+        # tells the three apart; `error` is already a drop field.
+        "sweep-retro-ingest-unavailable",
         "sweep-return-no-client",
         "sweep-returned-after-decisions",
         "sweep-selection-empty",
@@ -1651,10 +1868,13 @@ JOURNAL_KINDS = frozenset(
         # worktree_flow.py
         "accepted-spec-delivery-unreachable",
         "accepted-spec-write-unreachable",
+        "isolated-ledger-writes-uncarried",
         "isolation-flip-orphan-preserved",
         "merge-preflight-refused",
         "merge-target-cleaned",
+        "merge-target-preserved",
         "merge-target-tolerated",
+        "pinned-config-edit-refused",
         "scm-failed-diff-unlimited",
         "target-branch",
         "target-branch-checkout",
@@ -1670,7 +1890,16 @@ JOURNAL_KINDS = frozenset(
         "worktree-seed-dropped",
         "worktree-seed-skipped",
         "worktree-teardown-degraded",
+        # DW-390 workspace-trust seeding: `key` is benign, `path` and `reason`
+        # are presence-only in `diagnostics._JOURNAL_DROP_FIELDS`.
+        "worktree-trust-seeded",
+        "worktree-trust-unseeded",
         "artifact-publication-refused",
+        # DW-444: a zero-inode artifacts root's degraded fallback observation.
+        # `root` and `filesystem` are presence-only in
+        # `diagnostics._JOURNAL_DROP_FIELDS`; `fs_type` is kind-scoped benign and
+        # value-checked in `_scrub_entry`; `count` is benign.
+        "artifact-observation-unpinned",
     }
 )
 
@@ -1700,9 +1929,13 @@ JOURNAL_RECEIVERS = {"journal", "_journal"}
 # sys.platform branch; the Unity teardown scripts are POSIX-only. verify.py is the
 # one non-platform case: git's *diff format* spells an absent file `/dev/null` on
 # every platform, so `patch_new_files` compares against it as a protocol token.
+# The two relay twins read `/proc/<pid>/{stat,cmdline}` for the DW-507 lineage tag;
+# a platform without `/proc` fails the open and tags "unknown" by construction.
 PATH_ALLOW = {
+    "data/bmad_loop_hook.py",
     "data/plugins/unity/unity_cleanup.py",
     "data/plugins/unity/unity_teardown.py",
+    "events.py",
     "process_host.py",
     "verify.py",
 }
@@ -1731,11 +1964,12 @@ OS_KILL_ALLOW = {
     "process_host.py",
 }
 
-# The two sanctioned `shell=True` spots: operator-authored command strings whose
-# cmd/PowerShell port is an explicit out-of-scope follow-up.
+# The one sanctioned `shell=True` spot: the stop-aware child runner (DW-353) that
+# both operator-authored command families — verify commands and declarative plugin
+# hooks — spawn through. Their cmd/PowerShell port is an explicit out-of-scope
+# follow-up. `verify.py` and `plugins/bus.py` no longer spell `shell=True` at all.
 SHELL_ALLOW = {
-    "verify.py",
-    "plugins/bus.py",
+    "childrun.py",
 }
 
 # Bare POSIX paths that must not be hardcoded outside PATH_ALLOW. `os.devnull` is
@@ -1778,6 +2012,9 @@ SESSION_PROTOCOL_ENV = (
     "BMAD_LOOP_CLEAN_TMP",
     "BMAD_LOOP_QUIESCE_PHASE",
     "BMAD_LOOP_PROBE_CAPTURE_DIR",
+    # DW-507: the launched CLI's pid, exported in-pane by `TmuxMultiplexer._window_launch`
+    # and read back only by the two relay twins' lineage walk.
+    "BMAD_LOOP_LAUNCH_PID",
 )
 
 # The plugin's own families, which AGENTS.md's second clause leaves with the plugin
@@ -1940,9 +2177,9 @@ def _git_name_bindings(tree: ast.AST) -> tuple[set[str], set[str]]:
     that shape — in both the sequence and the string branch. ANY binding
     qualifies a name — a later rebind must not launder a spawn that was git
     somewhere in the module — which can only over-flag, and a false positive is
-    a review prompt, not a miss. The tmux detector keeps its literal-only head:
-    widening that older tripwire is a separate decision from the git chokepoint
-    invariant this one enforces."""
+    a review prompt, not a miss. The tmux detector's head has its own resolver,
+    ``_tmux_head_names``, which also reads attribute bindings: the tmux backend
+    names its executable through a class constant, and git has no such idiom."""
     heads: set[str] = set()
     commands: set[str] = set()
     for node in ast.walk(tree):
@@ -1960,6 +2197,90 @@ def _git_name_bindings(tree: ast.AST) -> tuple[set[str], set[str]]:
         if value.value == "git" or value.value.startswith("git "):
             commands.update(targets)
     return heads, commands
+
+
+def _tmux_head_names(tree: ast.AST) -> set[str]:
+    """The names bound anywhere in the module to the constant ``"tmux"`` — a bare
+    name (``TMUX = "tmux"``, or a class-body ``_BINARY = "tmux"``) or an
+    attribute's name (``self.exe = "tmux"``). The tmux twin of
+    ``_git_name_bindings``' head half: the sanctioned backend spawns
+    ``[self._BINARY, *argv]``, so a new module copying that idiom never spells the
+    literal the detector used to require.
+
+    The sequence detector matches a ``Name`` head by id and an ``Attribute`` head
+    by its ``attr`` alone, because ``self._BINARY``, ``cls._BINARY`` and
+    ``Backend._BINARY`` are all spellings of the same class constant. ANY binding
+    qualifies — a rebind does not launder the name — and a same-named attribute
+    bound to "tmux" elsewhere in the module can only over-flag: a false positive
+    is a review prompt, not a miss.
+
+    NOT COVERED, deliberately — anything not named above is out, for example: a
+    rebinding alias (``mux = self._BINARY``, then ``[mux, ...]``); a tuple-unpack
+    or walrus binding (``TMUX, X = "tmux", 1``; ``(t := "tmux")``); a parameter
+    default (``def f(exe="tmux")``); a binding in another module, most likely a
+    ``BaseTmuxBackend`` subclass in another file inheriting ``_BINARY`` (such a
+    subclass is itself a mux backend, part of the seam, as ``psmux_backend.py``
+    is); and the string-form command (``"tmux ls"``). These are live shapes, not
+    hypothetical ones: ``adapters/tmux_base.py`` itself rebinds
+    ``mux = self._BINARY`` and builds an f-string shell snippet from ``{mux}``.
+    This is a review tripwire, not a sandbox."""
+    heads: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            targets = node.targets
+        elif isinstance(node, ast.AnnAssign):
+            targets = [node.target]
+        else:
+            continue
+        value = node.value
+        if not isinstance(value, ast.Constant) or value.value != "tmux":
+            continue
+        for target in targets:
+            if isinstance(target, ast.Name):
+                heads.add(target.id)
+            elif isinstance(target, ast.Attribute):
+                heads.add(target.attr)
+    return heads
+
+
+def _signal_aliases(tree: ast.AST) -> tuple[set[str], set[str]]:
+    """``(module_aliases, signals_aliases)`` — the names this module can reach
+    ``SIGKILL`` through. ``module_aliases`` always holds ``signal`` (the plain
+    import, and the pre-widening detector's one spelling) plus every
+    ``import signal as X``; ``signals_aliases`` holds every
+    ``from signal import Signals [as Y]``, the enum whose ``.SIGKILL`` member is
+    just as absent on Windows.
+
+    NOT COVERED, deliberately — anything not named above is out, for example: a
+    rebinding alias (``sig = signal``, ``S = signal.Signals``); the enum's
+    subscript and value forms (``Signals["SIGKILL"]``, ``signal.Signals(9)``);
+    ``from signal import *``; ``vars(signal)["SIGKILL"]``;
+    ``operator.attrgetter("SIGKILL")``; and a qualified
+    ``builtins.getattr(signal, "SIGKILL")`` — a review tripwire, not a sandbox."""
+    modules = {"signal"}
+    signals: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            modules.update(a.asname for a in node.names if a.name == "signal" and a.asname)
+        elif isinstance(node, ast.ImportFrom) and node.module == "signal" and not node.level:
+            signals.update(a.asname or a.name for a in node.names if a.name == "Signals")
+    return modules, signals
+
+
+def _names_sigkill_holder(
+    node: ast.expr, module_aliases: set[str], signals_aliases: set[str]
+) -> bool:
+    """True when ``node`` is something ``SIGKILL`` is an attribute of: the
+    ``signal`` module under any import alias, its ``Signals`` enum reached
+    through such an alias, or a from-imported ``Signals``."""
+    if isinstance(node, ast.Name):
+        return node.id in module_aliases or node.id in signals_aliases
+    return (
+        isinstance(node, ast.Attribute)
+        and node.attr == "Signals"
+        and isinstance(node.value, ast.Name)
+        and node.value.id in module_aliases
+    )
 
 
 def _env_call_key_node(call: ast.Call) -> ast.expr | None:
@@ -2807,6 +3128,84 @@ def _consults_liveness_before(fn: ast.AST | None, lineno: int) -> bool:
     return False
 
 
+def _imported_module_names(tree: ast.AST) -> set[str]:
+    """Names this file binds with a plain ``import X`` / ``import X as Y`` — the
+    receivers whose ``.open`` is a module function (``os.open``, ``tarfile.open``,
+    ``webbrowser.open``) rather than ``Path.open``. ``import a.b`` binds ``a``."""
+    return {
+        alias.asname or alias.name.split(".", 1)[0]
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Import)
+        for alias in node.names
+    }
+
+
+def _call_arg(call: ast.Call, index: int, keyword: str) -> tuple[bool, ast.expr | None]:
+    """``(known, value)`` for one parameter of a call: the ``keyword=`` argument,
+    else the positional at ``index``. ``known`` is False when a ``*`` splat sits at
+    or before ``index`` and no keyword names the parameter — its value is then
+    unverifiable. ``(True, None)`` means the parameter is visibly not passed."""
+    for kw in call.keywords:
+        if kw.arg == keyword:
+            return True, kw.value
+    positional = call.args[: index + 1]
+    if any(isinstance(arg, ast.Starred) for arg in positional):
+        return False, None
+    return True, call.args[index] if len(call.args) > index else None
+
+
+def _encoding_less_text_io(call: ast.Call, module_names: set[str]) -> bool:
+    """Whether ``call`` opens, reads or writes a file in TEXT mode without an
+    explicit non-``None`` encoding — which decodes with the locale codepage on a
+    Windows host not in UTF-8 mode (the default until Python 3.15, PEP 686).
+
+    The shapes, with each one's ``(mode, encoding)`` positional slots:
+
+    * builtin ``open`` — the bare name, or ``io.open`` — ``(1, 3)``;
+    * ``.read_text`` — encoding at 0; ``.write_text`` — encoding at 1;
+    * ``.open`` on any receiver that is NOT a name the file binds with ``import``
+      — ``Path.open``, ``(0, 2)``. A module receiver (``os``, ``tarfile``,
+      ``webbrowser``) is a module function and is skipped.
+
+    A str-constant mode containing ``"b"`` is binary and skipped. A mode that is
+    not a constant flags anyway (a false positive is a review prompt), as does a
+    ``**`` splat or a ``*`` splat covering the encoding slot — unverifiable.
+
+    NOT COVERED: ``os.fdopen``, ``open`` rebound to another name, and
+    ``from io import open as o``; text-capable module functions the
+    imported-module exemption skips (``gzip`` / ``bz2`` / ``lzma`` / ``codecs``
+    ``.open``, ``builtins.open``, ``io.open`` under ``import io as x``); the unbound
+    ``Path.read_text(p)`` form; a parameter or local that shadows an imported module
+    name, since the import binding is file-wide rather than scope-aware; and text
+    I/O that is not a file open at all (``subprocess`` with ``text=True``,
+    ``tempfile.NamedTemporaryFile("w")``, ``io.TextIOWrapper``)."""
+    func = call.func
+    if isinstance(func, ast.Name) and func.id == "open":
+        mode_slot, encoding_slot = 1, 3
+    elif not isinstance(func, ast.Attribute):
+        return False
+    elif func.attr == "open" and isinstance(func.value, ast.Name) and func.value.id == "io":
+        mode_slot, encoding_slot = 1, 3
+    elif func.attr == "read_text":
+        mode_slot, encoding_slot = None, 0
+    elif func.attr == "write_text":
+        mode_slot, encoding_slot = None, 1
+    elif func.attr == "open" and not (
+        isinstance(func.value, ast.Name) and func.value.id in module_names
+    ):
+        mode_slot, encoding_slot = 0, 2
+    else:
+        return False
+    if mode_slot is not None:
+        _, mode = _call_arg(call, mode_slot, "mode")
+        if isinstance(mode, ast.Constant) and isinstance(mode.value, str) and "b" in mode.value:
+            return False
+    known, encoding = _call_arg(call, encoding_slot, "encoding")
+    if not known or encoding is None:
+        return True
+    return isinstance(encoding, ast.Constant) and encoding.value is None
+
+
 def _scan():
     """Single pass over the tree → list of (kind, rel, lineno, line_text)."""
     findings = []
@@ -2867,6 +3266,9 @@ def _scan_source(src: str, rel: str):
         and call.args
     }
     git_heads, git_commands = _git_name_bindings(tree)
+    tmux_heads = _tmux_head_names(tree)
+    signal_modules, signal_enums = _signal_aliases(tree)
+    module_names = _imported_module_names(tree)
 
     # Calls inside the value of a `probe = ...` assignment that sits inside the
     # `try` of a bare `except Exception` — `deferredwork.py`'s ADVISORY pre-lock
@@ -2989,9 +3391,19 @@ def _scan_source(src: str, rel: str):
         return lines[lineno - 1] if 1 <= lineno <= len(lines) else ""
 
     for node in ast.walk(tree):
+        # Text I/O with no explicit encoding — builtin/`io.open`, `.read_text`,
+        # `.write_text`, and `Path.open` on a non-module receiver; see
+        # `_encoding_less_text_io` for the shapes and what stays uncovered.
+        if isinstance(node, ast.Call) and _encoding_less_text_io(node, module_names):
+            findings.append(("encoding", rel, node.lineno, line_at(node.lineno)))
+
         # spawn-argv literals: ["tmux", ...] / ["git", ...] — each quarantined to
         # its owner. tmux matches lists only: the which-list *tuple*
-        # ("tmux", ...) is a real lookup shape in the tree. git matches tuples
+        # ("tmux", ...) is a real lookup shape in the tree. A tmux head resolves
+        # through the module's own bindings too — a name, or an attribute by its
+        # name, bound to "tmux" (`TMUX = "tmux"`, the backend's own
+        # `[self._BINARY, *argv]` — see `_tmux_head_names`, which also states
+        # what stays uncovered). git matches tuples
         # too — subprocess accepts any sequence, and git has no legitimate tuple
         # form to spare, so the tuple spelling of a bypass must not slip the
         # net. A path segment ("git" outside a sequence) and prose stay silent.
@@ -3002,10 +3414,10 @@ def _scan_source(src: str, rel: str):
         # exemption covers.
         if isinstance(node, (ast.List, ast.Tuple)) and node.elts:
             first = node.elts[0]
-            if (
-                isinstance(first, ast.Constant)
-                and first.value == "tmux"
-                and isinstance(node, ast.List)
+            if isinstance(node, ast.List) and (
+                (isinstance(first, ast.Constant) and first.value == "tmux")
+                or (isinstance(first, ast.Name) and first.id in tmux_heads)
+                or (isinstance(first, ast.Attribute) and first.attr in tmux_heads)
             ):
                 findings.append(("tmux", rel, node.lineno, line_at(node.lineno)))
             if (isinstance(first, ast.Constant) and first.value == "git") or (
@@ -3300,13 +3712,36 @@ def _scan_source(src: str, rel: str):
                     ("ledgerread", rel, node.lineno, line_at(node.lineno), fn_name, sanctioned)
                 )
 
-        # signal.SIGKILL attribute access (the guarded form is a "SIGKILL"
-        # *string* passed to getattr — not an attribute access — so it's clean)
+        # An unguarded SIGKILL — absent on Windows, so each spelling below raises
+        # there: the attribute on the `signal` module under any import alias, on
+        # its `Signals` enum (reached through such an alias, or from-imported
+        # under any name), a from-import of the name itself, and a `getattr` of
+        # it with no default. The guarded form — `getattr(signal, "SIGKILL",
+        # signal.SIGTERM)`, a string plus a fallback — stays clean, and so does
+        # the module constant it produces (`process_host.SIGKILL`, a bare
+        # `SIGKILL` name). See `_signal_aliases` for what stays uncovered.
         if (
             isinstance(node, ast.Attribute)
             and node.attr == "SIGKILL"
-            and isinstance(node.value, ast.Name)
-            and node.value.id == "signal"
+            and _names_sigkill_holder(node.value, signal_modules, signal_enums)
+        ):
+            findings.append(("sigkill", rel, node.lineno, line_at(node.lineno)))
+        if (
+            isinstance(node, ast.ImportFrom)
+            and node.module == "signal"
+            and not node.level
+            and any(a.name == "SIGKILL" for a in node.names)
+        ):
+            findings.append(("sigkill", rel, node.lineno, line_at(node.lineno)))
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "getattr"
+            and len(node.args) == 2
+            and not node.keywords
+            and _names_sigkill_holder(node.args[0], signal_modules, signal_enums)
+            and isinstance(node.args[1], ast.Constant)
+            and node.args[1].value == "SIGKILL"
         ):
             findings.append(("sigkill", rel, node.lineno, line_at(node.lineno)))
 
@@ -3651,8 +4086,13 @@ def _of(kind: str):
 
 
 def test_no_tmux_invocation_outside_backend():
-    """Only the tmux backend may build a ``["tmux", ...]`` argv — every other call
-    site goes through the multiplexer seam."""
+    """Only the tmux backend may build a tmux argv — every other call site goes
+    through the multiplexer seam. A tmux argv is a LIST headed by the ``"tmux"``
+    literal or by a name / attribute the module binds to it (``TMUX = "tmux"``;
+    the backend's own ``_BINARY = "tmux"`` read as ``[self._BINARY, *argv]``).
+    NOT COVERED: rebinding aliases and string-form commands (see
+    ``_tmux_head_names``). ``test_tmux_detector_sees_the_backends_own_spelling``
+    keeps this green-for-a-reason rather than green for want of findings."""
     offenders = [(rel, ln, txt) for _, rel, ln, txt in _of("tmux") if rel not in TMUX_BACKENDS]
     assert not offenders, (
         "tmux invoked outside the tmux backend (adapters/tmux_base.py, "
@@ -3979,6 +4419,88 @@ def test_verify_command_results_outcome_called_only_from_its_two_compositions():
         "repo_root (#695):\n"
         + "\n".join(f"  {rel}:{ln}: {txt.strip()}" for rel, ln, txt in offenders)
     )
+
+
+# DW-523: every composition that runs `[verify] commands` runs the environment
+# preflight first. `(file, class or None, function)` -> where it must call one of
+# `ENV_PREFLIGHT_CALLS`. A new composition is a decision to add a row here.
+ENV_PREFLIGHT_COMPOSITIONS = (
+    ("verify.py", None, "verify_commands_outcome"),
+    ("engine.py", "Engine", "_verify_commands_with_results"),
+    ("cli.py", None, "_reverify"),
+)
+ENV_PREFLIGHT_CALLS = frozenset({"run_environment_probes", "_run_environment_probes"})
+
+
+def _calls_env_preflight(tree: ast.Module, cls: str | None, name: str) -> bool | None:
+    """Whether ``cls.name`` (or module-level ``name``) calls a preflight runner;
+    None when the function is not found at all (a rename must not read as a pass)."""
+    scope: list[ast.stmt] = tree.body
+    if cls is not None:
+        owner = next((n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == cls), None)
+        if owner is None:
+            return None
+        scope = owner.body
+    fn = next(
+        (
+            n
+            for n in scope
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == name
+        ),
+        None,
+    )
+    if fn is None:
+        return None
+    for node in ast.walk(fn):
+        if isinstance(node, ast.Call):
+            callee = node.func
+            called = callee.id if isinstance(callee, ast.Name) else getattr(callee, "attr", None)
+            if called in ENV_PREFLIGHT_CALLS:
+                return True
+    return False
+
+
+def test_every_verify_composition_runs_the_environment_preflight():
+    """`verify_commands_outcome` (the three review gates), the engine's dev/fix
+    composition, and `cli._reverify` each run `[environment] probes` before any
+    `[verify]` command (DW-523). A composition that skipped it would run the
+    commands in an environment the operator declared a check for, and charge a
+    story for an outage. Ablation: delete the probe call from any of the three
+    and its row is named here."""
+    offenders = []
+    for rel, cls, name in ENV_PREFLIGHT_COMPOSITIONS:
+        tree = ast.parse((SRC / rel).read_text(encoding="utf-8"), filename=rel)
+        found = _calls_env_preflight(tree, cls, name)
+        if found is not True:
+            where = f"{cls}.{name}" if cls else name
+            offenders.append(f"{rel}:{where}: {'not found' if found is None else 'no preflight'}")
+    assert not offenders, (
+        "a [verify] composition no longer runs the environment preflight "
+        "(run_environment_probes / Engine._run_environment_probes):\n  " + "\n  ".join(offenders)
+    )
+
+
+def test_env_preflight_detector_sees_a_missing_call():
+    """The guard above asserts a PRESENCE per row; feed its detector the three
+    shapes it must tell apart, so a detector that always answered True (or never
+    found the function) cannot pass it."""
+    with_call = ast.parse(
+        "class Engine:\n"
+        "    def _verify_commands_with_results(self):\n"
+        "        self._run_environment_probes(task, site='x')\n"
+        "def _reverify():\n"
+        "    verify.run_environment_probes(pol, cwd)\n"
+    )
+    without = ast.parse(
+        "class Engine:\n"
+        "    def _verify_commands_with_results(self):\n"
+        "        verify.run_verify_commands(self.policy, root)\n"
+    )
+    assert _calls_env_preflight(with_call, "Engine", "_verify_commands_with_results") is True
+    assert _calls_env_preflight(with_call, None, "_reverify") is True
+    assert _calls_env_preflight(without, "Engine", "_verify_commands_with_results") is False
+    assert _calls_env_preflight(without, None, "_reverify") is None
+    assert _calls_env_preflight(without, "Missing", "_verify_commands_with_results") is None
 
 
 def test_spec_path_resolved_only_through_the_anchor():
@@ -5267,11 +5789,15 @@ def test_no_hardcoded_posix_paths():
 
 
 def test_no_unguarded_sigkill():
-    """``signal.SIGKILL`` is absent on Windows — reference it only via the
-    ``getattr(signal, "SIGKILL", signal.SIGTERM)`` guard, never as a bare
-    attribute access."""
+    """``SIGKILL`` is absent on Windows — reference it only via the
+    ``getattr(signal, "SIGKILL", signal.SIGTERM)`` guard (or the module constant
+    that guard produces), never unguarded: not as ``signal.SIGKILL`` under any
+    ``import signal as X`` alias, not through the ``Signals`` enum, not as a
+    ``from signal import SIGKILL``, and not as a ``getattr`` with no default.
+    NOT COVERED: rebinding aliases (``sig = signal``) and ``Signals["SIGKILL"]``
+    (see ``_signal_aliases``)."""
     offenders = _of("sigkill")
-    assert not offenders, "unguarded signal.SIGKILL attribute access:\n" + "\n".join(
+    assert not offenders, "unguarded SIGKILL reference:\n" + "\n".join(
         f"  {rel}:{ln}: {txt.strip()}" for _, rel, ln, txt in offenders
     )
 
@@ -5317,15 +5843,368 @@ def test_start_new_session_only_in_detach_helpers():
 
 
 def test_shell_true_only_in_sanctioned_spots():
-    """``shell=True`` only in the two operator-authored-command spots, each line
-    carrying a `# portability:` ack."""
+    """``shell=True`` only in the sanctioned operator-authored-command spot (the
+    stop-aware child runner), each line carrying a `# portability:` ack."""
     bad = []
     for _, rel, ln, txt in _of("shell"):
         if rel not in SHELL_ALLOW:
             bad.append(f"  {rel}:{ln}: {txt.strip()}  (not a sanctioned shell spot)")
         elif ACK not in txt:
             bad.append(f"  {rel}:{ln}: {txt.strip()}  (missing '{ACK}' ack)")
-    assert not bad, "shell=True outside verify.py / plugins/bus.py:\n" + "\n".join(bad)
+    assert not bad, "shell=True outside childrun.py:\n" + "\n".join(bad)
+
+
+# The probe matrix for the seven older tripwires above — tmux, path, sigkill,
+# killprobe, oskill, detach, shell — as `(kind, label, source)` rows. Those guards
+# predate the probe bar, and each tree-wide test is green both when the invariant
+# holds and when its detector branch has silently stopped detecting: before these
+# rows, deleting any of the seven branches left this file green, and the tmux and
+# sigkill detectors flagged nothing on the real tree at all. Every row runs through
+# `_scan_source`, the real scan path. Fix order when a new form turns up: add the
+# row here FIRST and watch it fail.
+_TMUX_CLASS_ATTR_SRC = (
+    "import subprocess\n"
+    "class Backend:\n"
+    '    _BINARY = "tmux"\n'
+    "    def run(self, *argv):\n"
+    "        return subprocess.run([self._BINARY, *argv])\n"
+)
+OLDER_TRIPWIRE_PROBES = [
+    # tmux — a list head that is the literal, or a name / attribute the module
+    # itself binds to "tmux" (see `_tmux_head_names`).
+    ("tmux", "literal-head", 'import subprocess\nsubprocess.run(["tmux", "ls"])\n'),
+    (
+        "tmux",
+        "module-constant",
+        'import subprocess\nTMUX = "tmux"\nsubprocess.run([TMUX, "ls"])\n',
+    ),
+    ("tmux", "annotated-constant", 'TMUX: str = "tmux"\nargv = [TMUX, "ls"]\n'),
+    # Any binding qualifies the name — a rebind must not launder it.
+    ("tmux", "rebound-constant", 'TMUX = "tmux"\nTMUX = "other"\nargv = [TMUX, "ls"]\n'),
+    # The backend's own spelling: a class constant read through `self`. `cls.` and
+    # `ClassName.` are the same constant, so the head resolves by attribute NAME.
+    ("tmux", "class-attr-head", _TMUX_CLASS_ATTR_SRC),
+    (
+        "tmux",
+        "class-attr-via-cls",
+        _TMUX_CLASS_ATTR_SRC.replace(
+            "    def run(self, *argv):\n", "    @classmethod\n    def run(cls, *argv):\n"
+        ).replace("self._BINARY", "cls._BINARY"),
+    ),
+    (
+        "tmux",
+        "class-attr-via-classname",
+        _TMUX_CLASS_ATTR_SRC.replace("self._BINARY", "Backend._BINARY"),
+    ),
+    (
+        "tmux",
+        "instance-attr-binding",
+        'class B:\n    def __init__(self):\n        self.exe = "tmux"\n'
+        '    def argv(self):\n        return [self.exe, "ls"]\n',
+    ),
+    # path — each POSIX root, whole and as a subpath.
+    ("path", "tmp", 'd = "/tmp"\n'),
+    ("path", "tmp-subpath", 'd = "/tmp/x"\n'),
+    ("path", "proc-subpath", 'f = open("/proc/1/stat")\n'),
+    ("path", "dev-null", 'sink = open("/dev/null", "w")\n'),
+    # sigkill — the literal spelling and every unguarded non-literal one.
+    ("sigkill", "literal", "import os, signal\nos.kill(pid, signal.SIGKILL)\n"),
+    ("sigkill", "module-alias", "import signal as sig\nx = sig.SIGKILL\n"),
+    ("sigkill", "from-import", "from signal import SIGKILL\n"),
+    ("sigkill", "from-import-aliased", "from signal import SIGTERM, SIGKILL as K\n"),
+    ("sigkill", "signals-enum", "import signal\nx = signal.Signals.SIGKILL\n"),
+    ("sigkill", "signals-enum-via-alias", "import signal as sig\nx = sig.Signals.SIGKILL\n"),
+    ("sigkill", "signals-from-import", "from signal import Signals\nx = Signals.SIGKILL\n"),
+    (
+        "sigkill",
+        "signals-from-import-aliased",
+        "from signal import Signals as S\nx = S.SIGKILL\n",
+    ),
+    # getattr with no default raises AttributeError on Windows exactly like the
+    # attribute access does — it is the guard's shape minus the guard.
+    ("sigkill", "getattr-no-default", 'import signal\nx = getattr(signal, "SIGKILL")\n'),
+    ("sigkill", "getattr-no-default-alias", 'import signal as sig\nx = getattr(sig, "SIGKILL")\n'),
+    (
+        "sigkill",
+        "getattr-signals-no-default",
+        'import signal\nx = getattr(signal.Signals, "SIGKILL")\n',
+    ),
+    (
+        "sigkill",
+        "getattr-signals-alias-no-default",
+        'from signal import Signals\nx = getattr(Signals, "SIGKILL")\n',
+    ),
+    # killprobe — the signal-0 existence probe.
+    ("killprobe", "signal-zero", "import os\nos.kill(pid, 0)\n"),
+    # oskill — any os.kill, probe and real send alike.
+    ("oskill", "signal-zero", "import os\nos.kill(pid, 0)\n"),
+    ("oskill", "sigterm", "import os, signal\nos.kill(pid, signal.SIGTERM)\n"),
+    # detach — the kwarg and the detach-kwargs dict.
+    (
+        "detach",
+        "kwarg",
+        'import subprocess\nsubprocess.Popen(["x"], start_new_session=True)\n',
+    ),
+    ("detach", "dict-literal", 'kwargs = {"start_new_session": True}\n'),
+    # shell — the kwarg.
+    ("shell", "kwarg", "import subprocess\nsubprocess.run(cmd, shell=True)\n"),
+]
+OLDER_TRIPWIRE_NON_PROBES = [
+    # tmux — the detector is list-only: the which-TUPLE is a real lookup shape.
+    (
+        "tmux",
+        "which-tuple",
+        'import shutil\nok = all(shutil.which(e) for e in ("tmux", "psmux"))\n',
+    ),
+    ("tmux", "which-call", 'import shutil\nok = shutil.which("tmux") is not None\n'),
+    # A class constant bound to a DIFFERENT executable (the psmux backend's own
+    # spelling) and a head the module never binds at all stay silent — the reach
+    # is exactly the names the module ties to "tmux".
+    ("tmux", "psmux-class-attr", _TMUX_CLASS_ATTR_SRC.replace('"tmux"', '"psmux"')),
+    (
+        "tmux",
+        "unbound-head",
+        'import subprocess\ndef run(exe):\n    return subprocess.run([exe, "ls"])\n',
+    ),
+    ("tmux", "prose", 'def f():\n    """Spawns tmux via the backend."""\n    return 1\n'),
+    # path — prose, a shell string that merely CONTAINS /dev/null, and a
+    # lookalike whose `tmp` is not the root.
+    ("path", "docstring-prose", 'def f():\n    """Writes under /tmp/x."""\n    return 1\n'),
+    ("path", "shell-redirect", 'cmd = "command -v foo 2>/dev/null"\n'),
+    ("path", "home-tmp-lookalike", 'p = "~/.gemini/tmp/session"\n'),
+    # sigkill — the guarded getattr, the module constant it produces (and that
+    # constant's use and re-export), and prose.
+    (
+        "sigkill",
+        "guarded-getattr",
+        'import signal\nK = getattr(signal, "SIGKILL", signal.SIGTERM)\n',
+    ),
+    (
+        "sigkill",
+        "guarded-constant-use",
+        "import os, signal\n"
+        'SIGKILL = getattr(signal, "SIGKILL", signal.SIGTERM)\n'
+        "os.kill(pid, SIGKILL)\n",
+    ),
+    ("sigkill", "reexported-constant", "import process_host\nx = process_host.SIGKILL\n"),
+    # The from-import arm is keyed to the stdlib `signal` module itself: importing
+    # the guarded constant from another module, or from a relative `.signal`, is
+    # not the unguarded name.
+    ("sigkill", "from-import-guarded-constant", "from bmad_loop.process_host import SIGKILL\n"),
+    ("sigkill", "from-import-relative-signal", "from .signal import SIGKILL\n"),
+    ("sigkill", "prose", 'MSG = "escalating SIGTERM to SIGKILL"\n'),
+    ("sigkill", "other-signal", "from signal import SIGTERM\nimport signal\nx = signal.SIGINT\n"),
+    # killprobe — a real signal send is not the existence probe, and the bool
+    # spelling is excluded by the detector on purpose. Neither escapes: both are
+    # `oskill` findings, which confines every os.kill to process_host.py.
+    ("killprobe", "real-signal", "import os, signal\nos.kill(pid, signal.SIGTERM)\n"),
+    ("killprobe", "bool-signal", "import os\nos.kill(pid, False)\n"),
+    # oskill — a Popen/psutil `.kill()` is not os.kill.
+    ("oskill", "process-kill-method", "proc.kill()\n"),
+    # detach / shell — the explicit False spelling.
+    (
+        "detach",
+        "kwarg-false",
+        'import subprocess\nsubprocess.Popen(["x"], start_new_session=False)\n',
+    ),
+    ("detach", "dict-false", 'kwargs = {"start_new_session": False}\n'),
+    ("shell", "kwarg-false", 'import subprocess\nsubprocess.run(["x"], shell=False)\n'),
+]
+OLDER_TRIPWIRE_KINDS = ("tmux", "path", "sigkill", "killprobe", "oskill", "detach", "shell")
+
+
+def test_older_tripwire_probe_tables_cover_every_kind():
+    """Each of the seven older detectors has at least one must-flag and one
+    must-stay-silent row — the floor that stops a kind silently dropping out of
+    the matrix (and a parametrize over an empty slice passing vacuously)."""
+    probed = Counter(row[0] for row in OLDER_TRIPWIRE_PROBES)
+    silenced = Counter(row[0] for row in OLDER_TRIPWIRE_NON_PROBES)
+    missing = [
+        (kind, table)
+        for kind in OLDER_TRIPWIRE_KINDS
+        for table, counts in (("probe", probed), ("non-probe", silenced))
+        if counts[kind] < 1
+    ]
+    assert not missing, f"older-tripwire kinds with no row: {missing}"
+    stray = (set(probed) | set(silenced)) - set(OLDER_TRIPWIRE_KINDS)
+    assert not stray, f"rows for a kind outside the seven: {sorted(stray)}"
+
+
+@pytest.mark.parametrize(
+    ("kind", "label", "source"),
+    OLDER_TRIPWIRE_PROBES,
+    ids=[f"{kind}-{label}" for kind, label, _ in OLDER_TRIPWIRE_PROBES],
+)
+def test_older_tripwire_detectors_flag_every_claimed_shape(kind, label, source):
+    """Each claimed shape produces a finding of its kind, driven through the same
+    `_scan_source` the real scan uses.
+
+    Ablation: delete any one of the seven detector branches in `_scan_source` —
+    or, singly, one arm of a widened one (the tmux Name head, the tmux Attribute
+    head, the sigkill attribute / from-import / getattr arm, either detach form)
+    — and that branch's rows here fail."""
+    found = [f for f in _scan_source(source, "probe.py") if f[0] == kind]
+    assert found, f"the {label!r} shape produced no `{kind}` finding:\n{source}"
+
+
+@pytest.mark.parametrize(
+    ("kind", "label", "source"),
+    OLDER_TRIPWIRE_NON_PROBES,
+    ids=[f"{kind}-{label}" for kind, label, _ in OLDER_TRIPWIRE_NON_PROBES],
+)
+def test_older_tripwire_detectors_stay_silent_on_lookalikes(kind, label, source):
+    """The complement: prose, lookalike strings, the guarded spellings and the
+    explicit-False kwargs produce no finding of the row's kind — flagging them
+    would get the allowlist widened until it means nothing.
+
+    Ablations: drop the tmux branch's `ast.List` check and `tmux-which-tuple`
+    fails; loosen the sigkill getattr arm to `len(node.args) >= 2` and both
+    guarded rows fail (as does the tree-wide guard, on process_host.py); drop the
+    sigkill from-import arm's `node.module == "signal"` filter and
+    `sigkill-from-import-guarded-constant` fails, or its `not node.level` filter
+    and `sigkill-from-import-relative-signal` fails; drop the killprobe branch's
+    `is not False` and `killprobe-bool-signal` fails."""
+    found = [f for f in _scan_source(source, "probe.py") if f[0] == kind]
+    assert not found, f"the {label!r} shape was flagged as `{kind}`:\n{source}"
+
+
+def test_tmux_detector_sees_the_backends_own_spelling():
+    """The backend spawns ``[self._BINARY, *argv]`` with ``_BINARY = "tmux"`` — the
+    idiom a new module would copy. The detector must see it in the backend itself;
+    otherwise ``test_no_tmux_invocation_outside_backend`` is vacuous, green for want
+    of any finding rather than because every finding sits in a backend file."""
+    rels = {rel for _, rel, *_ in _of("tmux")}
+    assert "adapters/tmux_base.py" in rels, (
+        "the tmux detector no longer flags the backend's own `[self._BINARY, ...]` "
+        f"spawn; files it did flag: {sorted(rels)}"
+    )
+
+
+def test_text_io_pins_an_encoding():
+    """Every text-mode ``open`` / ``Path.open`` / ``read_text`` / ``write_text`` in
+    ``src/bmad_loop`` names an explicit, non-``None`` encoding. Without one, Python
+    decodes with the locale codepage on a Windows host that is not in UTF-8 mode —
+    the default until Python 3.15 (PEP 686) — so a non-ASCII byte becomes mojibake
+    or a ``UnicodeDecodeError`` there and nowhere else. No allowlist: the tree has
+    zero offenders. Shapes and the uncovered spellings: ``_encoding_less_text_io``.
+
+    Ablation: drop the ``encoding="utf-8"`` from any ``read_text`` in src and this
+    test fails naming that file:line."""
+    offenders = _of("encoding")
+    assert not offenders, (
+        'text I/O without an explicit encoding — pin `encoding="utf-8"` (the locale '
+        "codepage is the default on Windows until Python 3.15, PEP 686):\n"
+        + "\n".join(f"  {rel}:{ln}: {txt.strip()}" for _, rel, ln, txt in offenders)
+    )
+
+
+# The release scripts read and write CHANGELOG.md (non-ASCII em dashes),
+# pyproject.toml, module.yaml and marketplace.json. They live outside `SRC`, so the
+# tree-wide scan never sees them; this names them explicitly.
+RELEASE_SCRIPTS = ("scripts/release.py", "scripts/sync_version.py")
+
+
+def test_release_scripts_pin_text_encoding():
+    """The encoding guard, run over the two release scripts: their own file reads
+    and writes of CHANGELOG.md and the version files must not go through the locale
+    codepage on a Windows host.
+
+    Ablation: drop one ``encoding="utf-8"`` from ``scripts/release.py`` and this
+    fails naming that line."""
+    root = Path(__file__).resolve().parent.parent
+    offenders = [
+        f"  {rel}:{ln}: {txt.strip()}"
+        for rel in RELEASE_SCRIPTS
+        for kind, _, ln, txt, *_ in _scan_source((root / rel).read_text(encoding="utf-8"), rel)
+        if kind == "encoding"
+    ]
+    assert not offenders, 'release-script text I/O without `encoding="utf-8"`:\n' + "\n".join(
+        offenders
+    )
+
+
+# Must-flag / must-stay-silent rows for the encoding detector, `(label, source)`,
+# each driven through `_scan_source`. One row per shape `_encoding_less_text_io`
+# claims, and one per lookalike it must leave alone.
+ENCODING_PROBES = [
+    ("builtin-open-default-mode", "f = open(p)\n"),
+    ("builtin-open-write", 'f = open(p, "w")\n'),
+    ("builtin-open-mode-keyword", 'f = open(p, mode="w")\n'),
+    ("io-open", "import io\nf = io.open(p)\n"),
+    ("path-read-text", "s = p.read_text()\n"),
+    ("path-write-text", "p.write_text(s)\n"),
+    ("path-open-default-mode", "f = p.open()\n"),
+    ("path-open-append", 'f = p.open("a")\n'),
+    ("path-open-on-call-receiver", 'from pathlib import Path\nf = Path(x).open("w")\n'),
+    ("path-open-on-attribute-receiver", "f = self._file.open()\n"),
+    ("explicit-encoding-none", "s = p.read_text(encoding=None)\n"),
+    ("positional-encoding-none", "s = p.read_text(None)\n"),
+    ("non-constant-mode", "f = open(p, mode)\n"),
+    ("kwargs-splat", "f = open(p, **kw)\n"),
+    ("args-splat-over-encoding", "f = open(*args)\n"),
+    ("args-splat-at-encoding-slot", 'f = open(p, "w", -1, *rest)\n'),
+    ("read-text-args-splat", "s = p.read_text(*args)\n"),
+    ("write-text-encoding-none", "p.write_text(s, encoding=None)\n"),
+    ("write-text-positional-encoding-none", "p.write_text(s, None)\n"),
+    ("text-mode-constant", 'f = open(p, "rt")\n'),
+    ("multi-line-call", "s = (\n    p.read_text()\n)\n"),
+]
+ENCODING_NON_PROBES = [
+    ("builtin-open-pinned", 'f = open(p, "w", encoding="utf-8")\n'),
+    ("read-text-pinned-variable", "s = p.read_text(encoding=enc)\n"),
+    ("builtin-open-positional-encoding", 'f = open(p, "r", -1, "utf-8")\n'),
+    ("read-text-positional-encoding", 's = p.read_text("utf-8")\n'),
+    ("write-text-positional-encoding", 'p.write_text(s, "utf-8")\n'),
+    ("write-text-pinned", 'p.write_text(s, encoding="utf-8")\n'),
+    ("path-open-positional-encoding", 'f = p.open("r", -1, "utf-8")\n'),
+    ("io-open-pinned", 'import io\nf = io.open(p, encoding="utf-8")\n'),
+    ("kwargs-splat-with-explicit-encoding", 'f = open(p, encoding="utf-8", **kw)\n'),
+    ("builtin-open-binary", 'f = open(p, "rb")\n'),
+    ("path-open-binary", 'f = p.open("wb")\n'),
+    ("builtin-open-binary-keyword", 'f = open(p, mode="rb")\n'),
+    ("path-open-append-binary", 'f = p.open("ab")\n'),
+    ("builtin-open-update-binary", 'f = open(p, "r+b")\n'),
+    ("os-open", "import os\nfd = os.open(p, flags)\n"),
+    ("tarfile-open", "import tarfile\nt = tarfile.open(p)\n"),
+    ("webbrowser-open", "import webbrowser\nwebbrowser.open(u)\n"),
+    ("aliased-module-open", "import tarfile as tf\nt = tf.open(p)\n"),
+    ("dotted-import-open", "import os.path\nfd = os.open(p, flags)\n"),
+    (
+        "docstring-prose",
+        'def f():\n    """Calls p.read_text() and open(p)."""\n    return 1\n',
+    ),
+    ("string-prose", 'MSG = "p.read_text() without an encoding"\n'),
+]
+
+
+def test_encoding_probe_tables_are_not_empty():
+    """The floor that stops a parametrize over an empty table passing vacuously."""
+    assert ENCODING_PROBES, "ENCODING_PROBES is empty"
+    assert ENCODING_NON_PROBES, "ENCODING_NON_PROBES is empty"
+
+
+@pytest.mark.parametrize(
+    ("label", "source"), ENCODING_PROBES, ids=[label for label, _ in ENCODING_PROBES]
+)
+def test_encoding_detector_flags_every_claimed_shape(label, source):
+    """Each claimed encoding-less text-I/O shape produces an ``encoding`` finding,
+    through the same ``_scan_source`` the real scan uses."""
+    found = [f for f in _scan_source(source, "probe.py") if f[0] == "encoding"]
+    assert found, f"the {label!r} shape produced no `encoding` finding:\n{source}"
+
+
+@pytest.mark.parametrize(
+    ("label", "source"), ENCODING_NON_PROBES, ids=[label for label, _ in ENCODING_NON_PROBES]
+)
+def test_encoding_detector_stays_silent_on_lookalikes(label, source):
+    """Pinned encodings (keyword or positional), binary modes, module-level
+    ``open`` functions and prose produce no ``encoding`` finding.
+
+    Ablations: drop the binary-mode skip and the ``*-binary`` rows fail; drop the
+    imported-module receiver check and ``os-open`` / ``tarfile-open`` /
+    ``webbrowser-open`` fail."""
+    found = [f for f in _scan_source(source, "probe.py") if f[0] == "encoding"]
+    assert not found, f"the {label!r} shape was flagged as `encoding`:\n{source}"
 
 
 def test_bmad_loop_env_reads_only_in_the_registry():
@@ -5657,14 +6536,21 @@ GIT_SCOPE_CASES = [
         'proc = _run_git(["git", "fetch"], repo)\n',
         True,
     ),
-    # The string form is refused inside verify.py too — there `shell=True` is
-    # allowlisted (SHELL_ALLOW), so without this the spelling would slip both
-    # tripwires at once; it can never be the chokepoint's feed position, since
-    # `_run_git` takes a sequence.
+    # The string form is refused inside verify.py too; it can never be the
+    # chokepoint's feed position, since `_run_git` takes a sequence.
     (
         "verify-string-shell",
         "verify.py",
         'import subprocess\nsubprocess.run("git status", shell=True)\n',
+        True,
+    ),
+    # …and inside childrun.py, the one file where `shell=True` is allowlisted
+    # (SHELL_ALLOW, DW-353) — without this the spelling would slip both tripwires
+    # at once there.
+    (
+        "childrun-string-shell",
+        "childrun.py",
+        'import subprocess\nsubprocess.Popen("git status", shell=True)\n',
         True,
     ),
 ]
@@ -7579,6 +8465,7 @@ def prune_preserve_refs(self):
     for family, prune in (
         ("attempt-preserve", verify.prune_preserve_refs),
         ("attempt-preserve-dirty", verify.prune_preserve_dirty_refs),
+        ("merge-preflight-preserve", verify.prune_merge_preflight_preserve_refs),
     ):
         try:
             deleted = prune(root, keep)
@@ -7666,7 +8553,9 @@ def test_journal_minted_kind_probes_expand_the_fstring():
 
     bare_target = (
         "def prune_preserve_refs(self):\n"
-        '    for family in ("attempt-preserve", "attempt-preserve-dirty"):\n'
+        "    for family in (\n"
+        '        "attempt-preserve", "attempt-preserve-dirty", "merge-preflight-preserve"\n'
+        "    ):\n"
         '        self.journal.append(f"{family}-pruned", count=n)\n'
     )
     assert _minted_spellings(bare_target) == {s for s in _MINTED_SPELLINGS if s.endswith("-pruned")}
@@ -7675,7 +8564,7 @@ def test_journal_minted_kind_probes_expand_the_fstring():
         "def prune_preserve_refs(self):\n"
         '    for family in ("attempt-preserve",):\n'
         "        pass\n"
-        '    for family in ("attempt-preserve-dirty",):\n'
+        '    for family in ("attempt-preserve-dirty", "merge-preflight-preserve"):\n'
         '        self.journal.append(f"{family}-pruned", count=n)\n'
     )
     assert _minted_spellings(two_loops) == {s for s in _MINTED_SPELLINGS if s.endswith("-pruned")}

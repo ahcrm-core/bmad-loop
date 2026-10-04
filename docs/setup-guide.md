@@ -177,6 +177,34 @@ worktree along with `_bmad/custom/`, so an isolated run resolves the same layers
 `validate` checked — including from the gitignored `*.user.toml`, which a fresh checkout
 would not carry.
 
+### Pointing retrospectives at run journals
+
+`bmad-retrospective` reads session logs as evidence for its process lessons: why a
+session stalled, what it tried and dropped. It doesn't know where bmad-loop keeps them,
+so on an epic bmad-loop drove it finds none and skips that analysis. bmad-loop ships no
+override for this (DW-387). To point the skill at the run records, create
+`_bmad/custom/bmad-retrospective.toml` yourself, or `bmad-retrospective.user.toml` for a
+personal copy:
+
+```toml
+[workflow]
+persistent_facts = [
+  "Session logs for bmad-loop-driven stories are the bmad-loop run directories, .bmad-loop/runs/<run-id>/ under {project-root}. journal.jsonl is one JSON event per line: a session-start (task_id, role, story_key, adapter, model) and a session-end (task_id, tokens, and a status of completed, stalled, timeout, crashed, over_budget or aborted) per coding-CLI session, joined on task_id since session-end carries no story_key, plus review results and retries, rollbacks, pauses and escalations. logs/<task-id>.log is that session's raw terminal capture (tmux pane output including escape sequences and repaints; for the hookless opencode profile, a readable transcript), and the journal's log_task / log_pos fields give the log file and byte offset each event lines up with. state.json records the run's stories and their outcome. Find the runs for this epic by grepping journal.jsonl files for its story keys. Runs archived by bmad-loop archive or bmad-loop clean are .bmad-loop/archive/<run-id>.tar.gz and still hold journal.jsonl, state.json and logs/: search inside them as well. Record a session-log gap only for runs that were deleted.",
+]
+```
+
+`persistent_facts` appends to the skill's defaults, so this fact adds to any others you
+already set. Don't use a `file:` glob such as `file:.bmad-loop/runs/*/journal.jsonl`
+instead: it would load every run's full journal into the retro's context.
+
+The records last only as long as the run directory or its archive. `bmad-loop clean`
+compresses finished runs outside the retention window to `.bmad-loop/archive/` (with
+`--hard`, or with `[cleanup] archive_old = false`, it deletes them), and `bmad-loop archive`
+does the same for a single run. Both the retro and the fact above can still read an
+archived run. `delete`, and a `clean` that deletes, remove a run for good.
+`clean --keep <run-id>` protects a run for that one invocation only, so pass it every
+time or retro the epic before its runs are deleted.
+
 ## Choosing which CLIs to drive
 
 The supported adapters are `claude` (the default), `codex`, `gemini`, `copilot`,
@@ -289,9 +317,18 @@ them to whoever owns the machine:
   - **Trust is exact-path.** `settings.json` `trustedWorkspaces` matches whole paths —
     trusting a parent does _not_ cover its subdirectories, and
     `--dangerously-skip-permissions` does not bypass the dialog (it covers tool
-    permissions only). So antigravity needs `isolation = "none"` (the default);
-    **`isolation = "worktree"` will hang**, because each worktree is a fresh untrusted
-    path under `.bmad-loop/runs/`. See [#169](https://github.com/bmad-code-org/bmad-loop/issues/169).
+    permissions only). `isolation = "none"` (the default) works once the project root
+    is trusted. **`isolation = "worktree"` works too**, as long as the project root is
+    trusted: after provisioning each unit worktree, bmad-loop appends its path to
+    `~/.gemini/antigravity-cli/settings.json` `trustedWorkspaces` before any session
+    launches (journaled `worktree-trust-seeded`). It only ever extends a grant you
+    already made — with the root untrusted nothing is written
+    (`worktree-trust-unseeded`) and the session will hang on the dialog. Check a path
+    with `bmad-loop probe-adapter antigravity --workspace <path>` (exit `0` = trusted).
+    **Known limitation:** entries are never removed when a worktree is torn down, so
+    `trustedWorkspaces` accumulates one entry per unit — prune stale
+    `.bmad-loop/runs/` paths by hand if the list grows. See
+    [#169](https://github.com/bmad-code-org/bmad-loop/issues/169) / DW-390.
   - **Token usage is not recorded** (`usage_parser = "none"`) — and this is permanent,
     not a gap: agy's transcript carries no usage data at all (it counts tokens only in
     an internal SQLite/protobuf store). Runs work; the token columns stay empty.

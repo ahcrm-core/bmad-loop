@@ -28,6 +28,11 @@ key = "retrospective"
 kind = "select"
 options_ref = "RETRO_MODES"
 default_ref = "GatesPolicy.retrospective"
+description = "at each epic boundary, and at run end for a finished last epic: never, notify (suggest /bmad-retrospective), or auto (run a headless /bmad-retrospective session on [adapter.retro] and commit its doc + board)"
+# `on_escalation` is reserved and deliberately has no field here (HIDDEN in
+# tests/test_settings_schema.py): `pause` is its only documented value and the
+# default. policy.py parses it, but nothing reads it — CRITICAL escalations
+# always pause, whatever it is set to (DW-376).
 
 [[section]]
 name = "review"
@@ -209,6 +214,29 @@ minimum = 0
 default_ref = "VerifyPolicy.stream_capture_kb"
 label = "verifier stream capture (KiB)"
 description = "per-stream cap on the verifier stdout/stderr retained under the run's verify/ directory (the tail is kept; the journal records the full size and a truncation flag) · 0 = capture nothing"
+[[section.field]]
+key = "env_fault_rc"
+kind = "int"
+minimum = 0
+maximum = 255
+default_ref = "VerifyPolicy.env_fault_rc"
+label = "environment-fault exit status"
+description = "exit status a verify command uses to declare an environment fault (pause, attempt not charged) instead of a code failure · 0 = disabled; 75 (EX_TEMPFAIL) is a good choice"
+
+[[section]]
+name = "environment"
+description = "environment health probes (run before verify, session launches, and charging a failed attempt)"
+[[section.field]]
+key = "probes"
+kind = "lines"
+description = "health-check commands run in the project root; a failing probe (nonzero exit, timeout, unrunnable) is an environment fault: the run pauses and the attempt is not charged"
+[[section.field]]
+key = "probe_timeout_s"
+kind = "int"
+minimum = 1
+default_ref = "EnvironmentPolicy.probe_timeout_s"
+label = "probe timeout (s)"
+description = "per-probe wall-clock bound; a probe running past it counts as failed"
 
 [[section]]
 name = "notify"
@@ -241,6 +269,7 @@ description = "reasoning effort, free-form (provider/model-specific, e.g. high, 
 [[section.field]]
 key = "extra_args"
 kind = "args"
+description = "when set, replaces the CLI profile's permission-bypass flags (its bypass_args), so repeat them (e.g. claude: --permission-mode bypassPermissions) or unattended sessions may stall on permission prompts"
 [[section.field]]
 key = "cleanup_session_on_finish"
 kind = "switch"
@@ -260,7 +289,7 @@ default_ref = "AdapterPolicy.stop_without_result_nudges"
 placeholder = "inherit (copilot profile ships 5)"
 description = "result-less Stop signals tolerated before a session is called stalled; overrides the global limits value for this CLI"
 
-# Per-stage adapter overrides. One section per [adapter.dev|review|triage] table,
+# Per-stage adapter overrides. One section per [adapter.dev|review|triage|retro] table,
 # expanded from this single template by the STAGES loop so they never drift.
 [[section]]
 name = "adapter.{stage}"
@@ -281,6 +310,7 @@ placeholder = "inherit / provider default"
 [[section.field]]
 key = "extra_args"
 kind = "args"
+description = "inherits from [adapter] only when the client matches (a stage that switches client falls back to that client's bypass flags); when set, replaces the CLI profile's permission-bypass flags (its bypass_args), so repeat them (e.g. claude: --permission-mode bypassPermissions)"
 [[section.field]]
 key = "usage_grace_s"
 kind = "float"
@@ -370,7 +400,7 @@ kind = "int"
 minimum = 0
 default_ref = "ScmPolicy.preserve_keep"
 label = "preserve-ref retention"
-description = "attempt-preserve/* recovery branches and attempt-preserve-dirty/* worktree snapshots kept at each run start (per family) · the newest by committer date survive and the tail is deleted (0 = never prune)"
+description = "attempt-preserve/* recovery branches, attempt-preserve-dirty/* rollback snapshots and merge-preflight-preserve/* merge pre-flight snapshots kept at each run start (per family) · the newest by committer date survive and the tail is deleted (0 = never prune)"
 [[section.field]]
 key = "seed_adapter_defaults"
 kind = "switch"
@@ -467,6 +497,13 @@ kind = "switch"
 default_ref = "OperatorPolicy.enabled"
 label = "allow awaiting-operator parks"
 description = "let a session finish + commit a story whose acceptance criteria need a human action (buy a domain, publish a DNS record) and park it as awaiting-operator instead of forcing done or blocked · what is owed is recorded in the story spec's operator_actions: frontmatter, and `bmad-loop confirm <story-key>` completes the story once you have done it"
+[[section.field]]
+key = "on_review_demotion"
+kind = "select"
+options_ref = "OPERATOR_ON_REVIEW_DEMOTION_MODES"
+default_ref = "OperatorPolicy.on_review_demotion"
+label = "review may park a done story"
+description = "escalate: a review pass is never offered the park, and one that finalizes a done story at awaiting-operator is not accepted (default) · park: the review may demote it — the board moves done -> awaiting-operator, the story commits and parks · sprint mode with parks enabled only"
 
 [[section]]
 name = "mux"
